@@ -1,0 +1,1 @@
+You'll need to download and install [Node.js](https://nodejs.org/en/download) and then run `npm run dev` in the root folder
