@@ -60,7 +60,7 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
       axisPointer: { type: "line", snap: true },
       confine: true,
       position: tooltipPosition,
-      valueFormatter: (value: string | number) => formatCurrency(Number(value)),
+      valueFormatter: (value: any) => formatCurrency(Number(value)),
     },
     xAxis: { type: "category", data: ages, axisLabel: { fontSize: 10, margin: 14 } },
     yAxis: { type: "value", axisLabel: { formatter: (value: number) => shortCurrency(value), fontSize: 10 }, splitLine: { lineStyle: { color: "#e8edf4" } } },
@@ -71,11 +71,11 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
       ...base,
       tooltip: {
         ...base.tooltip,
-        formatter: (parameters: Array<{ axisValue: string | number; seriesName: string; value: number; marker: string }>) => {
+        formatter: (parameters: any) => {
           const rows = parameters
-            .map((parameter) => `${parameter.marker} ${parameter.seriesName}<span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(Number(parameter.value || 0))}</span>`)
+            .map((parameter: any) => `${parameter.marker} ${parameter.seriesName}<span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(Number(parameter.value || 0))}</span>`)
             .join("<br/>");
-          const total = parameters.reduce((sum, parameter) => sum + Number(parameter.value || 0), 0);
+          const total = parameters.reduce((sum: number, parameter: any) => sum + Number(parameter.value || 0), 0);
           return `<strong>Age ${parameters[0]?.axisValue ?? ""}</strong><br/>${rows}<hr style="margin:6px 0;border:0;border-top:1px solid #e2e8f0"/><span style="color:#64748b">Total</span><span style="float:right;margin-left:18px;font-weight:700">${formatCurrency(total)}</span>`;
         },
       },
@@ -97,7 +97,7 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
         axisPointer: { type: "line", snap: true },
         confine: true,
         position: tooltipPosition,
-        formatter: (parameters: Array<{ axisValue: string | number }>) => {
+        formatter: (parameters: any) => {
           const year = medianYears.find((candidate) => candidate.age === Number(parameters[0]?.axisValue));
           if (!year) return "";
           const funded = Math.min(year.spendingTarget, year.netSpendableCash);
@@ -121,7 +121,7 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
         axisPointer: { type: "shadow" },
         confine: true,
         position: tooltipPosition,
-        formatter: (parameters: Array<{ axisValue: string | number; value: number; marker: string }>) => {
+        formatter: (parameters: any) => {
           const year = medianYears.find((candidate) => candidate.age === Number(parameters[0]?.axisValue));
           if (!year) return "";
           const fundedCash = year.netSpendableCash;
@@ -140,8 +140,12 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
             value,
             itemStyle: { color: value >= 0 ? "#10b981" : "#ef4444" },
           })),
-          markLine: { silent: true, symbol: "none", lineStyle: { color: "#64748b" }, data: [{ yAxis: 0 }] },
           ...phaseAnnotations(inputs, ages),
+          markLine: {
+            ...phaseMarkLines(inputs, ages),
+            lineStyle: { color: "#64748b" },
+            data: [{ yAxis: 0 }, ...phaseMarkLines(inputs, ages).data],
+          },
         },
       ],
     } as EChartsOption;
@@ -155,11 +159,11 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
         axisPointer: { type: "shadow" },
         confine: true,
         position: tooltipPosition,
-        formatter: (parameters: Array<{ axisValue: string | number; seriesName: string; value: number; marker: string }>) => {
+        formatter: (parameters: any) => {
           const rows = parameters
-            .map((parameter) => `${parameter.marker} ${parameter.seriesName}<span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(Number(parameter.value || 0))}</span>`)
+            .map((parameter: any) => `${parameter.marker} ${parameter.seriesName}<span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(Number(parameter.value || 0))}</span>`)
             .join("<br/>");
-          const total = parameters.reduce((sum, parameter) => sum + Number(parameter.value || 0), 0);
+          const total = parameters.reduce((sum: number, parameter: any) => sum + Number(parameter.value || 0), 0);
           const year = medianYears.find((candidate) => candidate.age === Number(parameters[0]?.axisValue));
           const byPersonRows = year && year.taxesByPerson.length > 1
             ? `<hr style="margin:6px 0;border:0;border-top:1px solid #e2e8f0"/><strong style="font-size:11px">By person</strong><br/>${year.taxesByPerson.map((person) => `<span style="color:#64748b">${person.label}</span><span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(person.totalTax)}</span>`).join("<br/>")}`
@@ -177,7 +181,7 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
   if (kind === "taxRates") {
     return {
       ...base,
-      tooltip: { ...base.tooltip, valueFormatter: (value: string | number) => `${(Number(value) * 100).toFixed(1)}%` },
+      tooltip: { ...base.tooltip, valueFormatter: (value: any) => `${(Number(value) * 100).toFixed(1)}%` },
       yAxis: { ...base.yAxis, axisLabel: { formatter: (value: number) => `${Math.round(value * 100)}%`, fontSize: 10 } },
       series: [
         lineSeries("Marginal tax rate", medianYears.map((year) => year.taxes.marginalRate), "#ef4444", inputs, ages, true),
@@ -191,7 +195,7 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
     const rrifMinimumRates = medianYears.map((year) => (year.openingBalances.rrsp === 0 ? 0 : (year.rrifMinimumWithdrawal ?? 0) / year.openingBalances.rrsp));
     return {
       ...base,
-      tooltip: { ...base.tooltip, valueFormatter: (value: string | number) => `${(Number(value) * 100).toFixed(1)}%` },
+      tooltip: { ...base.tooltip, valueFormatter: (value: any) => `${(Number(value) * 100).toFixed(1)}%` },
       yAxis: { ...base.yAxis, axisLabel: { formatter: (value: number) => `${Math.round(value * 100)}%`, fontSize: 10 } },
       series: [
         lineSeries("RRIF withdrawal rate", rrifWithdrawalRates, "#2563eb", inputs, ages, true),
@@ -207,18 +211,18 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
       axisPointer: { type: "shadow" },
       confine: true,
       position: tooltipPosition,
-      formatter: (parameters: Array<{ axisValue: string | number; seriesName: string; value: number; marker: string }>) => {
+      formatter: (parameters: any) => {
         const year = medianYears.find((candidate) => candidate.age === Number(parameters[0]?.axisValue));
-        const total = parameters.reduce((sum, parameter) => sum + Number(parameter.value || 0), 0);
+        const total = parameters.reduce((sum: number, parameter: any) => sum + Number(parameter.value || 0), 0);
         const incomeRows = parameters
           .slice(0, 4)
-          .filter((parameter) => Number(parameter.value || 0) !== 0)
-          .map((parameter) => `${parameter.marker} ${parameter.seriesName}<span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(Number(parameter.value))}</span>`)
+          .filter((parameter: any) => Number(parameter.value || 0) !== 0)
+          .map((parameter: any) => `${parameter.marker} ${parameter.seriesName}<span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(Number(parameter.value))}</span>`)
           .join("<br/>");
         const drawdownRows = parameters
           .slice(4)
-          .filter((parameter) => Number(parameter.value || 0) !== 0)
-          .map((parameter) => `${parameter.marker} ${parameter.seriesName}<span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(Number(parameter.value))}</span>`)
+          .filter((parameter: any) => Number(parameter.value || 0) !== 0)
+          .map((parameter: any) => `${parameter.marker} ${parameter.seriesName}<span style="float:right;margin-left:18px;font-weight:600">${formatCurrency(Number(parameter.value))}</span>`)
           .join("<br/>");
         const openingPortfolio = year ? year.openingBalances.rrsp + year.openingBalances.tfsa + year.openingBalances.nonRegistered + year.openingBalances.interestBearing : 0;
         const withdrawals = year ? year.withdrawals.rrsp + year.withdrawals.tfsa + year.withdrawals.nonRegistered + year.withdrawals.interestBearing : 0;

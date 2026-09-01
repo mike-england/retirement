@@ -341,7 +341,7 @@ export default function Home() {
             ...current,
             incomeStreams: [
               ...current.incomeStreams,
-              structuredClone(missingBenefits),
+              ...structuredClone(missingBenefits),
             ],
           };
     });
@@ -440,15 +440,17 @@ export default function Home() {
             <span className="status-dot" title="Inputs are ready" />
           </div>
           <nav className="input-tabs" aria-label="Planning input sections">
-            {[
-              ["People", UsersRound],
-              ["Income", BriefcaseBusiness],
-              ["Accounts", WalletCards],
-              ["Spending", BadgeDollarSign],
-              ["Assumptions", SlidersHorizontal],
-              ["Strategy", Landmark],
-            ].map(([tab, Icon]) => (
-              <button key={tab as string} className={activeInputTab === tab ? "active" : ""} onClick={() => setActiveInputTab(tab as string)}><Icon size={13} strokeWidth={1.8} /><span>{tab}</span></button>
+            {(
+              [
+                ["People", UsersRound],
+                ["Income", BriefcaseBusiness],
+                ["Accounts", WalletCards],
+                ["Spending", BadgeDollarSign],
+                ["Assumptions", SlidersHorizontal],
+                ["Strategy", Landmark],
+              ] satisfies [string, typeof UsersRound][]
+            ).map(([tab, Icon]) => (
+              <button key={tab} className={activeInputTab === tab ? "active" : ""} onClick={() => setActiveInputTab(tab)}><Icon size={13} strokeWidth={1.8} /><span>{tab}</span></button>
             ))}
           </nav>
           <div hidden={activeInputTab !== "People"}>
@@ -471,6 +473,7 @@ export default function Home() {
                           currentAge: current.personalInfo.currentAge,
                           targetDeathAge: current.personalInfo.targetDeathAge,
                           receivesCpp: true,
+                          cppPayoutRate: 0.6,
                           receivesOas: true,
                         },
                       ],
@@ -1825,7 +1828,7 @@ function MeltdownImpactView({ inputs }: { inputs: typeof defaultRetirementInputs
       trigger: "axis",
       axisPointer: { type: "cross" },
       confine: true,
-      valueFormatter: (value: string | number) => formatCurrency(Number(value)),
+      valueFormatter: (value) => formatCurrency(Number(value)),
     },
     xAxis: { type: "category", data: ages, axisLabel: { fontSize: 10, margin: 14 } },
     yAxis: { type: "value", axisLabel: { formatter: (value: number) => shortCurrency(value), fontSize: 10 }, splitLine: { lineStyle: { color: "#e8edf4" } } },
@@ -1843,7 +1846,7 @@ function MeltdownImpactView({ inputs }: { inputs: typeof defaultRetirementInputs
       trigger: "axis",
       axisPointer: { type: "cross" },
       confine: true,
-      valueFormatter: (value: string | number) => formatCurrency(Number(value)),
+      valueFormatter: (value) => formatCurrency(Number(value)),
     },
     xAxis: { type: "category", data: ages, axisLabel: { fontSize: 10, margin: 14 } },
     yAxis: { type: "value", axisLabel: { formatter: (value: number) => shortCurrency(value), fontSize: 10 }, splitLine: { lineStyle: { color: "#e8edf4" } } },
@@ -2105,7 +2108,7 @@ function MonteCarloPercentileChart({
       trigger: "axis",
       axisPointer: { type: "cross" },
       confine: true,
-      valueFormatter: (value: string | number) => formatCurrency(Number(value)),
+      valueFormatter: (value) => formatCurrency(Number(value)),
     },
     xAxis: { type: "category", data: ages, axisLabel: { fontSize: 10, margin: 14 } },
     yAxis: {
@@ -2171,8 +2174,8 @@ function FailureAnalysisView({
       trigger: "axis",
       axisPointer: { type: "shadow" },
       confine: true,
-      formatter: (parameters: Array<{ axisValue: string | number; value: number }>) =>
-        `Age ${parameters[0]?.axisValue}<br/>${parameters[0]?.value} runs ran out of money here`,
+      formatter: (parameters) =>
+        `Age ${(parameters as any[])[0]?.axisValue}<br/>${(parameters as any[])[0]?.value} runs ran out of money here`,
     },
     xAxis: {
       type: "category",
