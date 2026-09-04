@@ -71,6 +71,8 @@ export interface PlanPerson {
   existingAssets?: ExistingAssets;
 }
 
+export type IndexationMode = "none" | "fullInflation" | "partialInflation" | "fixedRate";
+
 export interface IncomeStream {
   id: string;
   ownerId: string;
@@ -79,7 +81,9 @@ export interface IncomeStream {
   startAge: number;
   endAge: number;
   taxTreatment: TaxTreatment;
-  indexedToInflation: boolean;
+  indexationMode: IndexationMode;
+  // Fraction of simulated inflation for "partialInflation" (e.g. 0.9 = 90% COLA), or a flat annual rate for "fixedRate" (e.g. 0.015 = 1.5%/yr).
+  indexationRate?: number;
   annualRrspContribution?: number;
   annualTfsaContribution?: number;
   annualNonRegisteredContribution?: number;
@@ -119,10 +123,14 @@ export interface MarketAssumptions {
   inflationStdDev: number;
 }
 
+export type WithdrawalAccount = "interestBearing" | "nonRegistered" | "tfsa" | "rrsp";
+
 export interface StrategySettings {
   cppStartAge: 60 | 65 | 70;
   oasStartAge: 60 | 65 | 70;
   aggressiveRrspMeltdown: boolean;
+  // Order accounts are drawn down to cover each year's spending shortfall, e.g. ["interestBearing", "nonRegistered", "tfsa", "rrsp"].
+  withdrawalOrder: WithdrawalAccount[];
 }
 
 export interface SimulationSettings {

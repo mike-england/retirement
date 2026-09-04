@@ -35,15 +35,29 @@ import type {
   TaxJurisdictionSettings,
   TaxRateBracket,
   TaxSettings,
+  WithdrawalAccount,
   YearProjection,
 } from "@/types/retirement";
 
-const ledgerColumns = [
-  "Year",
-  "Age",
-  "Phase",
-  "Return",
-  "Total income",
+const withdrawalAccountLabels: Record<WithdrawalAccount, string> = {
+  interestBearing: "GIC / interest-bearing",
+  nonRegistered: "Non-registered",
+  tfsa: "TFSA",
+  rrsp: "RRSP/RRIF",
+};
+const defaultWithdrawalOrder: WithdrawalAccount[] = ["interestBearing", "nonRegistered", "tfsa", "rrsp"];
+
+const ledgerLeadColumns = ["Year", "Age", "Phase", "Return"];
+const ledgerIncomeColumns = [
+  "Employment/Pension",
+  "CPP",
+  "OAS",
+  "RRSP/RRIF",
+  "TFSA",
+  "Non-reg",
+  "GIC",
+];
+const ledgerTailColumns = [
   "Taxes paid",
   "RRSP start",
   "RRSP end",
@@ -1149,6 +1163,47 @@ export default function Home() {
                 }
               />
             </div>
+            <div className="field-label-text">
+              <span>Withdrawal order</span>
+              <FieldHint text="Which account gets drawn down first to cover each year's spending shortfall, once income and mandatory RRIF minimums aren't enough. Move an account up to spend it down sooner, or down to preserve it longer (e.g. for estate planning)." />
+            </div>
+            <ol className="withdrawal-order-list">
+              {(inputs.strategy.withdrawalOrder ?? defaultWithdrawalOrder).map((account, index) => (
+                <li key={account}>
+                  <span>{withdrawalAccountLabels[account]}</span>
+                  <span className="withdrawal-order-actions">
+                    <button
+                      type="button"
+                      className="button button-quiet"
+                      disabled={index === 0}
+                      onClick={() =>
+                        setInputs((current) => {
+                          const order = [...(current.strategy.withdrawalOrder ?? defaultWithdrawalOrder)];
+                          [order[index - 1], order[index]] = [order[index], order[index - 1]];
+                          return { ...current, strategy: { ...current.strategy, withdrawalOrder: order } };
+                        })
+                      }
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-quiet"
+                      disabled={index === (inputs.strategy.withdrawalOrder ?? defaultWithdrawalOrder).length - 1}
+                      onClick={() =>
+                        setInputs((current) => {
+                          const order = [...(current.strategy.withdrawalOrder ?? defaultWithdrawalOrder)];
+                          [order[index + 1], order[index]] = [order[index], order[index + 1]];
+                          return { ...current, strategy: { ...current.strategy, withdrawalOrder: order } };
+                        })
+                      }
+                    >
+                      ↓
+                    </button>
+                  </span>
+                </li>
+              ))}
+            </ol>
             <label className="check-row emphasis">
               <input
                 type="checkbox"
@@ -1309,10 +1364,14 @@ function NumberField({
 
   return (
     <label className="field-label">
-      <span className="field-label-text">
-        {label}
-        {tooltip && <FieldHint text={tooltip} />}
-      </span>
+      {tooltip ? (
+        <span className="field-label-text">
+          {label}
+          <FieldHint text={tooltip} />
+        </span>
+      ) : (
+        label
+      )}
       <span className={`number-input${isFinancialValue ? " number-input--financial" : ""}`}>
         {prefix && <span>{prefix}</span>}
         <input
@@ -1496,7 +1555,7 @@ function IncomeStreamsEditor({
         startAge: Math.max(65, minimumAge),
         endAge: targetDeathAge,
         taxTreatment: "pension",
-        indexedToInflation: true,
+        indexationMode: "fullInflation",
       },
     ]);
   return (
@@ -1570,7 +1629,7 @@ function IncomeStreamsEditor({
               </select>
             </label>
           </div>
-          <div className="field-grid three-up">
+          <div className="field-grid three-up income-amount-fields">
             <NumberField
               label="Annual amount"
               prefix="$"
@@ -1598,18 +1657,45 @@ function IncomeStreamsEditor({
               }
             />
           </div>
-          <label className="check-row">
-            <input
-              type="checkbox"
-              checked={stream.indexedToInflation}
-              onChange={(event) =>
-                updateStream(stream.id, {
-                  indexedToInflation: event.target.checked,
-                })
-              }
-            />{" "}
-            Indexed to inflation
-          </label>
+          <div className="field-grid two-up income-indexation-fields">
+            <label className="field-label">
+              <span className="field-label-text">Indexation</span>
+              <select
+                value={stream.indexationMode}
+                onChange={(event) =>
+                  updateStream(stream.id, {
+                    indexationMode: event.target
+                      .value as IncomeStream["indexationMode"],
+                  })
+                }
+              >
+                <option value="none">Not indexed</option>
+                <option value="fullInflation">Full inflation</option>
+                <option value="partialInflation">Partial COLA</option>
+                <option value="fixedRate">Fixed annual rate</option>
+              </select>
+            </label>
+            {(stream.indexationMode === "partialInflation" ||
+              stream.indexationMode === "fixedRate") && (
+              <NumberField
+                label={
+                  stream.indexationMode === "partialInflation"
+                    ? "% of CPI"
+                    : "Annual rate"
+                }
+                suffix="%"
+                tooltip={
+                  stream.indexationMode === "partialInflation"
+                    ? "Portion of simulated inflation this income keeps up with each year, e.g. 90 for a 90% cost-of-living adjustment."
+                    : "Flat annual growth rate applied to this income, independent of the simulated inflation path."
+                }
+                value={(stream.indexationRate ?? 0) * 100}
+                onChange={(value) =>
+                  updateStream(stream.id, { indexationRate: Number(value) / 100 })
+                }
+              />
+            )}
+          </div>
           {(stream.taxTreatment === "employment" || stream.taxTreatment === "pension") && (
             <div className="income-contribution-fields">
               <p className="contribution-group-label">Contributions</p>
@@ -1965,7 +2051,20 @@ function LedgerView({
         <table className="ledger-table">
           <thead>
             <tr>
-              {ledgerColumns.map((column) => (
+              {ledgerLeadColumns.map((column) => (
+                <th key={column} rowSpan={2}>
+                  {column}
+                </th>
+              ))}
+              <th colSpan={ledgerIncomeColumns.length}>Income</th>
+              {ledgerTailColumns.map((column) => (
+                <th key={column} rowSpan={2}>
+                  {column}
+                </th>
+              ))}
+            </tr>
+            <tr className="ledger-subheader-row">
+              {ledgerIncomeColumns.map((column) => (
                 <th key={column}>{column}</th>
               ))}
             </tr>
@@ -2009,7 +2108,13 @@ function LedgerView({
                       %
                     </span>
                   </td>
-                  <td>{formatCurrency(year.totalIncome)}</td>
+                  <td>{formatCurrency(year.income.employment)}</td>
+                  <td>{formatCurrency(year.income.cpp)}</td>
+                  <td>{formatCurrency(year.income.oas)}</td>
+                  <td>{formatCurrency(year.income.rrspWithdrawal + year.withdrawals.rrsp)}</td>
+                  <td>{formatCurrency(year.income.tfsaWithdrawal + year.withdrawals.tfsa)}</td>
+                  <td>{formatCurrency(year.income.nonRegisteredWithdrawal + year.withdrawals.nonRegistered)}</td>
+                  <td>{formatCurrency(year.income.interest + year.income.interestBearingWithdrawal + year.withdrawals.interestBearing)}</td>
                   <td>{formatCurrency(year.taxes.totalTax)}</td>
                   <td>{formatCurrency(year.openingBalances.rrsp)}</td>
                   <td>{formatCurrency(year.closingBalances.rrsp)}</td>

@@ -3,6 +3,7 @@ import type {
   AccountWithdrawals,
   DeterministicProjection,
   IncomeBySource,
+  IncomeStream,
   ProvinceCode,
   RetirementInputs,
   TaxRateBracket,
@@ -67,6 +68,10 @@ export function projectRetirementPlan(
   const roster = buildRoster(inputs);
   let balancesByPerson = initialBalancesByPerson(inputs, roster);
   let cumulativeInflation = 1;
+  // Streams with "partialInflation"/"fixedRate" indexing compound independently of the shared inflation multiplier.
+  const streamIndexMultipliers: Record<string, number> = Object.fromEntries(
+    inputs.incomeStreams.map((stream) => [stream.id, 1]),
+  );
   let lifetimeTax = 0;
   let peakValue = totalPortfolioAcross(balancesByPerson);
   let portfolioPeakAge = inputs.personalInfo.currentAge;
@@ -101,6 +106,7 @@ export function projectRetirementPlan(
       balancesByPerson,
       index,
       cumulativeInflation,
+      streamIndexMultipliers,
       spendingTarget,
       retirementStartAge,
       age,
@@ -177,6 +183,13 @@ export function projectRetirementPlan(
       depleted,
     });
     cumulativeInflation *= 1 + inflationRate;
+    for (const stream of inputs.incomeStreams) {
+      if (stream.indexationMode === "partialInflation") {
+        streamIndexMultipliers[stream.id] *= 1 + (stream.indexationRate ?? 0) * inflationRate;
+      } else if (stream.indexationMode === "fixedRate") {
+        streamIndexMultipliers[stream.id] *= 1 + (stream.indexationRate ?? 0);
+      }
+    }
   }
 
   return {
@@ -243,13 +256,14 @@ function fundHousehold(
   balancesByPerson: Record<string, AccountBalances>,
   yearIndex: number,
   inflationMultiplier: number,
+  streamIndexMultipliers: Record<string, number>,
   spendingTarget: number,
   retirementStartAge: number,
   age: number,
   portfolioReturn: number,
 ) {
   const states: PersonYearState[] = roster.map((person) => {
-    const fixed = personFixedIncome(inputs, person, yearIndex, inflationMultiplier);
+    const fixed = personFixedIncome(inputs, person, yearIndex, inflationMultiplier, streamIndexMultipliers);
     const opening = balancesByPerson[person.id];
     // GIC/PPN-style interest uses its own guaranteed rate (not the market return) and compounds tax-deferred within the term; the full accumulated growth is only taxed the year the term matures.
     const growth = opening.interestBearing * Math.max(0, person.interestBearingRate);
@@ -299,8 +313,10 @@ function fundHousehold(
     );
   }
 
-  // Interest-bearing balances get no further tax benefit from staying invested (already taxed annually as it accrues), so they're drawn down first.
-  for (const account of ["interestBearing", "nonRegistered", "tfsa", "rrsp"] as const) {
+  // Interest-bearing balances get no further tax benefit from staying invested (already taxed annually as it accrues), so they're drawn down first by default.
+  // Falls back to the historical default order for scenarios saved before withdrawal order was configurable.
+  const withdrawalOrder = inputs.strategy.withdrawalOrder ?? ["interestBearing", "nonRegistered", "tfsa", "rrsp"];
+  for (const account of withdrawalOrder) {
     for (const state of states) {
       const requiredCash = spendingTarget - netCashTotal();
       const available = state.balances[account];
@@ -431,7 +447,20 @@ function combineTax(results: TaxResult[]): TaxResult {
   };
 }
 
-function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearIndex: number, inflationMultiplier: number) {
+// Resolves how much a stream's amount has grown: full/partial CPI use the shared inflation multiplier (scaled by the partial factor), fixedRate compounds on its own.
+function streamIndexMultiplier(stream: IncomeStream, inflationMultiplier: number, streamIndexMultipliers: Record<string, number>) {
+  switch (stream.indexationMode) {
+    case "fullInflation":
+      return inflationMultiplier;
+    case "partialInflation":
+    case "fixedRate":
+      return streamIndexMultipliers[stream.id] ?? 1;
+    default:
+      return 1;
+  }
+}
+
+function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearIndex: number, inflationMultiplier: number, streamIndexMultipliers: Record<string, number>) {
   const income: IncomeBySource = { employment: 0, cpp: 0, oas: 0, interest: 0, rrspWithdrawal: 0, tfsaWithdrawal: 0, nonRegisteredWithdrawal: 0, interestBearingWithdrawal: 0 };
   const taxableIncome: TaxableIncome = { ordinaryIncome: 0, capitalGains: 0, eligibleDividends: 0, nonEligibleDividends: 0 };
   const age = person.currentAge + yearIndex;
@@ -452,7 +481,8 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
         ? calculateOasAnnualBenefit(stream.annualAmount || oasAnnualMaximum, inputs.strategy.oasStartAge)
         : stream.annualAmount;
     const proration = incomeProrationFraction(age, stream.startAge, stream.endAge, person.birthMonth, yearIndex);
-    const amount = baseAmount * (stream.indexedToInflation ? inflationMultiplier : 1) * proration;
+    const indexMultiplier = streamIndexMultiplier(stream, inflationMultiplier, streamIndexMultipliers);
+    const amount = baseAmount * indexMultiplier * proration;
     if (stream.taxTreatment === "cpp") {
       income.cpp += amount;
       taxableIncome.ordinaryIncome += amount;
@@ -461,12 +491,12 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
       taxableIncome.ordinaryIncome += amount;
     } else if (stream.taxTreatment === "employment" || stream.taxTreatment === "pension") {
       // RRSP contributions are tax-deductible (reduce taxable income); TFSA/non-registered contributions come from after-tax cash and don't.
-      const streamIndexMultiplier = (stream.indexedToInflation ? inflationMultiplier : 1) * proration;
-      const streamRrspContribution = Math.min(amount, (stream.annualRrspContribution ?? 0) * streamIndexMultiplier);
+      const streamIndexMultiplierWithProration = indexMultiplier * proration;
+      const streamRrspContribution = Math.min(amount, (stream.annualRrspContribution ?? 0) * streamIndexMultiplierWithProration);
       const afterRrsp = amount - streamRrspContribution;
-      const streamTfsaContribution = Math.min(afterRrsp, (stream.annualTfsaContribution ?? 0) * streamIndexMultiplier);
+      const streamTfsaContribution = Math.min(afterRrsp, (stream.annualTfsaContribution ?? 0) * streamIndexMultiplierWithProration);
       const afterTfsa = afterRrsp - streamTfsaContribution;
-      const streamNonRegisteredContribution = Math.min(afterTfsa, (stream.annualNonRegisteredContribution ?? 0) * streamIndexMultiplier);
+      const streamNonRegisteredContribution = Math.min(afterTfsa, (stream.annualNonRegisteredContribution ?? 0) * streamIndexMultiplierWithProration);
       rrspContribution += streamRrspContribution;
       tfsaContribution += streamTfsaContribution;
       nonRegisteredContribution += streamNonRegisteredContribution;

@@ -21,7 +21,7 @@ export const defaultRetirementInputs: RetirementInputs = {
       startAge: 50,
       endAge: 64,
       taxTreatment: "employment",
-      indexedToInflation: true,
+      indexationMode: "fullInflation",
     },
   ],
   existingAssets: {
@@ -55,6 +55,7 @@ export const defaultRetirementInputs: RetirementInputs = {
     cppStartAge: 65,
     oasStartAge: 65,
     aggressiveRrspMeltdown: false,
+    withdrawalOrder: ["interestBearing", "nonRegistered", "tfsa", "rrsp"],
   },
   simulation: {
     iterations: 1_000,
