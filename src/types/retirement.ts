@@ -87,6 +87,9 @@ export interface IncomeStream {
   annualRrspContribution?: number;
   annualTfsaContribution?: number;
   annualNonRegisteredContribution?: number;
+  // Overrides the owner's birth month for prorating THIS stream's start/end year, e.g. retiring in June despite a December birthday. Unset = use birth month.
+  startMonth?: number;
+  endMonth?: number;
 }
 
 export interface ExistingAssets {
@@ -125,12 +128,17 @@ export interface MarketAssumptions {
 
 export type WithdrawalAccount = "interestBearing" | "nonRegistered" | "tfsa" | "rrsp";
 
+// How often the withdrawal waterfall runs against realized (already-applied) sub-period returns, instead of one lump annual withdrawal.
+export type WithdrawalFrequency = "annual" | "semiAnnual" | "quarterly" | "monthly";
+
 export interface StrategySettings {
   cppStartAge: 60 | 65 | 70;
   oasStartAge: 60 | 65 | 70;
   aggressiveRrspMeltdown: boolean;
   // Order accounts are drawn down to cover each year's spending shortfall, e.g. ["interestBearing", "nonRegistered", "tfsa", "rrsp"].
   withdrawalOrder: WithdrawalAccount[];
+  // Defaults to "annual" (a single year-end withdrawal) for scenarios saved before this was configurable.
+  withdrawalFrequency?: WithdrawalFrequency;
 }
 
 export interface SimulationSettings {
@@ -216,6 +224,16 @@ export interface YearProjection {
   inflationRate: number;
   estateValue: number;
   depleted: boolean;
+  // Only populated when strategy.withdrawalFrequency isn't "annual": the within-year breakdown driving the withdrawal waterfall.
+  subPeriods?: SubPeriodProjection[];
+}
+
+// One sub-annual slice (month/quarter/half-year) of a YearProjection: its own realized return and the withdrawals it triggered.
+export interface SubPeriodProjection {
+  index: number;
+  portfolioReturn: number;
+  withdrawals: AccountWithdrawals;
+  closingBalances: AccountBalances;
 }
 
 export interface DeterministicProjection {

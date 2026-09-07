@@ -1,11 +1,19 @@
-import { projectRetirementPlan } from "@/lib/simulationEngine";
+import { decomposeAnnualReturn, projectRetirementPlan, subPeriodsPerYear } from "@/lib/simulationEngine";
 import type { DeterministicProjection, RetirementInputs } from "@/types/retirement";
 
 export function projectWithVariableReturns(inputs: RetirementInputs): DeterministicProjection {
   const annualReturns = generateAnnualReturns(inputs).map((generatedReturn, index) =>
     inputs.assumptions.annualReturnOverrides[inputs.personalInfo.currentAge + index] ?? generatedReturn,
   );
-  return projectRetirementPlan(inputs, { annualReturns });
+  const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
+  const subPeriodReturns = subPeriodCount <= 1
+    ? undefined
+    : (() => {
+      // Offset from the annual seed so the within-year noise isn't a repeat of the annual draw sequence.
+      const random = createRandom((inputs.simulation.randomSeed ?? 0) + 1);
+      return annualReturns.map((annualReturn) => decomposeAnnualReturn(random, annualReturn, subPeriodCount, inputs.assumptions.returnStdDev));
+    })();
+  return projectRetirementPlan(inputs, { annualReturns, subPeriodReturns });
 }
 
 export function generateAnnualReturns(inputs: RetirementInputs, seed = inputs.simulation.randomSeed) {

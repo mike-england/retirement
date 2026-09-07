@@ -56,6 +56,7 @@ export const defaultRetirementInputs: RetirementInputs = {
     oasStartAge: 65,
     aggressiveRrspMeltdown: false,
     withdrawalOrder: ["interestBearing", "nonRegistered", "tfsa", "rrsp"],
+    withdrawalFrequency: "annual",
   },
   simulation: {
     iterations: 1_000,

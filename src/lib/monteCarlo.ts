@@ -1,4 +1,4 @@
-import { projectRetirementPlan } from "@/lib/simulationEngine";
+import { decomposeAnnualReturn, projectRetirementPlan, subPeriodsPerYear } from "@/lib/simulationEngine";
 import type {
   DeterministicProjection,
   FailureAnalysis,
@@ -20,6 +20,7 @@ export function runMonteCarloSimulation(inputs: RetirementInputs): SimulationOut
   const averageAnnualReturns: number[] = [];
   const returnFloor = inputs.assumptions.returnFloor ?? -0.08;
   const returnCeiling = Math.max(returnFloor, inputs.assumptions.returnCeiling ?? 0.15);
+  const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
 
   for (let run = 0; run < inputs.simulation.iterations; run += 1) {
     const annualReturns = Array.from({ length: yearCount }, () => boundedLognormalReturn(
@@ -34,7 +35,10 @@ export function runMonteCarloSimulation(inputs: RetirementInputs): SimulationOut
       inputs.assumptions.inflationMean,
       inputs.assumptions.inflationStdDev,
     )));
-    projections.push(projectRetirementPlan(inputs, { annualReturns, annualInflation }));
+    const subPeriodReturns = subPeriodCount <= 1
+      ? undefined
+      : annualReturns.map((annualReturn) => decomposeAnnualReturn(random, annualReturn, subPeriodCount, inputs.assumptions.returnStdDev));
+    projections.push(projectRetirementPlan(inputs, { annualReturns, annualInflation, subPeriodReturns }));
     averageAnnualReturns.push(average(annualReturns));
   }
 

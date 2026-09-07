@@ -1,3 +1,14 @@
+# 1.1.0 (September 10, 2026)
+- Added annual, semi-annual, quarterly, and monthly withdrawal schedules with randomized within-year returns that compound to the selected annual return.
+- Added expandable Ledger rows showing sub-period returns, withdrawals, and portfolio values, with configurable account withdrawal order.
+- Added optional income-stream start/end month overrides, date tooltips, household-lifespan validation, and CPP payout dollar estimates.
+- Added the app version to the banner and expanded the Guide with plain-language model, privacy, save/export/import, and limitation explanations.
+- Updated GitHub Pages deployment to use Node.js 24-compatible actions and to deploy only from pushed tags.
+- Updated the Guide and Ledger presentation to explain and display sub-annual projections more clearly.
+- Corrected sub-period cash-flow timing and Ledger double-counting of waterfall withdrawals.
+- Corrected RRIF minimum and aggressive RRSP meltdown attribution in sub-period Ledger details, including the artificial December spike.
+- Aligned income, CPP, OAS, and death-age proration with birthday and stream-specific month cutoffs.
+
 # 1.0.0 (September 9, 2026)
 - Initial retirement planner: simulation engine, Monte Carlo projections, government benefits and tax rules, results charts.
 - Multi-person/couple plans: each person has their own age, target death age, CPP/OAS elections, and interest-bearing (GIC/PPN) account, and files their own simulated tax return.

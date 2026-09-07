@@ -6,9 +6,11 @@ import type {
   IncomeStream,
   ProvinceCode,
   RetirementInputs,
+  SubPeriodProjection,
   TaxRateBracket,
   TaxResult,
   TaxSettings,
+  WithdrawalFrequency,
   YearProjection,
 } from "@/types/retirement";
 import { defaultTaxSettings } from "@/lib/taxRules";
@@ -57,7 +59,58 @@ export type ProjectionOptions = {
   calendarYear?: number;
   annualReturns?: number[];
   annualInflation?: number[];
+  // Per year index, the realized return for each sub-period (month/quarter/half) when withdrawalFrequency isn't "annual". Falls back to an internally generated split if omitted.
+  subPeriodReturns?: number[][];
 };
+
+export function subPeriodsPerYear(frequency: WithdrawalFrequency | undefined): number {
+  switch (frequency) {
+    case "monthly": return 12;
+    case "quarterly": return 4;
+    case "semiAnnual": return 2;
+    default: return 1;
+  }
+}
+
+// How much the sub-period returns are allowed to wobble around their share of the (already-drawn) annual return.
+const SUB_PERIOD_VOLATILITY_DAMPING = 0.6;
+
+// Splits one year's already-drawn annual return into N sub-period returns that compound back to exactly that annual number,
+// so a down year isn't withdrawn from as if returns were flat all year, without changing any annual-level Monte Carlo statistics.
+export function decomposeAnnualReturn(
+  random: () => number,
+  annualReturn: number,
+  subPeriodCount: number,
+  annualStdDev: number,
+): number[] {
+  if (subPeriodCount <= 1) return [annualReturn];
+  const targetLogReturn = Math.log(1 + Math.max(annualReturn, -0.999));
+  const subPeriodStdDev = (Math.max(0, annualStdDev) * SUB_PERIOD_VOLATILITY_DAMPING) / Math.sqrt(subPeriodCount);
+  const rawLogReturns = Array.from(
+    { length: subPeriodCount },
+    () => targetLogReturn / subPeriodCount + subPeriodStdDev * standardNormal(random),
+  );
+  const drift = (targetLogReturn - rawLogReturns.reduce((sum, value) => sum + value, 0)) / subPeriodCount;
+  return rawLogReturns.map((logReturn) => Math.exp(logReturn + drift) - 1);
+}
+
+function standardNormal(random: () => number) {
+  const first = Math.max(random(), Number.MIN_VALUE);
+  const second = random();
+  return Math.sqrt(-2 * Math.log(first)) * Math.cos(2 * Math.PI * second);
+}
+
+function createFallbackRandom(seed?: number) {
+  if (seed === undefined) return Math.random;
+  let state = seed >>> 0;
+  return () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
 
 export function projectRetirementPlan(
   inputs: RetirementInputs,
@@ -84,6 +137,9 @@ export function projectRetirementPlan(
     ...inputs.spendingPlan.phases.map((phase) => phase.startAge),
     finalAge + 1,
   );
+  const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
+  // Used only when the caller doesn't supply pre-generated subPeriodReturns, so a bare projectRetirementPlan(inputs) call is still deterministic per seed.
+  const fallbackRandom = createFallbackRandom(inputs.simulation.randomSeed);
 
   for (
     let age = inputs.personalInfo.currentAge, index = 0;
@@ -93,6 +149,10 @@ export function projectRetirementPlan(
     const openingBalancesByPerson = mapValues(balancesByPerson, cloneBalances);
     const inflationRate = options.annualInflation?.[index] ?? inputs.assumptions.inflationMean;
     const portfolioReturn = options.annualReturns?.[index] ?? inputs.assumptions.returnMean;
+    const periodReturns = subPeriodCount <= 1
+      ? [portfolioReturn]
+      : options.subPeriodReturns?.[index]
+        ?? decomposeAnnualReturn(fallbackRandom, portfolioReturn, subPeriodCount, inputs.assumptions.returnStdDev);
     const activePhase = inputs.spendingPlan.phases.find(
       (phase) => age >= phase.startAge && age <= phase.endAge,
     );
@@ -111,14 +171,18 @@ export function projectRetirementPlan(
       retirementStartAge,
       age,
       portfolioReturn,
+      periodReturns,
     );
 
-    balancesByPerson = Object.fromEntries(
-      Object.entries(result.balancesByPerson).map(([personId, balances]) => [
-        personId,
-        applyAnnualReturn(balances, portfolioReturn, roster.find((person) => person.id === personId)?.interestBearingRate ?? portfolioReturn),
-      ]),
-    );
+    // With sub-annual withdrawals, growth was already applied period-by-period inside fundHousehold; annual mode still grows once, after the single withdrawal pass.
+    balancesByPerson = result.growthAlreadyApplied
+      ? result.balancesByPerson
+      : Object.fromEntries(
+        Object.entries(result.balancesByPerson).map(([personId, balances]) => [
+          personId,
+          applyAnnualReturn(balances, portfolioReturn, roster.find((person) => person.id === personId)?.interestBearingRate ?? portfolioReturn),
+        ]),
+      );
     let estateValue = totalPortfolioAcross(balancesByPerson);
     let yearTax = result.tax.totalTax;
 
@@ -181,6 +245,7 @@ export function projectRetirementPlan(
       inflationRate,
       estateValue,
       depleted,
+      subPeriods: result.subPeriods,
     });
     cumulativeInflation *= 1 + inflationRate;
     for (const stream of inputs.incomeStreams) {
@@ -261,6 +326,7 @@ function fundHousehold(
   retirementStartAge: number,
   age: number,
   portfolioReturn: number,
+  periodReturns: number[],
 ) {
   const states: PersonYearState[] = roster.map((person) => {
     const fixed = personFixedIncome(inputs, person, yearIndex, inflationMultiplier, streamIndexMultipliers);
@@ -294,15 +360,18 @@ function fundHousehold(
 
   const netCashTotal = () => states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) + sumWithdrawals(state.withdrawals) - state.tax.totalTax), 0);
   const recurringNetIncome = states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) - state.tax.totalTax), 0);
+  // Snapshot each state's tax bill with zero withdrawals, so sub-period cash-flow math can prorate the FIXED income across the year instead of treating it as fully received in period 1.
+  const fixedTaxBaselineByState = new Map(states.map((state) => [state.id, state.tax.totalTax]));
 
   // RRIF minimum withdrawals are mandatory once converted (by 71), regardless of spending need, based on the fund's value at the start of the year.
-  let rrifMinimumWithdrawal = 0;
-  for (const state of states) {
-    const minimumWithdrawal = calculateRrifMinimumWithdrawal(balancesByPerson[state.id].rrsp, state.age);
-    if (minimumWithdrawal <= 0) continue;
-    const amount = Math.min(minimumWithdrawal, state.balances.rrsp);
-    if (amount <= 0) continue;
-    rrifMinimumWithdrawal += amount;
+  const rrifMinimumByState = new Map(states.map((state) => [
+    state.id,
+    Math.max(0, Math.min(calculateRrifMinimumWithdrawal(balancesByPerson[state.id].rrsp, state.age), state.balances.rrsp)),
+  ]));
+  const rrifMinimumWithdrawal = [...rrifMinimumByState.values()].reduce((sum, amount) => sum + amount, 0);
+
+  const withdrawRrifMinimum = (state: PersonYearState, amount: number) => {
+    if (amount <= 0) return;
     state.balances = removeWithdrawal(state.balances, "rrsp", amount);
     state.withdrawals.rrsp += amount;
     state.tax = calculateTax(
@@ -311,36 +380,102 @@ function fundHousehold(
       inputs.simulation.capitalGainsInclusionRate,
       inputs.taxSettings,
     );
-  }
+  };
 
   // Interest-bearing balances get no further tax benefit from staying invested (already taxed annually as it accrues), so they're drawn down first by default.
   // Falls back to the historical default order for scenarios saved before withdrawal order was configurable.
   const withdrawalOrder = inputs.strategy.withdrawalOrder ?? ["interestBearing", "nonRegistered", "tfsa", "rrsp"];
-  for (const account of withdrawalOrder) {
-    for (const state of states) {
-      const requiredCash = spendingTarget - netCashTotal();
-      const available = state.balances[account];
-      if (requiredCash <= 0 || available <= 0) continue;
-      const amount = requiredWithdrawal(requiredCash, available, account, state.balances, state.withdrawals, state.fixedTaxable, inputs);
-      if (amount <= 0) continue;
-      state.balances = removeWithdrawal(state.balances, account, amount);
-      state.withdrawals[account] += amount;
-      state.tax = calculateTax(
-        taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances),
-        inputs.personalInfo.province,
-        inputs.simulation.capitalGainsInclusionRate,
-        inputs.taxSettings,
-      );
+  const subPeriodCount = periodReturns.length;
+  let subPeriods: SubPeriodProjection[] | undefined;
+
+  if (subPeriodCount <= 1) {
+    // Single annual withdrawal, unchanged: growth is applied once by the caller, after this whole pass.
+    for (const state of states) withdrawRrifMinimum(state, rrifMinimumByState.get(state.id) ?? 0);
+    for (const account of withdrawalOrder) {
+      for (const state of states) {
+        const requiredCash = spendingTarget - netCashTotal();
+        const available = state.balances[account];
+        if (requiredCash <= 0 || available <= 0) continue;
+        const amount = requiredWithdrawal(requiredCash, available, account, state.balances, state.withdrawals, state.fixedTaxable, inputs);
+        if (amount <= 0) continue;
+        state.balances = removeWithdrawal(state.balances, account, amount);
+        state.withdrawals[account] += amount;
+        state.tax = calculateTax(
+          taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances),
+          inputs.personalInfo.province,
+          inputs.simulation.capitalGainsInclusionRate,
+          inputs.taxSettings,
+        );
+      }
+    }
+  } else {
+    // Sub-annual withdrawals: apply each period's own realized return before drawing on it, so a down period isn't sold from as if the year were flat.
+    subPeriods = [];
+    for (let period = 0; period < subPeriodCount; period += 1) {
+      for (const state of states) {
+        const rosterPerson = roster.find((person) => person.id === state.id);
+        const interestBearingRate = rosterPerson?.interestBearingRate ?? portfolioReturn;
+        const periodInterestRate = (1 + Math.max(0, interestBearingRate)) ** (1 / subPeriodCount) - 1;
+        state.balances = applyAnnualReturn(state.balances, periodReturns[period], periodInterestRate);
+      }
+      const withdrawalsBefore = new Map(states.map((state) => [state.id, { ...state.withdrawals }]));
+      // Mandatory RRIF minimum installments are spread evenly across periods (matches how real RRIF minimums are usually paid out) instead of vanishing from the monthly breakdown as one hidden annual lump.
+      for (const state of states) withdrawRrifMinimum(state, (rrifMinimumByState.get(state.id) ?? 0) / subPeriodCount);
+      // Compare cumulative cash-so-far against the cumulative (not per-period-flat) spending target, so tax-bracket effects from earlier periods still carry through correctly.
+      const cumulativeTarget = (spendingTarget * (period + 1)) / subPeriodCount;
+      const elapsedFraction = (period + 1) / subPeriodCount;
+      // Prorates the FIXED (annual) recurring income by how much of the year has elapsed, rather than crediting the whole year's income as already banked in period 1.
+      const netCashSoFar = () => states.reduce((sum, state) => {
+        const fixedTaxBaseline = fixedTaxBaselineByState.get(state.id) ?? 0;
+        const recurringNet = cashFromIncome(state.income) - fixedTaxBaseline;
+        const withdrawalTax = state.tax.totalTax - fixedTaxBaseline;
+        return sum + Math.max(0, recurringNet * elapsedFraction + sumWithdrawals(state.withdrawals) - withdrawalTax);
+      }, 0);
+      for (const account of withdrawalOrder) {
+        for (const state of states) {
+          const requiredCash = cumulativeTarget - netCashSoFar();
+          const available = state.balances[account];
+          if (requiredCash <= 0 || available <= 0) continue;
+          const amount = requiredWithdrawal(requiredCash, available, account, state.balances, state.withdrawals, state.fixedTaxable, inputs);
+          if (amount <= 0) continue;
+          state.balances = removeWithdrawal(state.balances, account, amount);
+          state.withdrawals[account] += amount;
+          state.tax = calculateTax(
+            taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances),
+            inputs.personalInfo.province,
+            inputs.simulation.capitalGainsInclusionRate,
+            inputs.taxSettings,
+          );
+        }
+      }
+      const periodWithdrawals = states.reduce((total, state) => {
+        const before = withdrawalsBefore.get(state.id)!;
+        return {
+          rrsp: total.rrsp + (state.withdrawals.rrsp - before.rrsp),
+          tfsa: total.tfsa + (state.withdrawals.tfsa - before.tfsa),
+          nonRegistered: total.nonRegistered + (state.withdrawals.nonRegistered - before.nonRegistered),
+          interestBearing: total.interestBearing + (state.withdrawals.interestBearing - before.interestBearing),
+        };
+      }, { rrsp: 0, tfsa: 0, nonRegistered: 0, interestBearing: 0 } as AccountWithdrawals);
+      subPeriods.push({
+        index: period,
+        portfolioReturn: periodReturns[period],
+        withdrawals: periodWithdrawals,
+        closingBalances: sumBalances(Object.fromEntries(states.map((state) => [state.id, state.balances]))),
+      });
     }
   }
 
   if (inputs.strategy.aggressiveRrspMeltdown && age >= retirementStartAge) {
+    // Smoothed evenly across periods below, so it doesn't show up as a single hidden 13th withdrawal.
+    const meltByState = new Map<string, number>();
     for (const state of states) {
       if (state.balances.rrsp <= 0) continue;
       const currentOrdinaryIncome = taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances).ordinaryIncome;
       const nextLimit = nextFederalBracketLimit(currentOrdinaryIncome, inputs.taxSettings);
       const meltAmount = Math.min(state.balances.rrsp, Math.max(0, nextLimit - currentOrdinaryIncome));
       if (meltAmount <= 0) continue;
+      meltByState.set(state.id, meltAmount);
       state.balances = removeWithdrawal(state.balances, "rrsp", meltAmount);
       state.withdrawals.rrsp += meltAmount;
       state.tax = calculateTax(
@@ -349,6 +484,18 @@ function fundHousehold(
         inputs.simulation.capitalGainsInclusionRate,
         inputs.taxSettings,
       );
+    }
+    const totalMelted = [...meltByState.values()].reduce((sum, amount) => sum + amount, 0);
+    // The melt amount can only be known once the full year's income is in, so it's spread evenly back across periods for
+    // display rather than dumped entirely into the last one - a smoothed approximation, but the final period still lands
+    // on the true end-of-year balance.
+    if (subPeriods && totalMelted > 0) {
+      const meltPerPeriod = totalMelted / subPeriods.length;
+      subPeriods.forEach((period, periodIndex) => {
+        const meltSoFar = meltPerPeriod * (periodIndex + 1);
+        period.withdrawals = { ...period.withdrawals, rrsp: period.withdrawals.rrsp + meltPerPeriod };
+        period.closingBalances = { ...period.closingBalances, rrsp: Math.max(0, period.closingBalances.rrsp - (totalMelted - meltSoFar)) };
+      });
     }
   }
 
@@ -424,6 +571,8 @@ function fundHousehold(
     recurringNetIncome,
     netSpendableCash,
     depleted: netSpendableCash < spendingTarget,
+    subPeriods,
+    growthAlreadyApplied: subPeriodCount > 1,
   };
 }
 
@@ -471,7 +620,10 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
   for (const stream of inputs.incomeStreams) {
     const ownerId = stream.ownerId || "primary";
     if (ownerId !== person.id) continue;
-    const eligibleForAge = age >= stream.startAge && age <= Math.min(stream.endAge, person.targetDeathAge);
+    // Death is a birthday cutoff too, same as any other endAge: whichever of the stream's own end or the person's death comes first prorates this final year.
+    const deathBindsFirst = person.targetDeathAge < stream.endAge;
+    const effectiveEndAge = deathBindsFirst ? person.targetDeathAge : stream.endAge;
+    const eligibleForAge = age >= stream.startAge && age <= effectiveEndAge;
     const eligibleForBenefitStart = (stream.taxTreatment !== "cpp" || age >= inputs.strategy.cppStartAge)
       && (stream.taxTreatment !== "oas" || age >= Math.max(65, inputs.strategy.oasStartAge));
     if (!eligibleForAge || !eligibleForBenefitStart) continue;
@@ -480,7 +632,9 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
       : stream.taxTreatment === "oas"
         ? calculateOasAnnualBenefit(stream.annualAmount || oasAnnualMaximum, inputs.strategy.oasStartAge)
         : stream.annualAmount;
-    const proration = incomeProrationFraction(age, stream.startAge, stream.endAge, person.birthMonth, yearIndex);
+    // Death always cuts off on the person's own birthday; the stream's own end can be overridden to a different month (e.g. retiring in June despite a December birthday).
+    const endMonth = deathBindsFirst ? person.birthMonth : (stream.endMonth ?? person.birthMonth);
+    const proration = incomeProrationFraction(age, stream.startAge, effectiveEndAge, stream.startMonth ?? person.birthMonth, endMonth, yearIndex);
     const indexMultiplier = streamIndexMultiplier(stream, inflationMultiplier, streamIndexMultipliers);
     const amount = baseAmount * indexMultiplier * proration;
     if (stream.taxTreatment === "cpp") {
@@ -517,14 +671,15 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
 
   if (age <= person.targetDeathAge) {
     if (person.receivesCpp && age >= inputs.strategy.cppStartAge) {
-      const proration = incomeProrationFraction(age, inputs.strategy.cppStartAge, person.targetDeathAge + 1, person.birthMonth, yearIndex);
+      // Was targetDeathAge + 1, which the age <= targetDeathAge guard above made unreachable - the death year never actually prorated. Fixed to cut off on the death birthday itself.
+      const proration = incomeProrationFraction(age, inputs.strategy.cppStartAge, person.targetDeathAge, person.birthMonth, person.birthMonth, yearIndex);
       const cppAmount = calculateCppAnnualBenefit(cppAnnualMaximum * person.cppPayoutRate, inputs.strategy.cppStartAge) * inflationMultiplier * proration;
       income.cpp += cppAmount;
       taxableIncome.ordinaryIncome += cppAmount;
     }
     if (person.receivesOas && age >= Math.max(65, inputs.strategy.oasStartAge)) {
       const oasStartAge = Math.max(65, inputs.strategy.oasStartAge);
-      const proration = incomeProrationFraction(age, oasStartAge, person.targetDeathAge + 1, person.birthMonth, yearIndex);
+      const proration = incomeProrationFraction(age, oasStartAge, person.targetDeathAge, person.birthMonth, person.birthMonth, yearIndex);
       const oasAmount = calculateOasAnnualBenefit(oasAnnualMaximum, inputs.strategy.oasStartAge) * inflationMultiplier * proration;
       income.oas += oasAmount;
       taxableIncome.ordinaryIncome += oasAmount;
@@ -534,11 +689,19 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
   return { income, taxableIncome, rrspContribution, tfsaContribution, nonRegisteredContribution };
 }
 
-// Approximates a mid-year start/end of eligibility using birth month; skipped for single-year windows (would double-shrink) and for the plan's first year (already ongoing, not a new mid-year start).
-function incomeProrationFraction(age: number, startAge: number, endAge: number, birthMonth: number | undefined, yearIndex: number) {
-  if (!birthMonth || startAge === endAge) return 1;
-  if (age === startAge) return yearIndex === 0 ? 1 : (13 - birthMonth) / 12;
-  if (age === endAge) return (birthMonth - 1) / 12;
+// Approximates a mid-year start/end of eligibility using the relevant month; skipped for single-year windows (would double-shrink) and for the plan's first year (already ongoing, not a new mid-year start).
+// startMonth/endMonth default to the person's birth month, but a stream can override either independently (e.g. retiring in June despite a December birthday).
+function incomeProrationFraction(
+  age: number,
+  startAge: number,
+  endAge: number,
+  startMonth: number | undefined,
+  endMonth: number | undefined,
+  yearIndex: number,
+) {
+  if (startAge === endAge) return 1;
+  if (age === startAge) return !startMonth ? 1 : (yearIndex === 0 ? 1 : (13 - startMonth) / 12);
+  if (age === endAge) return !endMonth ? 1 : (endMonth - 1) / 12;
   return 1;
 }
 

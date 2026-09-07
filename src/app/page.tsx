@@ -5,6 +5,7 @@ import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
 import { createPortal } from "react-dom";
 import {
+  Fragment,
   startTransition,
   useEffect,
   useMemo,
@@ -14,6 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import { defaultRetirementInputs } from "@/lib/default-inputs";
+import packageJson from "../../package.json";
 import { runMonteCarloSimulation } from "@/lib/monteCarlo";
 import {
   generateAnnualReturns,
@@ -24,6 +26,8 @@ import {
   defaultTaxSettings,
   provinceNames,
 } from "@/lib/taxRules";
+import { maxHouseholdAge, monthYearLabel } from "@/lib/planDates";
+import { calculateCppAnnualBenefit, cppAnnualMaximum } from "@/lib/governmentBenefits";
 import { SimulationCharts } from "@/components/SimulationCharts";
 import type {
   DeterministicProjection,
@@ -388,7 +392,7 @@ export default function Home() {
         <div className="brand-mark" aria-hidden="true">
           RP
         </div>
-        <strong>Retirement Planner</strong>
+        <strong>Retirement Planner <span className="app-version">v{packageJson.version}</span></strong>
         <div className="scenario-actions">
           <select
             aria-label="Scenario"
@@ -553,6 +557,7 @@ export default function Home() {
                 <NumberField
                   label="Death age"
                   value={inputs.personalInfo.targetDeathAge}
+                  tooltip={`Dies ${monthYearLabel(inputs.personalInfo, inputs.personalInfo.targetDeathAge)}`}
                   onChange={(value) =>
                     setNumber("personalInfo.targetDeathAge", value)
                   }
@@ -616,6 +621,7 @@ export default function Home() {
                   min={0}
                   step={1}
                   suffix="%"
+                  tooltip={`At ${inputs.strategy.cppStartAge}, ${formatCurrency(calculateCppAnnualBenefit(cppAnnualMaximum * (inputs.personalInfo.cppPayoutRate ?? 0.6), inputs.strategy.cppStartAge))} per year before tax, based on the current maximum CPP and this payout percentage.`}
                   value={oneDecimalPercent(inputs.personalInfo.cppPayoutRate ?? 0.6)}
                   onChange={(value) =>
                     setInputs((current) => ({
@@ -710,6 +716,7 @@ export default function Home() {
                   <NumberField
                     label="Death age"
                     value={person.targetDeathAge}
+                    tooltip={`Dies ${monthYearLabel(person, person.targetDeathAge)}`}
                     onChange={(value) =>
                       setInputs((current) => ({
                         ...current,
@@ -778,6 +785,7 @@ export default function Home() {
                     min={0}
                     step={1}
                     suffix="%"
+                      tooltip={`At ${inputs.strategy.cppStartAge}, ${formatCurrency(calculateCppAnnualBenefit(cppAnnualMaximum * (person.cppPayoutRate ?? 0.6), inputs.strategy.cppStartAge))} per year before tax, based on the current maximum CPP and this payout percentage.`}
                     value={oneDecimalPercent(person.cppPayoutRate ?? 0.6)}
                     onChange={(value) =>
                       setInputs((current) => ({
@@ -836,11 +844,14 @@ export default function Home() {
             streams={inputs.incomeStreams}
             minimumAge={inputs.personalInfo.currentAge}
             targetDeathAge={inputs.personalInfo.targetDeathAge}
+            personalInfo={inputs.personalInfo}
             people={[
-              { id: "primary", label: inputs.personalInfo.label ?? "Primary person" },
+              { id: "primary", label: inputs.personalInfo.label ?? "Primary person", currentAge: inputs.personalInfo.currentAge, birthMonth: inputs.personalInfo.birthMonth },
               ...(inputs.personalInfo.additionalPeople ?? []).map((person) => ({
                 id: person.id,
                 label: person.label,
+                currentAge: person.currentAge,
+                birthMonth: person.birthMonth,
               })),
             ]}
             onChange={(incomeStreams) =>
@@ -1011,6 +1022,7 @@ export default function Home() {
           <SpendingPlanEditor
             spendingPlan={inputs.spendingPlan}
             minimumAge={inputs.personalInfo.currentAge}
+            personalInfo={inputs.personalInfo}
             onChange={(spendingPlan) =>
               setInputs((current) => ({ ...current, spendingPlan }))
             }
@@ -1145,6 +1157,7 @@ export default function Home() {
               <AgeSelect
                 label="CPP start age"
                 value={inputs.strategy.cppStartAge}
+                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.cppStartAge)} for the primary person (each person's own start date follows their own age/birth month).`}
                 onChange={(value) =>
                   setInputs((current) => ({
                     ...current,
@@ -1155,6 +1168,7 @@ export default function Home() {
               <AgeSelect
                 label="OAS start age"
                 value={inputs.strategy.oasStartAge}
+                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.oasStartAge)} for the primary person (each person's own start date follows their own age/birth month).`}
                 onChange={(value) =>
                   setInputs((current) => ({
                     ...current,
@@ -1204,6 +1218,29 @@ export default function Home() {
                 </li>
               ))}
             </ol>
+            <label className="field-label">
+              <span className="field-label-text">
+                Withdrawal frequency
+                <FieldHint text="How often the withdrawal waterfall runs against realized returns, instead of one lump annual withdrawal. Monthly/quarterly/semi-annual also apply randomized within-year return variation on the Dashboard/Ledger and in Monte Carlo, so a down stretch isn't sold from as if the whole year were flat." />
+              </span>
+              <select
+                value={inputs.strategy.withdrawalFrequency ?? "annual"}
+                onChange={(event) =>
+                  setInputs((current) => ({
+                    ...current,
+                    strategy: {
+                      ...current.strategy,
+                      withdrawalFrequency: event.target.value as typeof current.strategy.withdrawalFrequency,
+                    },
+                  }))
+                }
+              >
+                <option value="annual">Annual</option>
+                <option value="semiAnnual">Semi-annual</option>
+                <option value="quarterly">Quarterly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </label>
             <label className="check-row emphasis">
               <input
                 type="checkbox"
@@ -1333,6 +1370,7 @@ function NumberField({
   prefix,
   suffix,
   min,
+  max,
   step,
   tooltip,
 }: {
@@ -1342,6 +1380,7 @@ function NumberField({
   prefix?: string;
   suffix?: string;
   min?: number;
+  max?: number;
   step?: number;
   tooltip?: string;
 }) {
@@ -1378,6 +1417,7 @@ function NumberField({
           type={useCommaFormatting ? "text" : "number"}
           inputMode={useCommaFormatting ? "decimal" : undefined}
           min={min}
+          max={max}
           step={step}
           value={displayValue}
           onFocus={() => setIsFocused(true)}
@@ -1443,14 +1483,23 @@ function AgeSelect({
   label,
   value,
   onChange,
+  tooltip,
 }: {
   label: string;
   value: 60 | 65 | 70;
   onChange: (value: 60 | 65 | 70) => void;
+  tooltip?: string;
 }) {
   return (
     <label className="field-label">
-      {label}
+      {tooltip ? (
+        <span className="field-label-text">
+          {label}
+          <FieldHint text={tooltip} />
+        </span>
+      ) : (
+        label
+      )}
       <select
         value={value}
         onChange={(event) =>
@@ -1471,15 +1520,21 @@ const monthNames = [
 function MonthSelect({
   value,
   onChange,
+  label = "Birth month",
+  tooltip = "Used to prorate CPP, OAS, and other income streams in the calendar year they start or end, instead of assuming a full year's amount immediately.",
+  unsetLabel = "Unknown",
 }: {
   value: number | undefined;
   onChange: (value: number | undefined) => void;
+  label?: string;
+  tooltip?: string;
+  unsetLabel?: string;
 }) {
   return (
     <label className="field-label">
       <span className="field-label-text">
-        Birth month
-        <FieldHint text="Used to prorate CPP, OAS, and other income streams in the calendar year they start or end, instead of assuming a full year's amount immediately." />
+        {label}
+        <FieldHint text={tooltip} />
       </span>
       <select
         value={value ?? ""}
@@ -1487,7 +1542,7 @@ function MonthSelect({
           onChange(event.target.value === "" ? undefined : Number(event.target.value))
         }
       >
-        <option value="">Unknown</option>
+        <option value="">{unsetLabel}</option>
         {monthNames.map((name, index) => (
           <option key={name} value={index + 1}>
             {name}
@@ -1529,13 +1584,15 @@ function IncomeStreamsEditor({
   streams,
   minimumAge,
   targetDeathAge,
+  personalInfo,
   people,
   onChange,
 }: {
   streams: IncomeStream[];
   minimumAge: number;
   targetDeathAge: number;
-  people: Array<{ id: string; label: string }>;
+  personalInfo: RetirementInputs["personalInfo"];
+  people: Array<{ id: string; label: string; currentAge: number; birthMonth?: number }>;
   onChange: (streams: IncomeStream[]) => void;
 }) {
   const updateStream = (id: string, changes: Partial<IncomeStream>) =>
@@ -1566,7 +1623,10 @@ function IncomeStreamsEditor({
           Add income
         </button>
       </div>
-      {streams.map((stream) => (
+      {streams.map((stream) => {
+        const owner = people.find((person) => person.id === (stream.ownerId ?? "primary")) ?? people[0];
+        const maxAge = maxHouseholdAge(owner, personalInfo);
+        return (
         <div className="income-card" key={stream.id}>
           <div className="section-title-row">
             <span className="stream-title">Income stream</span>
@@ -1641,20 +1701,42 @@ function IncomeStreamsEditor({
             <NumberField
               label="Start age"
               min={minimumAge}
+              max={stream.endAge}
               value={stream.startAge}
+              tooltip={`Starts ${monthYearLabel(owner, stream.startAge, undefined, stream.startMonth)}`}
               onChange={(value) =>
                 updateStream(stream.id, {
-                  startAge: Math.max(minimumAge, Number(value)),
+                  startAge: Math.min(stream.endAge, Math.max(minimumAge, Number(value))),
                 })
               }
             />
             <NumberField
               label="End age"
-              min={minimumAge}
+              min={stream.startAge}
+              max={maxAge}
               value={stream.endAge}
+              tooltip={`Ends ${monthYearLabel(owner, stream.endAge, undefined, stream.endMonth)}`}
               onChange={(value) =>
-                updateStream(stream.id, { endAge: Number(value) })
+                updateStream(stream.id, {
+                  endAge: Math.min(maxAge, Math.max(stream.startAge, Number(value))),
+                })
               }
+            />
+          </div>
+          <div className="field-grid two-up income-indexation-fields">
+            <MonthSelect
+              label="Start month"
+              tooltip="Defaults to the owner's birth month. Override if this income starts in a different month, e.g. retiring in June despite a December birthday."
+              unsetLabel="Same as birth month"
+              value={stream.startMonth}
+              onChange={(value) => updateStream(stream.id, { startMonth: value })}
+            />
+            <MonthSelect
+              label="End month"
+              tooltip="Defaults to the owner's birth month. Override if this income ends in a different month than the birthday."
+              unsetLabel="Same as birth month"
+              value={stream.endMonth}
+              onChange={(value) => updateStream(stream.id, { endMonth: value })}
             />
           </div>
           <div className="field-grid two-up income-indexation-fields">
@@ -1731,7 +1813,8 @@ function IncomeStreamsEditor({
             </div>
           )}
         </div>
-      ))}
+        );
+      })}
       {streams.length === 0 && (
         <p className="empty-section">No income streams configured.</p>
       )}
@@ -1741,12 +1824,15 @@ function IncomeStreamsEditor({
 function SpendingPlanEditor({
   spendingPlan,
   minimumAge,
+  personalInfo,
   onChange,
 }: {
   spendingPlan: SpendingPlan;
   minimumAge: number;
+  personalInfo: RetirementInputs["personalInfo"];
   onChange: (spendingPlan: SpendingPlan) => void;
 }) {
+  const maxAge = maxHouseholdAge(personalInfo, personalInfo);
   const updatePhase = (
     id: string,
     changes: Partial<SpendingPlan["phases"][number]>,
@@ -1803,21 +1889,25 @@ function SpendingPlanEditor({
             <NumberField
               label="Start age"
               min={minimumAge}
+              max={phase.endAge}
               value={phase.startAge}
-              tooltip={`Age ${phase.startAge} for the primary person = calendar year ${calendarYearForAge(phase.startAge, minimumAge)}`}
+              tooltip={`Starts ${monthYearLabel(personalInfo, phase.startAge)} for the primary person (spending phases always follow the primary's age).`}
               onChange={(value) =>
                 updatePhase(phase.id, {
-                  startAge: Math.max(minimumAge, Number(value)),
+                  startAge: Math.min(phase.endAge, Math.max(minimumAge, Number(value))),
                 })
               }
             />
             <NumberField
               label="End age"
-              min={minimumAge}
+              min={phase.startAge}
+              max={maxAge}
               value={phase.endAge}
-              tooltip={`Age ${phase.endAge} for the primary person = calendar year ${calendarYearForAge(phase.endAge, minimumAge)}`}
+              tooltip={`Ends ${monthYearLabel(personalInfo, phase.endAge)} for the primary person.`}
               onChange={(value) =>
-                updatePhase(phase.id, { endAge: Number(value) })
+                updatePhase(phase.id, {
+                  endAge: Math.min(maxAge, Math.max(phase.startAge, Number(value))),
+                })
               }
             />
             <NumberField
@@ -1860,9 +1950,6 @@ function SpendingPlanEditor({
       </label>
     </section>
   );
-}
-function calendarYearForAge(age: number, currentAge: number) {
-  return new Date().getFullYear() + (age - currentAge);
 }
 function DashboardView({
   kpis,
@@ -1991,6 +2078,7 @@ function LedgerView({
   onGenerateReturns: () => void;
   onReturnChange: (age: number, rate: number) => void;
 }) {
+  const [expandedAges, setExpandedAges] = useState<Set<number>>(new Set());
   if (!projection)
     return (
       <section className="ledger-panel ledger-panel--dense">
@@ -2076,16 +2164,37 @@ function LedgerView({
                   year.age >= phase.startAge && year.age <= phase.endAge,
               );
               const phase = inputs.spendingPlan.phases[phaseIndex];
+              const hasSubPeriods = (year.subPeriods?.length ?? 0) > 0;
+              const isExpanded = expandedAges.has(year.age);
               return (
+                <Fragment key={year.age}>
                 <tr
-                  key={year.age}
                   className={
                     phaseIndex >= 0
                       ? `phase-row phase-row-${phaseIndex % 3}`
                       : ""
                   }
                 >
-                  <td>{year.calendarYear}</td>
+                  <td>
+                    {hasSubPeriods && (
+                      <button
+                        type="button"
+                        className="button button-quiet ledger-expand-toggle"
+                        aria-label={isExpanded ? "Collapse" : "Expand"}
+                        onClick={() =>
+                          setExpandedAges((current) => {
+                            const next = new Set(current);
+                            if (next.has(year.age)) next.delete(year.age);
+                            else next.add(year.age);
+                            return next;
+                          })
+                        }
+                      >
+                        {isExpanded ? "\u2212" : "+"}
+                      </button>
+                    )}
+                    {year.calendarYear}
+                  </td>
                   <td>{year.age}</td>
                   <td>
                     <span className="phase-tag">
@@ -2111,10 +2220,10 @@ function LedgerView({
                   <td>{formatCurrency(year.income.employment)}</td>
                   <td>{formatCurrency(year.income.cpp)}</td>
                   <td>{formatCurrency(year.income.oas)}</td>
-                  <td>{formatCurrency(year.income.rrspWithdrawal + year.withdrawals.rrsp)}</td>
-                  <td>{formatCurrency(year.income.tfsaWithdrawal + year.withdrawals.tfsa)}</td>
-                  <td>{formatCurrency(year.income.nonRegisteredWithdrawal + year.withdrawals.nonRegistered)}</td>
-                  <td>{formatCurrency(year.income.interest + year.income.interestBearingWithdrawal + year.withdrawals.interestBearing)}</td>
+                  <td>{formatCurrency(year.income.rrspWithdrawal)}</td>
+                  <td>{formatCurrency(year.income.tfsaWithdrawal)}</td>
+                  <td>{formatCurrency(year.income.nonRegisteredWithdrawal)}</td>
+                  <td>{formatCurrency(year.income.interest + year.income.interestBearingWithdrawal)}</td>
                   <td>{formatCurrency(year.taxes.totalTax)}</td>
                   <td>{formatCurrency(year.openingBalances.rrsp)}</td>
                   <td>{formatCurrency(year.closingBalances.rrsp)}</td>
@@ -2127,12 +2236,80 @@ function LedgerView({
                   <td>{formatCurrency(year.netSpendableCash)}</td>
                   <td>{formatCurrency(year.estateValue)}</td>
                 </tr>
+                {hasSubPeriods && isExpanded && (
+                  <tr className="ledger-subperiod-row">
+                    <td colSpan={ledgerLeadColumns.length + ledgerIncomeColumns.length + ledgerTailColumns.length}>
+                      <div className="ledger-subperiod-sticky">
+                        <SubPeriodTable subPeriods={year.subPeriods!} income={year.income} withdrawals={year.withdrawals} />
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
               );
             })}
           </tbody>
         </table>
       </div>
     </section>
+  );
+}
+const subPeriodLabels: Record<number, string[]> = {
+  2: ["H1", "H2"],
+  4: ["Q1", "Q2", "Q3", "Q4"],
+  12: monthNames.map((name) => name.slice(0, 3)),
+};
+function SubPeriodTable({
+  subPeriods,
+  income,
+  withdrawals,
+}: {
+  subPeriods: NonNullable<YearProjection["subPeriods"]>;
+  income: YearProjection["income"];
+  withdrawals: YearProjection["withdrawals"];
+}) {
+  const labels = subPeriodLabels[subPeriods.length] ?? subPeriods.map((_, index) => `${index + 1}`);
+  // year.income.X already folds in the waterfall withdrawal (see combinedIncome in fundHousehold), so isolate just the
+  // stream-driven portion here before prorating it evenly per period - adding the raw income.X would double-count.
+  const periodCount = subPeriods.length || 1;
+  const rrspStreamPerPeriod = (income.rrspWithdrawal - withdrawals.rrsp) / periodCount;
+  const tfsaStreamPerPeriod = (income.tfsaWithdrawal - withdrawals.tfsa) / periodCount;
+  const nonRegisteredStreamPerPeriod = (income.nonRegisteredWithdrawal - withdrawals.nonRegistered) / periodCount;
+  const interestBearingStreamPerPeriod = (income.interest + income.interestBearingWithdrawal - withdrawals.interestBearing) / periodCount;
+  return (
+    <table className="ledger-subperiod-table">
+      <thead>
+        <tr>
+          <th>Period</th>
+          <th>Return</th>
+          <th>RRSP w/d</th>
+          <th>TFSA w/d</th>
+          <th>Non-reg w/d</th>
+          <th>GIC w/d</th>
+          <th>Portfolio value</th>
+        </tr>
+      </thead>
+      <tbody>
+        {subPeriods.map((period) => (
+          <tr key={period.index}>
+            <td>{labels[period.index] ?? period.index + 1}</td>
+            <td>{formatPercent(period.portfolioReturn)}</td>
+            <td>{formatCurrency(period.withdrawals.rrsp + rrspStreamPerPeriod)}</td>
+            <td>{formatCurrency(period.withdrawals.tfsa + tfsaStreamPerPeriod)}</td>
+            <td>{formatCurrency(period.withdrawals.nonRegistered + nonRegisteredStreamPerPeriod)}</td>
+            <td>{formatCurrency(period.withdrawals.interestBearing + interestBearingStreamPerPeriod)}</td>
+            <td>
+              {formatCurrency(
+                period.closingBalances.rrsp
+                + period.closingBalances.tfsa
+                + period.closingBalances.nonRegistered
+                + period.closingBalances.interestBearing,
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 function MonteCarloView({
@@ -2733,20 +2910,21 @@ function GuideView() {
       title: "What this tool actually calculates",
       body: (
         <>
-          <p>The Dashboard and Ledger show a single "variable-return" projection: one randomized sequence of annual investment returns and inflation (generated from your Assumptions), simulated year by year from your current age to your target death age.</p>
-          <p>Monte Carlo re-runs that same year-by-year math hundreds of times, each time with a fresh random sequence of returns/inflation, so you can see the spread of outcomes (best case, worst case, typical case) instead of just one path.</p>
-          <p>Every year the engine: adds fixed income (employment, CPP, OAS, pensions), applies mandatory withdrawals (RRIF minimums), draws down accounts in a fixed order to cover any remaining spending need, calculates tax, checks for OAS clawback, and reinvests any leftover cash - then grows all balances by that year's investment return.</p>
+          <p>This is a scenario-based planning model. It predicts possible household cash flow, taxes, account balances, and estate values from the assumptions you enter, but it cannot predict which future scenario will occur.</p>
+          <p>The Dashboard and Ledger show one seeded variable-return path. Monte Carlo runs the same plan many times with different return and inflation paths, then summarizes the range of outcomes. A high success rate means the modeled portfolio stayed funded; it does not guarantee that result in real life.</p>
+          <p>Each simulated year adds income, applies the selected withdrawal schedule, calculates annual tax and OAS recovery tax, reinvests eligible surplus cash, and updates the accounts. With monthly, quarterly, or semi-annual withdrawals, the market return is also split into matching sub-period returns that compound back to the year's return.</p>
         </>
       ),
     },
     {
-      title: "People: birth month, province, CPP/OAS payout",
+      title: "People and dates",
       body: (
         <>
-          <p><strong>Birth month</strong> only matters for prorating the first and last year of an age-gated benefit (CPP, OAS, or an income stream with a start/end age). Without it, a benefit starting "at age 65" is assumed to start on your birthday exactly at the start of the simulation year; with it, the tool prorates that first/last year by the fraction of months you actually qualify.</p>
-          <p><strong>Province</strong> selects which provincial tax bracket set (and provincial basic personal amount/credit rate) applies on the Tax Info tab. Quebec additionally gets a federal tax abatement, and Ontario gets a provincial surtax on top of its brackets - both are handled automatically once you pick the province.</p>
-          <p><strong>CPP/OAS payout %</strong> lets you dial in less than the maximum benefit (e.g. if you didn't contribute the full 39 years, or didn't live in Canada long enough for full OAS).</p>
-          <p>Each additional person you add files their <strong>own</strong> tax return with their own brackets, basic personal amount, accounts, and benefits - the household total is just the sum of everyone's numbers, not a joint return.</p>
+          <p><strong>Current age</strong> anchors the simulation. <strong>Death age</strong> is the person's birthday cutoff for age-based income and benefits; the estate is settled in the final simulated year. The information icons beside age fields show the corresponding month and year when enough date information is available.</p>
+          <p><strong>Birth month</strong> is optional. Set it when you want age-based starts and ends, CPP/OAS, or death timing to be prorated to a particular month. If it is unknown, the model uses a full-year approximation.</p>
+          <p>Income streams can override the birth month with their own <strong>start month</strong> and <strong>end month</strong>. This is useful for retiring in June even when your birthday is in December. Spending phases remain on the primary person's age timeline.</p>
+          <p>Each additional person has their own age, birth month, benefits, accounts, and tax return. Household projections use the longest household lifespan; age-based income belongs to the person who owns that stream.</p>
+          <p><strong>Province</strong> selects the provincial tax rules. <strong>CPP/OAS payout %</strong> lets you model less than the maximum benefit.</p>
         </>
       ),
     },
@@ -2754,9 +2932,10 @@ function GuideView() {
       title: "Income streams",
       body: (
         <>
-          <p>Each income stream has a tax treatment (employment, pension, CPP, OAS, RRSP withdrawal, eligible/non-eligible dividend, capital gains, or tax-free) that decides how it's taxed - separate from CPP/OAS calculated automatically from Strategy settings.</p>
-          <p>"Indexed to inflation" grows that stream's dollar amount by the simulation's randomized inflation rate every year. Turn it off for something fixed in nominal dollars (e.g. a fixed-payment annuity).</p>
-          <p>An income stream can also route part of its amount into RRSP/TFSA/non-registered contributions (e.g. a salary that funds ongoing RRSP contributions) - those land directly in the matching account balance each year.</p>
+          <p>Each stream has an owner, amount, age range, optional start/end month, tax treatment, and indexation rule. The age and month controls determine when the stream starts and stops; the nearby information icon shows the resulting date.</p>
+          <p>Tax treatment controls how the amount is classified: employment and pension are ordinary income, registered withdrawals are taxable or tax-free as appropriate, dividends receive their modeled treatment, and capital gains use the configured inclusion rate.</p>
+          <p>Employment and pension streams can route part of their cash into RRSP, TFSA, or non-registered contributions. Those contributions are added directly to the relevant account instead of being treated as spending.</p>
+          <p>Indexation can follow inflation, a portion of inflation, a fixed annual rate, or no increase. The model uses annual income totals; the withdrawal schedule controls how spending draws are distributed within the year.</p>
         </>
       ),
     },
@@ -2767,7 +2946,7 @@ function GuideView() {
           <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. Once you turn 71, a mandatory minimum withdrawal kicks in automatically each year (the CRA's prescribed percentage of the RRIF's value at the start of that year) - see the "RRIF withdrawal rate" chart to compare it against what's actually withdrawn.</p>
           <p><strong>TFSA</strong>: withdrawals are always tax-free and never counted as income anywhere.</p>
           <p><strong>Non-registered</strong> + <strong>Adjusted cost base (ACB)</strong>: only the gain above your ACB is taxable, and only that portion is a capital gain (taxed at the capital gains inclusion rate on the Assumptions tab, currently 50% or 66.67% included). If ACB equals the account balance there's no gain and changing it further won't do anything; the same applies at death, where any remaining unrealized gain is deemed realized.</p>
-          <p><strong>GIC / interest income</strong>: modeled separately from the market-return accounts because it earns its own fixed rate and is principal-protected (never declines). It compounds tax-deferred for the term you set, then the whole accumulated amount is taxed as ordinary income the year the term matures (like a GIC/PPN, not a T5 issued annually) - unless you withdraw early, which crystallizes a proportional share of the deferred growth immediately.</p>
+          <p><strong>GIC / interest income</strong>: modeled separately from market-return accounts because it earns its own fixed rate and is principal-protected. It compounds tax-deferred for the selected term, then accumulated growth is taxed as ordinary income at maturity. An early withdrawal realizes a proportional share of deferred growth.</p>
         </>
       ),
     },
@@ -2775,8 +2954,9 @@ function GuideView() {
       title: "Spending",
       body: (
         <>
-          <p>Spending is defined in phases (e.g. "go-go years" vs. "slow-go years") each with its own annual target and age range. "Indexed to inflation" grows every phase's target by cumulative simulated inflation from today; turned off, spending targets stay fixed in today's dollars.</p>
-          <p>Each year, the engine tries to fund that year's target after tax, drawing from accounts in this order: GIC/interest first (no further tax benefit to staying invested), then non-registered, then TFSA, then RRSP. If there isn't enough left in every account, the plan shows a funding shortfall for that year rather than going negative.</p>
+          <p>Spending is defined in phases, each with an annual target and age range. The information icons show the primary person's corresponding dates. Start age cannot be after end age, and the editor caps end ages at the household's modeled lifespan.</p>
+          <p>When spending is indexed, each phase grows with cumulative simulated inflation. Otherwise its target stays fixed in nominal dollars.</p>
+          <p>The withdrawal order is configurable. The model uses it to cover after-tax spending shortfalls, with RRIF minimums and any configured income streams included in the annual cash-flow calculation. If the accounts cannot fund the target, the projection is marked depleted instead of borrowing an invented balance.</p>
         </>
       ),
     },
@@ -2784,10 +2964,10 @@ function GuideView() {
       title: "Assumptions: what's random and what isn't",
       body: (
         <>
-          <p><strong>Return mean/StdDev</strong> and <strong>Inflation mean/StdDev</strong> define a normal-ish (lognormal, bounded) distribution that both the Dashboard/Ledger's single path and every Monte Carlo run draw from independently each year - they're not the same fixed number every year, they're randomized around these values.</p>
-          <p><strong>Return floor/ceiling</strong> clip how extreme any single year's randomly drawn return can be, in both the deterministic path and Monte Carlo.</p>
-          <p>On the Ledger tab you can manually override specific years' returns (e.g. to model a real historical sequence or stress-test a crash at a specific age) - Monte Carlo ignores these overrides and always randomizes.</p>
-          <p>One important simplification: federal/provincial tax brackets, the basic personal amount, TFSA contribution room, and OAS clawback thresholds all inflate forward using the simulation's own inflation rate, but the underlying <em>rates</em> (tax rates, inclusion rate, etc.) never change over the plan - there's no way to model future tax reform.</p>
+          <p><strong>Return mean/StdDev</strong> and <strong>Inflation mean/StdDev</strong> define the distributions used to generate paths. <strong>Return floor/ceiling</strong> limit extreme annual returns. The random seed makes the single path reproducible.</p>
+          <p>For a non-annual withdrawal frequency, each annual return is decomposed into sub-period returns that preserve the annual compounded result while allowing positive and negative months or quarters within the year.</p>
+          <p>The Ledger can override individual annual returns for the single projection. Monte Carlo ignores those overrides and generates fresh paths.</p>
+          <p>Tax brackets, basic personal amounts, TFSA room, and OAS thresholds are projected forward using simulated inflation, while tax rates and other rule parameters remain fixed. Future legislation is not modeled.</p>
         </>
       ),
     },
@@ -2795,8 +2975,9 @@ function GuideView() {
       title: "Strategy",
       body: (
         <>
-          <p><strong>CPP/OAS start age</strong> (60/65/70) changes both the monthly benefit amount (early = permanently reduced, late = permanently increased) and how much lifetime benefit you collect.</p>
-          <p><strong>Aggressive RRSP meltdown</strong>, once retired, withdraws extra RRSP/RRIF money each year beyond what's needed for spending - just enough to "fill up" your current federal tax bracket without pushing into the next one - to shrink the RRSP before mandatory minimums or death force it out at a worse rate. The "Aggressive RRSP meltdown: impact" charts at the bottom of the Dashboard compare your plan with this toggled on vs. off, holding the randomized return sequence identical so only the withdrawal strategy differs.</p>
+          <p><strong>Withdrawal frequency</strong> controls when the waterfall runs: annual, semi-annual, quarterly, or monthly. More frequent schedules expose the portfolio to more realistic within-year timing and make the Ledger expandable by period.</p>
+          <p><strong>CPP/OAS start age</strong> changes the modeled benefit amount: starting early reduces it and delaying increases it. The strategy age and the person's date determine the timing shown by the information icon.</p>
+          <p><strong>Aggressive RRSP meltdown</strong> withdraws additional RRSP/RRIF funds after retirement to fill the current federal bracket. It is a tax strategy approximation, and its annual decision is displayed in the sub-period table as smoothed period amounts when using a non-annual schedule.</p>
         </>
       ),
     },
@@ -2804,7 +2985,7 @@ function GuideView() {
       title: "Death, estate, and probate",
       body: (
         <>
-          <p>When someone reaches their target death age, their accounts either roll over tax-free to a surviving person in the household, or - if no one survives them - are deemed fully disposed: the RRSP/RRIF and any deferred GIC growth become fully taxable ordinary income, and non-registered growth above the ACB becomes a taxable capital gain, all in that final year.</p>
+          <p>When someone reaches their target death age, their accounts either roll over tax-free to a surviving person in the household, or - if no one survives them - are deemed disposed: RRSP/RRIF balances and deferred GIC growth become ordinary income, while non-registered growth above the ACB becomes a capital gain.</p>
           <p>What's left after that final tax bill is reduced further by the probate fee rate (Assumptions) to produce the final estate value shown on the Dashboard.</p>
         </>
       ),
@@ -2816,12 +2997,22 @@ function GuideView() {
       ),
     },
     {
+      title: "Your data stays on this device",
+      body: (
+        <>
+          <p>All calculations run locally in your browser. This tool has no telemetry, does not send your scenario to a server, and does not store your financial information anywhere off this device.</p>
+          <p><strong>Save</strong> keeps a scenario in this browser on this device so you can return to it later. It is not an online account, and it will not automatically appear on another computer or phone.</p>
+          <p><strong>Export</strong> downloads a copy of your scenario as a file. Keep that file somewhere safe if you want a backup or need to move the scenario to another device. <strong>Import</strong> lets you choose that file and load the scenario into the app on the new device.</p>
+          <p>Clearing browser data or using private browsing can remove locally saved scenarios. Export important scenarios before doing that.</p>
+        </>
+      ),
+    },
+    {
       title: "Saving, loading, import & export",
       body: (
         <>
-          <p><strong>Save</strong> writes your current inputs into your browser's own storage (localStorage, under the key "retirement-planner.scenarios") - nothing is sent to a server. The first time you save a "New Scenario" it creates a new entry; saving again while that scenario is selected overwrites it in place. The scenario picker dropdown and name field let you switch between or rename saved scenarios; renaming (by editing the name field and clicking away) updates the saved copy immediately without needing to press Save.</p>
-          <p>Because it's stored in your browser, a saved scenario is only available on that browser/device/profile - clearing site data, using a different browser, or private/incognito mode won't see it. <strong>New</strong> resets the working form back to the defaults without touching anything already saved. <strong>Delete</strong> removes the currently-selected saved scenario (with a confirmation prompt) - it's disabled while you're on "New Scenario" since there's nothing saved to delete yet.</p>
-          <p><strong>Export</strong> downloads your current inputs as a standalone <code>.json</code> file (named after the scenario) - use this to back up a scenario outside the browser, or to move it to another device/browser. <strong>Import</strong> reads a previously exported <code>.json</code> file back in as a brand-new saved scenario and switches to it immediately; it validates the file's shape first and silently ignores anything that doesn't look like a valid set of plan inputs.</p>
+          <p><strong>Save</strong> stores the current scenario in this browser. Saving again updates the selected scenario. <strong>New</strong> starts a fresh scenario without deleting saved ones, and <strong>Delete</strong> removes the selected saved scenario.</p>
+          <p><strong>Export</strong> makes a file you can keep as a backup. <strong>Import</strong> loads one of those files back into the app and creates a saved scenario from it. This is the way to move a scenario between devices.</p>
         </>
       ),
     },
@@ -2829,11 +3020,11 @@ function GuideView() {
       title: "The other tabs",
       body: (
         <>
-          <p><strong>Dashboard</strong>: the single variable-return projection - KPIs, portfolio/spending/tax charts, and the meltdown comparison.</p>
-          <p><strong>Ledger</strong>: the same projection as a year-by-year table, where you can override individual years' returns.</p>
-          <p><strong>Monte Carlo</strong>: hundreds of randomized runs summarized as percentile bands, plus a failure-rate analysis of how often the plan runs out of money.</p>
-          <p><strong>Compare</strong>: run two full scenarios side by side to see how a change in inputs shifts the outcome.</p>
-          <p><strong>Tax Info</strong>: the editable federal/provincial bracket tables, basic personal amounts, and credit rates actually used by every calculation in the tool.</p>
+          <p><strong>Dashboard</strong>: the main projection, KPIs, charts, and strategy comparison.</p>
+          <p><strong>Ledger</strong>: the same projection in a year-by-year table. Edit annual returns and expand years to inspect monthly, quarterly, or semi-annual returns and withdrawals.</p>
+          <p><strong>Monte Carlo</strong>: randomized runs summarized as percentile bands, success rate, and failure analysis.</p>
+          <p><strong>Compare</strong>: run two saved scenarios side by side to see how changing inputs affects the result.</p>
+          <p><strong>Tax Info</strong>: the editable tax brackets, credits, and rates used by the model.</p>
         </>
       ),
     },
