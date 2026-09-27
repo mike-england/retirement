@@ -21,9 +21,10 @@ export const defaultRetirementInputs: RetirementInputs = {
       startAge: 50,
       endAge: 64,
       taxTreatment: "employment",
-      indexationMode: "fullInflation",
+      indexationMode: "none",
     },
   ],
+  contributionSchedules: [],
   existingAssets: {
     rrspBalance: 0,
     tfsaBalance: 0,
@@ -42,10 +43,13 @@ export const defaultRetirementInputs: RetirementInputs = {
     ],
   },
   assumptions: {
-    returnMean: 0.05,
-    returnStdDev: 0.12,
-    returnFloor: -0.08,
-    returnCeiling: 0.15,
+    // A moderate/balanced-growth portfolio: ~6% average nominal return, realistically wide floor/ceiling (a severe
+    // recession year vs. a strong recovery year) so the crash/calm return model has room to draw genuine down years
+    // instead of clamping almost everything toward one bound. See the Assumptions tab's return distribution preview.
+    returnMean: 0.06,
+    returnStdDev: 0.11,
+    returnFloor: -0.25,
+    returnCeiling: 0.2,
     annualReturnOverrides: {},
     inflationMean: 0.02,
     inflationStdDev: 0.01,

@@ -84,12 +84,20 @@ export interface IncomeStream {
   indexationMode: IndexationMode;
   // Fraction of simulated inflation for "partialInflation" (e.g. 0.9 = 90% COLA), or a flat annual rate for "fixedRate" (e.g. 0.015 = 1.5%/yr).
   indexationRate?: number;
+  startMonth?: number;
+  endMonth?: number;
+}
+
+export interface ContributionSchedule {
+  id: string;
+  ownerId: string;
+  label: string;
+  year: number;
+  endYear: number;
+  frequency: "annual" | "monthly";
   annualRrspContribution?: number;
   annualTfsaContribution?: number;
   annualNonRegisteredContribution?: number;
-  // Overrides the owner's birth month for prorating THIS stream's start/end year, e.g. retiring in June despite a December birthday. Unset = use birth month.
-  startMonth?: number;
-  endMonth?: number;
 }
 
 export interface ExistingAssets {
@@ -97,9 +105,30 @@ export interface ExistingAssets {
   tfsaBalance: number;
   nonRegisteredBalance: number;
   nonRegisteredBookValue: number;
+  // Deprecated: a single implicit GIC starting immediately, kept only so older saved scenarios still load. New scenarios use `gics` below.
   interestBearingBalance?: number;
   interestBearingTermYears?: number;
   interestBearingRate?: number;
+  // A ladder of GICs/PPNs, each with its own start age, term, rate, funding source, and maturity behavior.
+  gics?: GicHolding[];
+}
+
+// The tax status of the GIC holding. "external" is retained as a legacy alias for non-registered saved scenarios.
+export type GicFundingSource = "external" | "registered" | "nonRegistered";
+// What happens to a GIC's proceeds when its term matures: "renew" starts an identical new term immediately (a true
+// ladder, indefinitely), "cashOut" moves the proceeds into the non-registered account instead of continuing.
+export type GicMaturityAction = "renew" | "cashOut";
+
+export interface GicHolding {
+  id: string;
+  label?: string;
+  balance: number;
+  // Total guaranteed return for the whole term (e.g. "5% for a 2-year GIC" = 5% over those 2 years), same convention as the legacy single-GIC rate.
+  rate: number;
+  termYears: number;
+  startAge: number;
+  fundingSource: GicFundingSource;
+  maturityAction: GicMaturityAction;
 }
 
 export interface SpendingPhase {
@@ -139,7 +168,23 @@ export interface StrategySettings {
   withdrawalOrder: WithdrawalAccount[];
   // Defaults to "annual" (a single year-end withdrawal) for scenarios saved before this was configurable.
   withdrawalFrequency?: WithdrawalFrequency;
+  // Uses the GIC/PPN as a sequence-of-returns buffer instead of a fixed withdrawal-order position: reserved (and optionally
+  // refilled) while markets are near their peak, then drawn preferentially once the market portfolio is in a real drawdown.
+  gicBuffer?: GicBufferSettings;
 }
+
+export interface GicBufferSettings {
+  enabled: boolean;
+  // Peak-to-current drawdown of the market-linked sub-portfolio (RRSP+TFSA+non-registered) that flips the GIC to being drawn first, e.g. 0.10 = 10% down from its peak.
+  triggerDrawdown: number;
+  // Drawdown level (measured the same way) at which the market is considered recovered and the GIC reverts to being reserved. Should be <= triggerDrawdown to avoid flip-flopping year to year.
+  recoveryDrawdown: number;
+  // While reserved, redirects any leftover cash (e.g. RRIF minimums exceeding spending need) into the GIC first, up to targetBalance, before TFSA/non-registered.
+  refillFromSurplus: boolean;
+  // Balance to refill toward; defaults to the household's combined starting GIC balance when unset.
+  targetBalance?: number;
+}
+
 
 export interface SimulationSettings {
   iterations: number;
@@ -151,6 +196,7 @@ export interface SimulationSettings {
 export interface RetirementInputs {
   personalInfo: PersonalInfo;
   incomeStreams: IncomeStream[];
+  contributionSchedules: ContributionSchedule[];
   existingAssets: ExistingAssets;
   spendingPlan: SpendingPlan;
   assumptions: MarketAssumptions;
@@ -159,14 +205,29 @@ export interface RetirementInputs {
   simulation: SimulationSettings;
 }
 
+// Live simulation state for a single GIC ladder rung (distinct from the GicHolding config it was created from).
+export interface GicPositionState {
+  id: string;
+  balance: number;
+  accrued: number;
+  fundingSource: GicFundingSource;
+  termElapsed: number;
+  termYears: number;
+  // Effective annual compounding rate (already converted from the configured total-for-term rate).
+  annualRate: number;
+  maturityAction: GicMaturityAction;
+}
+
 export interface AccountBalances {
   rrsp: number;
   tfsa: number;
   nonRegistered: number;
   nonRegisteredBookValue: number;
+  // Aggregate across all gicPositions below - kept in sync whenever positions change, and is what withdrawals/display use.
   interestBearing: number;
   interestBearingAccrued: number;
-  interestBearingTermElapsed: number;
+  taxableInterestBearingAccrued: number;
+  gicPositions: GicPositionState[];
 }
 
 export interface AccountWithdrawals {
@@ -223,7 +284,13 @@ export interface YearProjection {
   portfolioReturn: number;
   inflationRate: number;
   estateValue: number;
+  // One-time deemed-disposition tax on death (RRSP/RRIF, deferred GIC growth, and non-registered gains), only nonzero the
+  // year the last household member dies with no surviving person to roll over to. Kept separate from `taxes` (which
+  // reflects that year's ordinary living income tax) since it's paid from the estate, not funded from annual cash flow.
+  estateTax: number;
   depleted: boolean;
+  // Only populated when strategy.gicBuffer.enabled: whether the GIC was being drawn (market drawdown past trigger) or reserved/refilled that year.
+  gicBufferMode?: "draw" | "reserve";
   // Only populated when strategy.withdrawalFrequency isn't "annual": the within-year breakdown driving the withdrawal waterfall.
   subPeriods?: SubPeriodProjection[];
 }

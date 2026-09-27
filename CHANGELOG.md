@@ -1,3 +1,16 @@
+# 1.2.0 (September 27, 2026)
+- Derived household retirement timing from employment income end ages/months instead of a separate retirement date. Monthly spending and withdrawals begin when the last employment stream ends, while income streams can define their own partial first/final years.
+- Income start/end age tooltips now show calendar month/year boundaries using the person's current age and birth month; income starts default to January and ends default to December.
+- Separated contributions from income streams with a dedicated Contributions tab for owner, age range, and RRSP/TFSA/non-registered amounts. RRSP contributions reduce taxable income; all contributions reduce available cash.
+- Contribution schedules apply across an inclusive calendar-year range; users can create a separate one-year schedule for unusual or partial years.
+- Contribution schedules can be annual or monthly; monthly amounts are deposited through sub-period simulations so they participate in returns as they arrive.
+- Added multiple GICs per person, including individual rates, terms, start ages, funding sources, auto-renewal, and cash-out maturity behavior. Existing single-GIC scenarios migrate automatically.
+- Added a GIC buffer strategy that reserves the GIC near market peaks and draws it first during real drawdowns, with optional refill after recovery.
+- Added a return distribution preview and reworked the shared Ledger/Monte Carlo return generator into a properly bounded distribution that tracks the requested mean and updates when assumptions change.
+- Added a separate End-of-life tax Dashboard KPI for one-time estate tax.
+- Updated default return assumptions to a moderate profile: 6% mean, 11% standard deviation, -25% floor, and +20% ceiling.
+- Fixed false portfolio-depleted signals caused by OAS clawback timing and prevented pre-spending income from being silently reinvested as portfolio surplus.
+
 # 1.1.0 (September 10, 2026)
 - Added annual, semi-annual, quarterly, and monthly withdrawal schedules with randomized within-year returns that compound to the selected annual return.
 - Added expandable Ledger rows showing sub-period returns, withdrawals, and portfolio values, with configurable account withdrawal order.
@@ -11,7 +24,7 @@
 
 # 1.0.0 (September 9, 2026)
 - Initial retirement planner: simulation engine, Monte Carlo projections, government benefits and tax rules, results charts.
-- Multi-person/couple plans: each person has their own age, target death age, CPP/OAS elections, and interest-bearing (GIC/PPN) account, and files their own simulated tax return.
+- Multi-person/couple plans: each person has their own age, target death age, CPP/OAS elections, and interest-bearing account, and files their own simulated tax return.
 - Government benefits modeling: CPP and OAS annual amounts with early/deferred start-age adjustments, mandatory RRIF minimum withdrawals from age 71, and an approximated OAS clawback based on projected other taxable income.
 - Canadian tax rules sourced from `@equisoft/tax-ca`, covering federal and all provincial/territorial brackets, basic personal amounts, and surtaxes for the current tax year.
 - Configurable, reorderable withdrawal order across interest-bearing, non-registered, TFSA, and RRSP accounts to control drawdown sequencing.

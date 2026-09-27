@@ -20,7 +20,7 @@ This starts a dev server at http://localhost:3000 with hot reload.
 
 ### Option 2: Static build + local HTTP server
 
-This mirrors what actually gets deployed to GitHub Pages: a static export with no Node.js server involved.
+This produces the same kind of static export deployed to GitHub Pages, with no Node.js server needed to serve it. The default local build uses root paths; the Pages build adds the `/retirement` base path.
 
 ```
 npm install
@@ -33,7 +33,7 @@ e.g. `python3 -m http.server 8000 --directory out`.
 
 ## Releasing
 
-Deploys to GitHub Pages only run when a tag is pushed (any branch). To cut a release:
+GitHub Pages deploys run automatically when a tag is pushed (from any branch), and can also be started manually from the Actions tab. To cut a release:
 
 1. Bump the `version` in [package.json](package.json).
 2. Add a new section at the top of [CHANGELOG.md](CHANGELOG.md): `# X.Y.Z (Month D, Year)` with bullet points.

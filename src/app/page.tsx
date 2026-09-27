@@ -17,20 +17,24 @@ import {
 import { defaultRetirementInputs } from "@/lib/default-inputs";
 import packageJson from "../../package.json";
 import { runMonteCarloSimulation } from "@/lib/monteCarlo";
-import {
-  generateAnnualReturns,
-  projectWithVariableReturns,
-} from "@/lib/projectionPath";
+import { sampleAnnualReturn } from "@/lib/simulationEngine";
+import { projectWithVariableReturns } from "@/lib/projectionPath";
 import {
   availableTaxYears,
   defaultTaxSettings,
   provinceNames,
 } from "@/lib/taxRules";
-import { maxHouseholdAge, monthYearLabel } from "@/lib/planDates";
+import { ageYearLabel, maxHouseholdAge, monthYearLabel } from "@/lib/planDates";
 import { calculateCppAnnualBenefit, cppAnnualMaximum } from "@/lib/governmentBenefits";
 import { SimulationCharts } from "@/components/SimulationCharts";
 import type {
   DeterministicProjection,
+  ContributionSchedule,
+  ExistingAssets,
+  GicBufferSettings,
+  GicFundingSource,
+  GicHolding,
+  GicMaturityAction,
   IncomeStream,
   ProvinceCode,
   RetirementInputs,
@@ -50,6 +54,12 @@ const withdrawalAccountLabels: Record<WithdrawalAccount, string> = {
   rrsp: "RRSP/RRIF",
 };
 const defaultWithdrawalOrder: WithdrawalAccount[] = ["interestBearing", "nonRegistered", "tfsa", "rrsp"];
+const defaultGicBuffer: GicBufferSettings = {
+  enabled: false,
+  triggerDrawdown: 0.1,
+  recoveryDrawdown: 0.03,
+  refillFromSurplus: true,
+};
 
 const ledgerLeadColumns = ["Year", "Age", "Phase", "Return"];
 const ledgerIncomeColumns = [
@@ -98,13 +108,21 @@ export default function Home() {
   const [scenarioName, setScenarioName] = useState("New Scenario");
   const [justSaved, setJustSaved] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const gicBuffer = inputs.strategy.gicBuffer ?? defaultGicBuffer;
+  const updateGicBuffer = (patch: Partial<GicBufferSettings>) =>
+    setInputs((current) => ({
+      ...current,
+      strategy: { ...current.strategy, gicBuffer: { ...(current.strategy.gicBuffer ?? defaultGicBuffer), ...patch } },
+    }));
+  const startingGicBalance = deriveGicList(inputs.existingAssets, inputs.personalInfo.currentAge).reduce((sum, gic) => sum + gic.balance, 0)
+    + (inputs.personalInfo.additionalPeople ?? []).reduce((sum, person) => sum + deriveGicList(person.existingAssets, person.currentAge).reduce((gicSum, gic) => gicSum + gic.balance, 0), 0);
   const averageInvestmentReturn = projection
     ? projection.years.reduce((sum, year) => sum + year.portfolioReturn, 0) /
       projection.years.length
     : 0;
   const shortfallYears = projection
     ? projection.years.filter(
-        (year) => year.spendingTarget > year.netSpendableCash,
+        (year) => year.spendingTarget - year.netSpendableCash > 1,
       )
     : [];
   const totalUnmetSpending = shortfallYears.reduce(
@@ -117,6 +135,9 @@ export default function Home() {
     : 0;
   const lifetimeOas = projection
     ? projection.years.reduce((sum, year) => sum + year.income.oas, 0)
+    : 0;
+  const endOfLifeTax = projection
+    ? projection.years.reduce((sum, year) => sum + year.estateTax, 0)
     : 0;
   const kpis = projection
     ? [
@@ -137,7 +158,12 @@ export default function Home() {
         [
           "Lifetime tax",
           formatCurrency(projection.lifetimeTax),
-          "Federal and provincial",
+          "Federal and provincial, including end-of-life tax",
+        ],
+        [
+          "End-of-life tax",
+          formatCurrency(endOfLifeTax),
+          endOfLifeTax > 0 ? "One-time deemed-disposition bill, paid from the estate" : "No unrolled-over estate at the end of the plan",
         ],
         [
           "Average investment return",
@@ -156,6 +182,7 @@ export default function Home() {
         ["Portfolio status", "--", "Variable-return projection"],
         ["Final estate", "--", "After probate and final taxes"],
         ["Lifetime tax", "--", "Federal and provincial"],
+        ["End-of-life tax", "--", "One-time deemed-disposition bill"],
         ["Lifetime CPP", "--", "All eligible people"],
         ["Lifetime OAS", "--", "All eligible people"],
         ["Portfolio peak age", "--", "Variable-return projection"],
@@ -181,23 +208,27 @@ export default function Home() {
       return next;
     });
   }
-
   function generateReturns() {
     const nextSeed = Date.now() >>> 0;
     applyReturnSeed(nextSeed);
   }
 
-  function applyReturnSeed(seed: number) {
-    const returns = generateAnnualReturns(inputs, seed);
-    const annualReturnOverrides = Object.fromEntries(
-      returns.map((rate, index) => [
-        inputs.personalInfo.currentAge + index,
-        rate,
-      ]),
-    );
+  // Changing the underlying random-generation parameters invalidates any previously locked-in path (bulk-generated or
+  // hand-edited), so the Ledger/Dashboard immediately reflect the new assumptions instead of staying frozen at old values.
+  function setReturnAssumption(patch: Partial<RetirementInputs["assumptions"]>) {
     setInputs((current) => ({
       ...current,
-      assumptions: { ...current.assumptions, annualReturnOverrides },
+      assumptions: { ...current.assumptions, ...patch, annualReturnOverrides: {} },
+    }));
+  }
+
+  function applyReturnSeed(seed: number) {
+    // Clearing overrides (rather than freezing every year's value) lets the Ledger keep regenerating live from the
+    // seed whenever mean/std-dev/floor/ceiling change, instead of the whole path getting stuck at whatever it was
+    // when this seed was picked. Any individual years you've hand-edited via the Ledger's Return cells still stick.
+    setInputs((current) => ({
+      ...current,
+      assumptions: { ...current.assumptions, annualReturnOverrides: {} },
       simulation: { ...current.simulation, randomSeed: seed },
     }));
   }
@@ -261,9 +292,13 @@ export default function Home() {
       return;
     }
     const scenario = scenarios.find((current) => current.id === id);
-    if (scenario) {
+    if (scenario && isRetirementInputs(scenario.inputs)) {
       setScenarioName(scenario.name);
       setInputs(structuredClone(scenario.inputs));
+    } else if (scenario) {
+      window.alert(
+        `"${scenario.name}" uses an older data format and cannot be loaded. Delete it and create a new scenario.`,
+      );
     }
   }
 
@@ -273,6 +308,16 @@ export default function Home() {
     );
     if (!scenario || !window.confirm(`Delete ${scenario.name}?`)) return;
     persistScenarios(scenarios.filter((current) => current.id !== scenario.id));
+    createNewScenario();
+  }
+
+  function deleteAllScenarios() {
+    if (
+      scenarios.length === 0 ||
+      !window.confirm(`Delete all ${scenarios.length} saved scenarios?`)
+    )
+      return;
+    persistScenarios([]);
     createNewScenario();
   }
 
@@ -333,11 +378,7 @@ export default function Home() {
         window.localStorage.getItem(scenarioStorageKey) ?? "[]",
       ) as SavedScenario[];
       if (Array.isArray(savedScenarios))
-        setScenarios(
-          savedScenarios.filter((scenario) =>
-            isRetirementInputs(scenario.inputs),
-          ),
-        );
+        setScenarios(savedScenarios);
     } catch {
       setScenarios([]);
     }
@@ -366,6 +407,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    setProjection(null);
     const debounceTimer = window.setTimeout(() => {
       setIsRunning(true);
       const nextProjection = projectWithVariableReturns(inputs);
@@ -439,6 +481,13 @@ export default function Home() {
           >
             Delete
           </button>
+          <button
+            className="button button-quiet button-delete-all"
+            onClick={deleteAllScenarios}
+            disabled={scenarios.length === 0}
+          >
+            Delete all
+          </button>
           <input
             ref={importInputRef}
             type="file"
@@ -462,6 +511,7 @@ export default function Home() {
               [
                 ["People", UsersRound],
                 ["Income", BriefcaseBusiness],
+                ["Contributions", WalletCards],
                 ["Accounts", WalletCards],
                 ["Spending", BadgeDollarSign],
                 ["Assumptions", SlidersHorizontal],
@@ -566,15 +616,7 @@ export default function Home() {
               <div className="field-label-shell">
                 <MonthSelect
                   value={inputs.personalInfo.birthMonth}
-                  onChange={(value) =>
-                    setInputs((current) => ({
-                      ...current,
-                      personalInfo: {
-                        ...current.personalInfo,
-                        birthMonth: value,
-                      },
-                    }))
-                  }
+                  onChange={(value) => setInputs((current) => ({ ...current, personalInfo: { ...current.personalInfo, birthMonth: value } }))}
                 />
               </div>
               <label className="field-label">
@@ -737,21 +779,13 @@ export default function Home() {
                 <div className="field-label-shell">
                   <MonthSelect
                     value={person.birthMonth}
-                    onChange={(value) =>
-                      setInputs((current) => ({
-                        ...current,
-                        personalInfo: {
-                          ...current.personalInfo,
-                          additionalPeople: (
-                            current.personalInfo.additionalPeople ?? []
-                          ).map((candidate) =>
-                            candidate.id === person.id
-                              ? { ...candidate, birthMonth: value }
-                              : candidate,
-                          ),
-                        },
-                      }))
-                    }
+                    onChange={(value) => setInputs((current) => ({
+                      ...current,
+                      personalInfo: {
+                        ...current.personalInfo,
+                        additionalPeople: (current.personalInfo.additionalPeople ?? []).map((candidate) => candidate.id === person.id ? { ...candidate, birthMonth: value } : candidate),
+                      },
+                    }))}
                   />
                 </div>
                 <div className="benefit-toggles">
@@ -846,17 +880,26 @@ export default function Home() {
             targetDeathAge={inputs.personalInfo.targetDeathAge}
             personalInfo={inputs.personalInfo}
             people={[
-              { id: "primary", label: inputs.personalInfo.label ?? "Primary person", currentAge: inputs.personalInfo.currentAge, birthMonth: inputs.personalInfo.birthMonth },
+              { id: "primary", label: inputs.personalInfo.label ?? "Primary person", currentAge: inputs.personalInfo.currentAge },
               ...(inputs.personalInfo.additionalPeople ?? []).map((person) => ({
                 id: person.id,
                 label: person.label,
                 currentAge: person.currentAge,
-                birthMonth: person.birthMonth,
               })),
             ]}
             onChange={(incomeStreams) =>
               setInputs((current) => ({ ...current, incomeStreams }))
             }
+          />
+          </div>
+          <div hidden={activeInputTab !== "Contributions"}>
+          <ContributionSchedulesEditor
+            schedules={inputs.contributionSchedules}
+            people={[
+              { id: "primary", label: inputs.personalInfo.label ?? "Primary person", currentAge: inputs.personalInfo.currentAge },
+              ...(inputs.personalInfo.additionalPeople ?? []).map((person) => ({ id: person.id, label: person.label, currentAge: person.currentAge })),
+            ]}
+            onChange={(contributionSchedules) => setInputs((current) => ({ ...current, contributionSchedules }))}
           />
           </div>
           <div hidden={activeInputTab !== "Accounts"}>
@@ -903,36 +946,21 @@ export default function Home() {
                   setNumber("existingAssets.nonRegisteredBookValue", value)
                 }
               />
-              <NumberField
-                label="GIC / interest income"
-                prefix="$"
-                tooltip="Guaranteed Investment Certificates, Principal Protected Notes, and similar interest-bearing holdings. Growth is taxed as regular income only when the term below matures (a 1-year term is taxed annually like a T5; a 3-year term compounds tax-deferred for 3 years, then the whole accumulated amount is taxed at once)."
-                value={inputs.existingAssets.interestBearingBalance ?? 0}
-                onChange={(value) =>
-                  setNumber("existingAssets.interestBearingBalance", value)
-                }
-              />
-              <NumberField
-                label="GIC term (years)"
-                min={1}
-                step={1}
-                tooltip="How many years the GIC/PPN compounds before it matures and pays out. Withdrawing early still realizes a proportional share of the deferred growth for tax purposes that year."
-                value={inputs.existingAssets.interestBearingTermYears ?? 1}
-                onChange={(value) =>
-                  setNumber("existingAssets.interestBearingTermYears", String(Math.max(1, Math.round(Number(value)))))
-                }
-              />
-              <NumberField
-                label="GIC rate"
-                suffix="%"
-                step={0.1}
-                tooltip="The guaranteed rate this GIC/PPN earns, separate from the Return mean/StdDev used for RRSP/TFSA/non-registered accounts. Unlike those, it's a fixed rate every year, not randomized in Monte Carlo."
-                value={oneDecimalPercent(inputs.existingAssets.interestBearingRate ?? inputs.assumptions.returnMean)}
-                onChange={(value) =>
-                  setNumber("existingAssets.interestBearingRate", String(Number(value) / 100))
-                }
-              />
             </div>
+            <div className="field-label-text gic-section-heading">
+              <span>GICs / interest-bearing holdings</span>
+              <FieldHint text="Guaranteed Investment Certificates, Principal Protected Notes, and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior - e.g. a laddered set of GICs, or one starting partway through retirement." />
+            </div>
+            <GicListEditor
+              gics={deriveGicList(inputs.existingAssets, inputs.personalInfo.currentAge)}
+              currentAge={inputs.personalInfo.currentAge}
+              onChange={(gics) =>
+                setInputs((current) => ({
+                  ...current,
+                  existingAssets: { ...current.existingAssets, gics },
+                }))
+              }
+            />
           </section>
           {(inputs.personalInfo.additionalPeople ?? []).map((person) => {
             const assets = person.existingAssets ?? {
@@ -990,30 +1018,16 @@ export default function Home() {
                     value={assets.nonRegisteredBookValue}
                     onChange={(value) => updateAssets({ nonRegisteredBookValue: Number(value) })}
                   />
-                  <NumberField
-                    label="GIC / interest income"
-                    prefix="$"
-                    tooltip="Guaranteed Investment Certificates, Principal Protected Notes, and similar interest-bearing holdings. Growth is taxed as regular income only when the term below matures (a 1-year term is taxed annually like a T5; a 3-year term compounds tax-deferred for 3 years, then the whole accumulated amount is taxed at once)."
-                    value={assets.interestBearingBalance ?? 0}
-                    onChange={(value) => updateAssets({ interestBearingBalance: Number(value) })}
-                  />
-                  <NumberField
-                    label="GIC term (years)"
-                    min={1}
-                    step={1}
-                    tooltip="How many years this person's GIC/PPN compounds before it matures and pays out. Withdrawing early still realizes a proportional share of the deferred growth for tax purposes that year."
-                    value={assets.interestBearingTermYears ?? 1}
-                    onChange={(value) => updateAssets({ interestBearingTermYears: Math.max(1, Math.round(Number(value))) })}
-                  />
-                  <NumberField
-                    label="GIC rate"
-                    suffix="%"
-                    step={0.1}
-                    tooltip="The guaranteed rate this person's GIC/PPN earns, separate from the Return mean/StdDev used for RRSP/TFSA/non-registered accounts. It's a fixed rate every year, not randomized in Monte Carlo."
-                    value={oneDecimalPercent(assets.interestBearingRate ?? inputs.assumptions.returnMean)}
-                    onChange={(value) => updateAssets({ interestBearingRate: Number(value) / 100 })}
-                  />
                 </div>
+                <div className="field-label-text gic-section-heading">
+                  <span>GICs / interest-bearing holdings</span>
+                  <FieldHint text="Guaranteed Investment Certificates, Principal Protected Notes, and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior." />
+                </div>
+                <GicListEditor
+                  gics={deriveGicList(assets, person.currentAge)}
+                  currentAge={person.currentAge}
+                  onChange={(gics) => updateAssets({ gics })}
+                />
               </section>
             );
           })}
@@ -1039,10 +1053,7 @@ export default function Home() {
                 value={oneDecimalPercent(inputs.assumptions.returnMean)}
                 tooltip="Average annual investment return. It sets the single randomized path used on the Dashboard/Ledger, and is the value Monte Carlo centers every run's randomized returns on — raising it improves most outcomes and the success rate."
                 onChange={(value) =>
-                  setNumber(
-                    "assumptions.returnMean",
-                    String(Number(value) / 100),
-                  )
+                  setReturnAssumption({ returnMean: Number(value) / 100 })
                 }
               />
               <NumberField
@@ -1053,10 +1064,7 @@ export default function Home() {
                 value={oneDecimalPercent(inputs.assumptions.returnStdDev)}
                 tooltip="How much annual returns vary year to year, for both the Dashboard/Ledger's single path and every Monte Carlo run. Higher values widen the spread between Monte Carlo runs — more very good and very bad sequences of returns, which increases the chance of an early bad stretch depleting the portfolio."
                 onChange={(value) =>
-                  setNumber(
-                    "assumptions.returnStdDev",
-                    String(Math.max(0, Number(value)) / 100),
-                  )
+                  setReturnAssumption({ returnStdDev: Math.max(0, Number(value)) / 100 })
                 }
               />
               <NumberField
@@ -1068,16 +1076,12 @@ export default function Home() {
                 )}
                 tooltip="The worst single-year return any randomized path can draw, on the Dashboard/Ledger and in Monte Carlo alike. Returns below this are resampled, so it caps how bad any one simulated year can be."
                 onChange={(value) =>
-                  setInputs((current) => ({
-                    ...current,
-                    assumptions: {
-                      ...current.assumptions,
-                      returnFloor: Math.min(
-                        Number(value) / 100,
-                        current.assumptions.returnCeiling ?? 0.15,
-                      ),
-                    },
-                  }))
+                  setReturnAssumption({
+                    returnFloor: Math.min(
+                      Number(value) / 100,
+                      inputs.assumptions.returnCeiling ?? 0.15,
+                    ),
+                  })
                 }
               />
               <NumberField
@@ -1089,16 +1093,12 @@ export default function Home() {
                 )}
                 tooltip="The best single-year return any randomized path can draw, on the Dashboard/Ledger and in Monte Carlo alike. Returns above this are resampled, so it caps how good any one simulated year can be."
                 onChange={(value) =>
-                  setInputs((current) => ({
-                    ...current,
-                    assumptions: {
-                      ...current.assumptions,
-                      returnCeiling: Math.max(
-                        Number(value) / 100,
-                        current.assumptions.returnFloor ?? -0.08,
-                      ),
-                    },
-                  }))
+                  setReturnAssumption({
+                    returnCeiling: Math.max(
+                      Number(value) / 100,
+                      inputs.assumptions.returnFloor ?? -0.08,
+                    ),
+                  })
                 }
               />
               <NumberField
@@ -1140,6 +1140,14 @@ export default function Home() {
                 }}
               />
             </div>
+            {activeInputTab === "Assumptions" && (
+              <ReturnDistributionPreview
+                mean={inputs.assumptions.returnMean}
+                stdDev={inputs.assumptions.returnStdDev}
+                floor={inputs.assumptions.returnFloor ?? -0.08}
+                ceiling={inputs.assumptions.returnCeiling ?? 0.15}
+              />
+            )}
             <p className="section-note">
               These drive both the Dashboard&apos;s single projected path and
               every run of the Monte Carlo simulation. Monte Carlo draws a
@@ -1157,7 +1165,7 @@ export default function Home() {
               <AgeSelect
                 label="CPP start age"
                 value={inputs.strategy.cppStartAge}
-                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.cppStartAge)} for the primary person (each person's own start date follows their own age/birth month).`}
+                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.cppStartAge)} for the primary person.`}
                 onChange={(value) =>
                   setInputs((current) => ({
                     ...current,
@@ -1168,7 +1176,7 @@ export default function Home() {
               <AgeSelect
                 label="OAS start age"
                 value={inputs.strategy.oasStartAge}
-                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.oasStartAge)} for the primary person (each person's own start date follows their own age/birth month).`}
+                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.oasStartAge)} for the primary person.`}
                 onChange={(value) =>
                   setInputs((current) => ({
                     ...current,
@@ -1257,6 +1265,59 @@ export default function Home() {
               />{" "}
               Aggressive RRSP meltdown
             </label>
+          </section>
+          <section className="input-section">
+            <div className="field-label-text">
+              <h2 style={{ display: "inline" }}>GIC buffer strategy</h2>
+              <FieldHint text="Instead of always drawing the GIC in a fixed order position, hold it in reserve while the market's own return (isolated from your withdrawals) is near its peak, and draw it first once the market is down significantly from that peak - so you're not selling depressed investments to fund spending. Once the market recovers, it stops drawing the GIC and (optionally) tops it back up from any leftover cash." />
+            </div>
+            <label className="check-row emphasis">
+              <input
+                type="checkbox"
+                checked={gicBuffer.enabled}
+                onChange={(event) => updateGicBuffer({ enabled: event.target.checked })}
+              />{" "}
+              Reserve the GIC for down markets
+            </label>
+            {gicBuffer.enabled && (
+              <>
+                <div className="field-grid two-up">
+                  <NumberField
+                    label="Draw trigger"
+                    suffix="%"
+                    step={1}
+                    tooltip="How far the market portfolio (RRSP+TFSA+non-registered) has to fall from its highest-ever value before the GIC starts being drawn first. A single bad year rarely justifies this; 10-15% (a real correction, not just noise) is a reasonable starting point."
+                    value={oneDecimalPercent(gicBuffer.triggerDrawdown)}
+                    onChange={(value) => updateGicBuffer({ triggerDrawdown: Number(value) / 100 })}
+                  />
+                  <NumberField
+                    label="Recovery threshold"
+                    suffix="%"
+                    step={1}
+                    tooltip="Once drawing the GIC, the market has to recover back to within this % of its old peak before the GIC reverts to being reserved (and refilled, if enabled). Keep this lower than the draw trigger, or it'll flip back and forth every year."
+                    value={oneDecimalPercent(gicBuffer.recoveryDrawdown)}
+                    onChange={(value) => updateGicBuffer({ recoveryDrawdown: Number(value) / 100 })}
+                  />
+                </div>
+                <label className="check-row emphasis">
+                  <input
+                    type="checkbox"
+                    checked={gicBuffer.refillFromSurplus}
+                    onChange={(event) => updateGicBuffer({ refillFromSurplus: event.target.checked })}
+                  />{" "}
+                  Refill the GIC from leftover cash once the market recovers
+                </label>
+                {gicBuffer.refillFromSurplus && (
+                  <NumberField
+                    label="Refill target balance"
+                    prefix="$"
+                    tooltip="Balance to top the GIC back up toward using leftover cash (e.g. RRIF minimums exceeding spending need) while reserved. Defaults to the household's combined starting GIC balance if left blank."
+                    value={gicBuffer.targetBalance ?? startingGicBalance}
+                    onChange={(value) => updateGicBuffer({ targetBalance: Number(value) })}
+                  />
+                )}
+              </>
+            )}
           </section>
           </div>
         </aside>
@@ -1360,6 +1421,152 @@ export default function Home() {
         </section>
       </div>
     </main>
+  );
+}
+
+const gicFundingSourceLabels: Record<GicFundingSource, string> = {
+  external: "Legacy existing holding",
+  registered: "Registered (RRSP/RRIF)",
+  nonRegistered: "Non-registered",
+};
+const gicMaturityActionLabels: Record<GicMaturityAction, string> = {
+  renew: "Auto-renew (ladder)",
+  cashOut: "Cash out to non-registered",
+};
+
+// Existing scenarios only have the legacy single-GIC fields; this presents that as one editable list entry until the
+// user actually saves a `gics` array, at which point it takes over.
+function deriveGicList(assets: ExistingAssets | undefined, currentAge: number): GicHolding[] {
+  if (assets?.gics && assets.gics.length > 0) {
+    return assets.gics.map((gic) =>
+      gic.fundingSource === "external"
+        ? { ...gic, fundingSource: "nonRegistered" }
+        : gic,
+    );
+  }
+  const legacyBalance = assets?.interestBearingBalance ?? 0;
+  if (legacyBalance <= 0) return [];
+  return [{
+    id: "legacy",
+    label: "GIC",
+    balance: legacyBalance,
+    rate: assets?.interestBearingRate ?? 0.05,
+    termYears: assets?.interestBearingTermYears ?? 1,
+    startAge: currentAge,
+    fundingSource: "external",
+    maturityAction: "renew",
+  }];
+}
+
+function GicListEditor({
+  gics,
+  currentAge,
+  onChange,
+}: {
+  gics: GicHolding[];
+  currentAge: number;
+  onChange: (gics: GicHolding[]) => void;
+}) {
+  const updateGic = (id: string, patch: Partial<GicHolding>) =>
+    onChange(gics.map((gic) => (gic.id === id ? { ...gic, ...patch } : gic)));
+  const removeGic = (id: string) => onChange(gics.filter((gic) => gic.id !== id));
+  const addGic = () =>
+    onChange([
+      ...gics,
+      {
+        id: `gic-${Date.now()}`,
+        label: `GIC ${gics.length + 1}`,
+        balance: 0,
+        rate: 0.05,
+        termYears: 1,
+        startAge: currentAge,
+        fundingSource: "nonRegistered",
+        maturityAction: "renew",
+      },
+    ]);
+
+  return (
+    <div className="gic-list">
+      {gics.map((gic) => (
+        <div className="gic-card" key={gic.id}>
+          <div className="gic-card-heading">
+            <input
+              className="gic-label-input"
+              type="text"
+              value={gic.label ?? ""}
+              placeholder="GIC label"
+              onChange={(event) => updateGic(gic.id, { label: event.target.value })}
+            />
+            <button type="button" className="button button-quiet" onClick={() => removeGic(gic.id)}>
+              Remove
+            </button>
+          </div>
+          <div className="field-grid two-up">
+            <NumberField
+              label="Balance"
+              prefix="$"
+              value={gic.balance}
+              onChange={(value) => updateGic(gic.id, { balance: Number(value) })}
+            />
+            <NumberField
+              label="Rate"
+              suffix="%"
+              step={0.1}
+              tooltip="The guaranteed TOTAL return for the whole term (e.g. '5% for a 2-year GIC' means 5% over those 2 years, not per year). Compounded into an equivalent annual rate internally and never randomized in Monte Carlo."
+              value={oneDecimalPercent(gic.rate)}
+              onChange={(value) => updateGic(gic.id, { rate: Number(value) / 100 })}
+            />
+            <NumberField
+              label="Term (years)"
+              min={1}
+              step={1}
+              tooltip="How many years this GIC compounds before it matures. Withdrawing early still realizes a proportional share of the deferred growth for tax purposes that year."
+              value={gic.termYears}
+              onChange={(value) => updateGic(gic.id, { termYears: Math.max(1, Math.round(Number(value))) })}
+            />
+            <NumberField
+              label="Start age"
+              min={currentAge}
+              step={1}
+              tooltip="Age at which this GIC's balance becomes active. Set to the current age for a GIC already held today; set it later to model a GIC starting partway through retirement."
+              value={gic.startAge}
+              onChange={(value) => updateGic(gic.id, { startAge: Math.round(Number(value)) })}
+            />
+            <label className="field-label">
+              <span className="field-label-text">
+                Account type
+                <FieldHint text="The account type determines whether GIC interest is taxable. The balance is entered separately and is not deducted from the RRSP, RRIF, or non-registered balance." />
+              </span>
+              <select
+                value={gic.fundingSource}
+                onChange={(event) => updateGic(gic.id, { fundingSource: event.target.value as GicFundingSource })}
+              >
+                {(Object.keys(gicFundingSourceLabels) as GicFundingSource[]).filter((source) => source !== "external").map((source) => (
+                  <option key={source} value={source}>{gicFundingSourceLabels[source]}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field-label">
+              <span className="field-label-text">
+                At maturity
+                <FieldHint text="'Auto-renew' starts an identical new term immediately, indefinitely (a true ladder). 'Cash out' moves the matured proceeds into the non-registered account instead of continuing." />
+              </span>
+              <select
+                value={gic.maturityAction}
+                onChange={(event) => updateGic(gic.id, { maturityAction: event.target.value as GicMaturityAction })}
+              >
+                {(Object.keys(gicMaturityActionLabels) as GicMaturityAction[]).map((action) => (
+                  <option key={action} value={action}>{gicMaturityActionLabels[action]}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </div>
+      ))}
+      <button type="button" className="button button-quiet" onClick={addGic}>
+        + Add GIC
+      </button>
+    </div>
   );
 }
 
@@ -1513,22 +1720,23 @@ function AgeSelect({
     </label>
   );
 }
-const monthNames = [
+const ledgerMonthNames = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
+
 function MonthSelect({
   value,
   onChange,
   label = "Birth month",
-  tooltip = "Used to prorate CPP, OAS, and other income streams in the calendar year they start or end, instead of assuming a full year's amount immediately.",
-  unsetLabel = "Unknown",
+  tooltip = "Used to prorate spending, income, CPP, OAS, and death timing within a year. Leave unknown to use full-year age transitions.",
+  defaultMonth,
 }: {
   value: number | undefined;
   onChange: (value: number | undefined) => void;
   label?: string;
   tooltip?: string;
-  unsetLabel?: string;
+  defaultMonth?: number;
 }) {
   return (
     <label className="field-label">
@@ -1536,22 +1744,14 @@ function MonthSelect({
         {label}
         <FieldHint text={tooltip} />
       </span>
-      <select
-        value={value ?? ""}
-        onChange={(event) =>
-          onChange(event.target.value === "" ? undefined : Number(event.target.value))
-        }
-      >
-        <option value="">{unsetLabel}</option>
-        {monthNames.map((name, index) => (
-          <option key={name} value={index + 1}>
-            {name}
-          </option>
-        ))}
+      <select value={value ?? defaultMonth ?? ""} onChange={(event) => onChange(event.target.value === "" ? undefined : Number(event.target.value))}>
+        <option value="">Unknown</option>
+        {monthNames.map((name, index) => <option key={name} value={index + 1}>{name}</option>)}
       </select>
     </label>
   );
 }
+
 function ChartPlaceholder({
   title,
   description,
@@ -1580,6 +1780,68 @@ function ChartPlaceholder({
     </article>
   );
 }
+function ContributionSchedulesEditor({
+  schedules,
+  people,
+  onChange,
+}: {
+  schedules: ContributionSchedule[];
+  people: Array<{ id: string; label: string; currentAge: number }>;
+  onChange: (schedules: ContributionSchedule[]) => void;
+}) {
+  const updateSchedule = (id: string, changes: Partial<ContributionSchedule>) =>
+    onChange(schedules.map((schedule) => schedule.id === id ? { ...schedule, ...changes } : schedule));
+  const addSchedule = () => onChange([...schedules, {
+    id: `contribution-${Date.now()}`,
+    ownerId: "primary",
+    label: "New contribution plan",
+    year: new Date().getFullYear(),
+    endYear: new Date().getFullYear() + Math.max(0, 65 - (people.find((person) => person.id === "primary")?.currentAge ?? 0)),
+    frequency: "annual",
+    annualRrspContribution: 0,
+    annualTfsaContribution: 0,
+    annualNonRegisteredContribution: 0,
+  }]);
+  return (
+    <section className="input-section">
+      <div className="section-title-row">
+        <div>
+          <h2>Contribution schedules</h2>
+        </div>
+        <button type="button" className="text-button" onClick={addSchedule}>Add contribution plan</button>
+      </div>
+      {schedules.map((schedule) => (
+        <article className="income-stream-card" key={schedule.id}>
+          {(() => {
+            const startYear = Number.isFinite(schedule.year) ? schedule.year : new Date().getFullYear();
+            const endYear = Number.isFinite(schedule.endYear) ? schedule.endYear : startYear;
+            return (
+              <>
+          <div className="field-grid three-up">
+            <label className="field-label">Owner<select value={schedule.ownerId} onChange={(event) => { const owner = people.find((person) => person.id === event.target.value) ?? people[0]; updateSchedule(schedule.id, { ownerId: event.target.value, endYear: Math.max(startYear, new Date().getFullYear() + Math.max(0, 65 - owner.currentAge)) }); }}>{people.map((person) => <option key={person.id} value={person.id}>{person.label}</option>)}</select></label>
+            <label className="field-label">Label<input value={schedule.label} onChange={(event) => updateSchedule(schedule.id, { label: event.target.value })} /></label>
+          </div>
+          <div className="field-grid two-up income-amount-fields">
+            <NumberField label="Start year" min={new Date().getFullYear()} value={startYear} tooltip="First calendar year when this contribution applies." onChange={(value) => updateSchedule(schedule.id, { year: Math.min(endYear, Math.round(Number(value))) })} />
+            <NumberField label="End year" min={startYear} value={endYear} tooltip="Last calendar year when this contribution applies." onChange={(value) => updateSchedule(schedule.id, { endYear: Math.max(startYear, Math.round(Number(value))) })} />
+            <label className="field-label">Frequency<select value={schedule.frequency} onChange={(event) => updateSchedule(schedule.id, { frequency: event.target.value as ContributionSchedule["frequency"] })}><option value="annual">Annual</option><option value="monthly">Monthly</option></select></label>
+          </div>
+          <div className="field-grid three-up income-contribution-fields">
+            <NumberField label="RRSP" prefix="$" value={schedule.annualRrspContribution ?? 0} onChange={(value) => updateSchedule(schedule.id, { annualRrspContribution: Number(value) })} />
+            <NumberField label="TFSA" prefix="$" value={schedule.annualTfsaContribution ?? 0} onChange={(value) => updateSchedule(schedule.id, { annualTfsaContribution: Number(value) })} />
+            <NumberField label="Non-registered" prefix="$" value={schedule.annualNonRegisteredContribution ?? 0} onChange={(value) => updateSchedule(schedule.id, { annualNonRegisteredContribution: Number(value) })} />
+          </div>
+          <button type="button" className="text-button danger-text" onClick={() => onChange(schedules.filter((candidate) => candidate.id !== schedule.id))}>Remove contribution plan</button>
+              </>
+            );
+          })()}
+        </article>
+      ))}
+      {schedules.length === 0 && <p className="empty-section">No contribution schedules configured.</p>}
+    </section>
+  );
+}
+
 function IncomeStreamsEditor({
   streams,
   minimumAge,
@@ -1592,7 +1854,7 @@ function IncomeStreamsEditor({
   minimumAge: number;
   targetDeathAge: number;
   personalInfo: RetirementInputs["personalInfo"];
-  people: Array<{ id: string; label: string; currentAge: number; birthMonth?: number }>;
+  people: Array<{ id: string; label: string; currentAge: number }>;
   onChange: (streams: IncomeStream[]) => void;
 }) {
   const updateStream = (id: string, changes: Partial<IncomeStream>) =>
@@ -1612,7 +1874,9 @@ function IncomeStreamsEditor({
         startAge: Math.max(65, minimumAge),
         endAge: targetDeathAge,
         taxTreatment: "pension",
-        indexationMode: "fullInflation",
+        indexationMode: "none",
+        startMonth: 1,
+        endMonth: 12,
       },
     ]);
   return (
@@ -1703,7 +1967,7 @@ function IncomeStreamsEditor({
               min={minimumAge}
               max={stream.endAge}
               value={stream.startAge}
-              tooltip={`Starts ${monthYearLabel(owner, stream.startAge, undefined, stream.startMonth)}`}
+              tooltip={`Starts ${monthYearLabel(owner, stream.startAge, undefined, stream.startMonth ?? 1)}`}
               onChange={(value) =>
                 updateStream(stream.id, {
                   startAge: Math.min(stream.endAge, Math.max(minimumAge, Number(value))),
@@ -1715,7 +1979,7 @@ function IncomeStreamsEditor({
               min={stream.startAge}
               max={maxAge}
               value={stream.endAge}
-              tooltip={`Ends ${monthYearLabel(owner, stream.endAge, undefined, stream.endMonth)}`}
+              tooltip={`Ends ${monthYearLabel(owner, stream.endAge, undefined, stream.endMonth ?? 12)}`}
               onChange={(value) =>
                 updateStream(stream.id, {
                   endAge: Math.min(maxAge, Math.max(stream.startAge, Number(value))),
@@ -1724,20 +1988,8 @@ function IncomeStreamsEditor({
             />
           </div>
           <div className="field-grid two-up income-indexation-fields">
-            <MonthSelect
-              label="Start month"
-              tooltip="Defaults to the owner's birth month. Override if this income starts in a different month, e.g. retiring in June despite a December birthday."
-              unsetLabel="Same as birth month"
-              value={stream.startMonth}
-              onChange={(value) => updateStream(stream.id, { startMonth: value })}
-            />
-            <MonthSelect
-              label="End month"
-              tooltip="Defaults to the owner's birth month. Override if this income ends in a different month than the birthday."
-              unsetLabel="Same as birth month"
-              value={stream.endMonth}
-              onChange={(value) => updateStream(stream.id, { endMonth: value })}
-            />
+            <MonthSelect label="Start month" tooltip="Month when this income starts in its first active year. Defaults to January." defaultMonth={1} value={stream.startMonth} onChange={(value) => updateStream(stream.id, { startMonth: value ?? 1 })} />
+            <MonthSelect label="End month" tooltip="Month when this income ends in its final active year. Defaults to December." defaultMonth={12} value={stream.endMonth} onChange={(value) => updateStream(stream.id, { endMonth: value ?? 12 })} />
           </div>
           <div className="field-grid two-up income-indexation-fields">
             <label className="field-label">
@@ -1778,40 +2030,6 @@ function IncomeStreamsEditor({
               />
             )}
           </div>
-          {(stream.taxTreatment === "employment" || stream.taxTreatment === "pension") && (
-            <div className="income-contribution-fields">
-              <p className="contribution-group-label">Contributions</p>
-              <div className="field-grid three-up">
-                <NumberField
-                  label="RRSP"
-                  prefix="$"
-                  tooltip="How much of this income gets contributed to RRSP each year. Tax-deductible, reducing taxable income for the year. If left at 0, none of this income is automatically invested — it's assumed spent on living expenses."
-                  value={stream.annualRrspContribution ?? 0}
-                  onChange={(value) =>
-                    updateStream(stream.id, { annualRrspContribution: Number(value) })
-                  }
-                />
-                <NumberField
-                  label="TFSA"
-                  prefix="$"
-                  tooltip="How much of this income (after any RRSP contribution) gets contributed to TFSA each year. After-tax, like non-registered, but all future growth and withdrawals stay completely tax-free."
-                  value={stream.annualTfsaContribution ?? 0}
-                  onChange={(value) =>
-                    updateStream(stream.id, { annualTfsaContribution: Number(value) })
-                  }
-                />
-                <NumberField
-                  label="Non-registered"
-                  prefix="$"
-                  tooltip="How much of this income (after any RRSP/TFSA contribution) gets invested in a non-registered account each year. Comes from after-tax cash, so it's not tax-deductible."
-                  value={stream.annualNonRegisteredContribution ?? 0}
-                  onChange={(value) =>
-                    updateStream(stream.id, { annualNonRegisteredContribution: Number(value) })
-                  }
-                />
-              </div>
-            </div>
-          )}
         </div>
         );
       })}
@@ -1868,7 +2086,7 @@ function SpendingPlanEditor({
       <div className="section-title-row">
         <span className="field-label-text">
           <h2>Spending plan</h2>
-          <FieldHint text="Start/end ages here are always based on the primary person's age, even if you've added a second person with a different age. The calendar year shown updates from that." />
+          <FieldHint text="Spending phases apply to full calendar years. Start/end ages are converted to years using the primary person's current age; birth month does not affect spending timing." />
         </span>
         <button type="button" className="text-button" onClick={addPhase}>
           Add phase
@@ -1891,7 +2109,7 @@ function SpendingPlanEditor({
               min={minimumAge}
               max={phase.endAge}
               value={phase.startAge}
-              tooltip={`Starts ${monthYearLabel(personalInfo, phase.startAge)} for the primary person (spending phases always follow the primary's age).`}
+              tooltip={`Applies for the full calendar year ${ageYearLabel(personalInfo, phase.startAge)}.`}
               onChange={(value) =>
                 updatePhase(phase.id, {
                   startAge: Math.min(phase.endAge, Math.max(minimumAge, Number(value))),
@@ -1903,7 +2121,7 @@ function SpendingPlanEditor({
               min={phase.startAge}
               max={maxAge}
               value={phase.endAge}
-              tooltip={`Ends ${monthYearLabel(personalInfo, phase.endAge)} for the primary person.`}
+              tooltip={`Applies through the full calendar year ${ageYearLabel(personalInfo, phase.endAge)}.`}
               onChange={(value) =>
                 updatePhase(phase.id, {
                   endAge: Math.min(maxAge, Math.max(phase.startAge, Number(value))),
@@ -2231,7 +2449,17 @@ function LedgerView({
                   <td>{formatCurrency(year.closingBalances.tfsa)}</td>
                   <td>{formatCurrency(year.openingBalances.nonRegistered)}</td>
                   <td>{formatCurrency(year.closingBalances.nonRegistered)}</td>
-                  <td>{formatCurrency(year.openingBalances.interestBearing)}</td>
+                  <td>
+                    {formatCurrency(year.openingBalances.interestBearing)}
+                    {year.gicBufferMode && (
+                      <span
+                        className={`gic-buffer-badge gic-buffer-badge-${year.gicBufferMode}`}
+                        title={year.gicBufferMode === "draw" ? "Market drawdown: GIC drawn first this year" : "Market near peak: GIC reserved (and refilled if enabled)"}
+                      >
+                        {year.gicBufferMode === "draw" ? "draw" : "reserve"}
+                      </span>
+                    )}
+                  </td>
                   <td>{formatCurrency(year.closingBalances.interestBearing)}</td>
                   <td>{formatCurrency(year.netSpendableCash)}</td>
                   <td>{formatCurrency(year.estateValue)}</td>
@@ -2254,10 +2482,14 @@ function LedgerView({
     </section>
   );
 }
+const monthNames = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
 const subPeriodLabels: Record<number, string[]> = {
   2: ["H1", "H2"],
   4: ["Q1", "Q2", "Q3", "Q4"],
-  12: monthNames.map((name) => name.slice(0, 3)),
+  12: ledgerMonthNames.map((name) => name.slice(0, 3)),
 };
 function SubPeriodTable({
   subPeriods,
@@ -2372,6 +2604,92 @@ function MonteCarloView({
 function worstSurvivingLabel(simulationOutput: SimulationOutput) {
   const rank = Math.round(simulationOutput.kpis.worstSurvivingPercentileRank * 100);
   return `${rank}th percentile (worst surviving)`;
+}
+
+function ReturnDistributionPreview({
+  mean,
+  stdDev,
+  floor,
+  ceiling,
+}: {
+  mean: number;
+  stdDev: number;
+  floor: number;
+  ceiling: number;
+}) {
+  const stats = useMemo(() => {
+    // A fixed seed keeps the preview stable while you tweak other inputs, independent of the scenario's own random seed.
+    const random = createPreviewRandom(20260907);
+    const sampleCount = 4000;
+    const samples = Array.from({ length: sampleCount }, () => sampleAnnualReturn(random, mean, stdDev, floor, ceiling));
+    const bucketCount = 20;
+    const bucketWidth = (ceiling - floor) / bucketCount || 1;
+    const counts = new Array(bucketCount).fill(0);
+    for (const sample of samples) {
+      const bucketIndex = Math.min(bucketCount - 1, Math.max(0, Math.floor((sample - floor) / bucketWidth)));
+      counts[bucketIndex] += 1;
+    }
+    const labels = Array.from({ length: bucketCount }, (_, index) => `${((floor + index * bucketWidth) * 100).toFixed(0)}%`);
+    const realizedMean = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+    const variance = samples.reduce((sum, value) => sum + (value - realizedMean) ** 2, 0) / samples.length;
+    const negativeShare = samples.filter((value) => value < 0).length / samples.length;
+    return {
+      labels,
+      frequencies: counts.map((count) => count / samples.length),
+      realizedMean,
+      realizedStdDev: Math.sqrt(variance),
+      negativeShare,
+      worst: Math.min(...samples),
+      best: Math.max(...samples),
+    };
+  }, [mean, stdDev, floor, ceiling]);
+
+  const option: EChartsOption = {
+    animationDuration: 200,
+    grid: { top: 12, right: 12, bottom: 46, left: 46 },
+    tooltip: {
+      trigger: "axis",
+      valueFormatter: (value) => formatPercent(Number(value)),
+    },
+    xAxis: { type: "category", data: stats.labels, axisLabel: { fontSize: 9, rotate: 45 } },
+    yAxis: {
+      type: "value",
+      axisLabel: { formatter: (value: number) => formatPercent(value), fontSize: 10 },
+      splitLine: { lineStyle: { color: "#e8edf4" } },
+    },
+    series: [
+      {
+        type: "bar",
+        data: stats.frequencies,
+        itemStyle: { color: "#2563eb" },
+        barWidth: "80%",
+      },
+    ],
+  };
+
+  return (
+    <div className="return-distribution-preview">
+      <div className="field-label-text">
+        <span>Return distribution preview</span>
+        <FieldHint text="Shows the shape of annual returns these assumptions actually produce (a sample of 4,000 draws), not just the raw mean/std-dev numbers. Returns are drawn from a normal distribution truncated to the floor/cap, with the underlying curve shifted so the average of the truncated draws still lands on your mean. If your floor and cap aren't the same distance from your mean (realistic, since markets usually have more downside room than upside), the shape will skew toward whichever side has more room - that's expected, not an error." />
+      </div>
+      <ReactECharts option={option} style={{ height: 160, width: "100%" }} notMerge lazyUpdate />
+      <p className="return-distribution-stats">
+        Realized: {formatPercent(stats.realizedMean)} mean, {formatPercent(stats.realizedStdDev)} std-dev, {formatPercent(stats.negativeShare)} of years negative, range {formatPercent(stats.worst)} to {formatPercent(stats.best)}.
+      </p>
+    </div>
+  );
+}
+
+function createPreviewRandom(seed: number) {
+  let state = seed >>> 0;
+  return () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
+  };
 }
 
 function MonteCarloPercentileChart({
@@ -2513,12 +2831,15 @@ function CompareView({
   draftInputs: RetirementInputs;
   draftProjection: DeterministicProjection | null;
 }) {
+  const validScenarios = scenarios.filter((scenario) =>
+    isRetirementInputs(scenario.inputs),
+  );
   const choices = [
     { id: "draft", name: "Current draft", inputs: draftInputs },
-    ...scenarios,
+    ...validScenarios,
   ];
   const [leftId, setLeftId] = useState("draft");
-  const [rightId, setRightId] = useState(scenarios[0]?.id ?? "");
+  const [rightId, setRightId] = useState(validScenarios[0]?.id ?? "");
   const [comparison, setComparison] = useState<{
     left: DeterministicProjection;
     right: DeterministicProjection;
@@ -2920,9 +3241,7 @@ function GuideView() {
       title: "People and dates",
       body: (
         <>
-          <p><strong>Current age</strong> anchors the simulation. <strong>Death age</strong> is the person's birthday cutoff for age-based income and benefits; the estate is settled in the final simulated year. The information icons beside age fields show the corresponding month and year when enough date information is available.</p>
-          <p><strong>Birth month</strong> is optional. Set it when you want age-based starts and ends, CPP/OAS, or death timing to be prorated to a particular month. If it is unknown, the model uses a full-year approximation.</p>
-          <p>Income streams can override the birth month with their own <strong>start month</strong> and <strong>end month</strong>. This is useful for retiring in June even when your birthday is in December. Spending phases remain on the primary person's age timeline.</p>
+          <p><strong>Current age</strong> anchors the simulation. <strong>Death age</strong> is the person's birthday cutoff for age-based income and benefits; the estate is settled in the final simulated year. Birth month, when provided, controls within-year proration.</p>
           <p>Each additional person has their own age, birth month, benefits, accounts, and tax return. Household projections use the longest household lifespan; age-based income belongs to the person who owns that stream.</p>
           <p><strong>Province</strong> selects the provincial tax rules. <strong>CPP/OAS payout %</strong> lets you model less than the maximum benefit.</p>
         </>
@@ -2932,9 +3251,9 @@ function GuideView() {
       title: "Income streams",
       body: (
         <>
-          <p>Each stream has an owner, amount, age range, optional start/end month, tax treatment, and indexation rule. The age and month controls determine when the stream starts and stops; the nearby information icon shows the resulting date.</p>
+          <p>Each stream has an owner, amount, age range, tax treatment, and indexation rule. The age controls determine when the stream starts and stops.</p>
           <p>Tax treatment controls how the amount is classified: employment and pension are ordinary income, registered withdrawals are taxable or tax-free as appropriate, dividends receive their modeled treatment, and capital gains use the configured inclusion rate.</p>
-          <p>Employment and pension streams can route part of their cash into RRSP, TFSA, or non-registered contributions. Those contributions are added directly to the relevant account instead of being treated as spending.</p>
+          <p>Contribution schedules deposit the configured annual amounts directly into RRSP, TFSA, or non-registered accounts during their active age range. RRSP contributions reduce taxable income; TFSA and non-registered contributions use after-tax cash. All contributions reduce available cash regardless of where the money came from. For a partial or unusual year, create a separate schedule active for that one year with the desired annual amounts.</p>
           <p>Indexation can follow inflation, a portion of inflation, a fixed annual rate, or no increase. The model uses annual income totals; the withdrawal schedule controls how spending draws are distributed within the year.</p>
         </>
       ),
@@ -2946,7 +3265,7 @@ function GuideView() {
           <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. Once you turn 71, a mandatory minimum withdrawal kicks in automatically each year (the CRA's prescribed percentage of the RRIF's value at the start of that year) - see the "RRIF withdrawal rate" chart to compare it against what's actually withdrawn.</p>
           <p><strong>TFSA</strong>: withdrawals are always tax-free and never counted as income anywhere.</p>
           <p><strong>Non-registered</strong> + <strong>Adjusted cost base (ACB)</strong>: only the gain above your ACB is taxable, and only that portion is a capital gain (taxed at the capital gains inclusion rate on the Assumptions tab, currently 50% or 66.67% included). If ACB equals the account balance there's no gain and changing it further won't do anything; the same applies at death, where any remaining unrealized gain is deemed realized.</p>
-          <p><strong>GIC / interest income</strong>: modeled separately from market-return accounts because it earns its own fixed rate and is principal-protected. It compounds tax-deferred for the selected term, then accumulated growth is taxed as ordinary income at maturity. An early withdrawal realizes a proportional share of deferred growth.</p>
+          <p><strong>GIC / interest income</strong>: modeled separately from market-return accounts because it earns its own guaranteed rate and is principal-protected. The rate you enter is the total return for the whole term (e.g. 5% for a 2-year GIC means 5% over those 2 years), compounded tax-deferred until the term matures, when the accumulated growth is taxed as ordinary income all at once. An early withdrawal realizes a proportional share of deferred growth.</p>
         </>
       ),
     },
@@ -2976,8 +3295,10 @@ function GuideView() {
       body: (
         <>
           <p><strong>Withdrawal frequency</strong> controls when the waterfall runs: annual, semi-annual, quarterly, or monthly. More frequent schedules expose the portfolio to more realistic within-year timing and make the Ledger expandable by period.</p>
-          <p><strong>CPP/OAS start age</strong> changes the modeled benefit amount: starting early reduces it and delaying increases it. The strategy age and the person's date determine the timing shown by the information icon.</p>
+          <p>Employment income end ages and months define when each person stops working; household spending and withdrawals begin when the last employment income stream in the household ends. With monthly withdrawals, that first retirement year is prorated from the selected month through December. Income streams also support independent start and end months for partial first or final years.</p>
+          <p><strong>CPP/OAS start age</strong> changes the modeled benefit amount: starting early reduces it and delaying increases it. The strategy age determines when the benefit begins.</p>
           <p><strong>Aggressive RRSP meltdown</strong> withdraws additional RRSP/RRIF funds after retirement to fill the current federal bracket. It is a tax strategy approximation, and its annual decision is displayed in the sub-period table as smoothed period amounts when using a non-annual schedule.</p>
+          <p><strong>GIC buffer strategy</strong>: a GIC only earns its keep as a sequence-of-returns buffer if it's still there when a real downturn hits - drawing it down on a fixed schedule regardless of market conditions defeats the purpose. Enabling this reserves the GIC while the market portfolio's own return (isolated from your contributions/withdrawals, since decumulation itself shouldn't look like a crash) is near its all-time high, then draws the GIC first once that return index is down more than the "draw trigger" from its peak - so a downturn is funded from the guaranteed GIC instead of selling depressed investments. Once the market recovers back within the "recovery threshold" of its old peak, the GIC reverts to being reserved (and refilled from leftover cash, e.g. RRIF minimums exceeding spending need, if enabled). A single down year is usually noise; 10-15% off the peak is a more meaningful signal that it's worth protecting the rest of the portfolio from selling low. There's deliberately no auto-optimizer here: fitting a trigger/recovery threshold to one guessed-at future return sequence is fitting noise, not a real edge - pick a threshold based on how much of a real correction you want to ride out, not by curve-fitting a simulation.</p>
         </>
       ),
     },
@@ -2987,6 +3308,7 @@ function GuideView() {
         <>
           <p>When someone reaches their target death age, their accounts either roll over tax-free to a surviving person in the household, or - if no one survives them - are deemed disposed: RRSP/RRIF balances and deferred GIC growth become ordinary income, while non-registered growth above the ACB becomes a capital gain.</p>
           <p>What's left after that final tax bill is reduced further by the probate fee rate (Assumptions) to produce the final estate value shown on the Dashboard.</p>
+          <p>This one-time deemed-disposition bill is shown as its own <strong>End-of-life tax</strong> KPI card on the Dashboard, separate from <strong>Lifetime tax</strong> - it's paid out of the estate itself, not funded from spending cash flow, so it doesn't indicate a funding shortfall in the Ledger's regular "Taxes paid" column. It's still included in the Lifetime tax total.</p>
         </>
       ),
     },
@@ -3050,7 +3372,8 @@ function isRetirementInputs(value: unknown): value is RetirementInputs {
       candidate.assumptions &&
       candidate.strategy &&
       candidate.simulation &&
-      Array.isArray(candidate.incomeStreams),
+      Array.isArray(candidate.incomeStreams) &&
+      Array.isArray(candidate.contributionSchedules),
   );
 }
 function oneDecimalPercent(rate: number) {

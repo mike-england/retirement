@@ -1,7 +1,13 @@
 import type {
   AccountBalances,
   AccountWithdrawals,
+  ContributionSchedule,
   DeterministicProjection,
+  GicBufferSettings,
+  GicFundingSource,
+  GicHolding,
+  GicMaturityAction,
+  GicPositionState,
   IncomeBySource,
   IncomeStream,
   ProvinceCode,
@@ -10,6 +16,7 @@ import type {
   TaxRateBracket,
   TaxResult,
   TaxSettings,
+  WithdrawalAccount,
   WithdrawalFrequency,
   YearProjection,
 } from "@/types/retirement";
@@ -31,6 +38,17 @@ type TaxableIncome = {
   nonEligibleDividends: number;
 };
 
+// A GicHolding config with its rate already converted to an effective annual rate, ready to instantiate as a GicPositionState.
+type ResolvedGicConfig = {
+  id: string;
+  balance: number;
+  annualRate: number;
+  termYears: number;
+  startAge: number;
+  fundingSource: GicFundingSource;
+  maturityAction: GicMaturityAction;
+};
+
 // Each person files their own tax return: their own brackets, basic personal amount, and only their own accounts/income count toward it.
 type PersonRoster = {
   id: string;
@@ -41,8 +59,7 @@ type PersonRoster = {
   receivesCpp: boolean;
   cppPayoutRate: number;
   receivesOas: boolean;
-  interestBearingTermYears: number;
-  interestBearingRate: number;
+  gicConfigs: ResolvedGicConfig[];
 };
 
 type PersonYearState = {
@@ -53,6 +70,10 @@ type PersonYearState = {
   withdrawals: AccountWithdrawals;
   fixedTaxable: TaxableIncome;
   tax: TaxResult;
+  cashContribution: number;
+  monthlyRrspContribution: number;
+  monthlyTfsaContribution: number;
+  monthlyNonRegisteredContribution: number;
 };
 
 export type ProjectionOptions = {
@@ -74,6 +95,29 @@ export function subPeriodsPerYear(frequency: WithdrawalFrequency | undefined): n
 
 // How much the sub-period returns are allowed to wobble around their share of the (already-drawn) annual return.
 const SUB_PERIOD_VOLATILITY_DAMPING = 0.6;
+
+const DEFAULT_WITHDRAWAL_ORDER: WithdrawalAccount[] = ["interestBearing", "nonRegistered", "tfsa", "rrsp"];
+
+// Reserved while the market sub-portfolio is near its peak (drawdown below recoveryDrawdown), drawn first once a real
+// drawdown hits (past triggerDrawdown), with hysteresis in between so a single noisy year doesn't flip the mode back and forth.
+function nextGicBufferMode(
+  previousMode: "reserve" | "draw",
+  drawdown: number,
+  triggerDrawdown: number,
+  recoveryDrawdown: number,
+): "reserve" | "draw" {
+  if (previousMode === "draw") return drawdown <= recoveryDrawdown ? "reserve" : "draw";
+  return drawdown >= triggerDrawdown ? "draw" : "reserve";
+}
+
+function effectiveWithdrawalOrder(baseOrder: WithdrawalAccount[], bufferMode: "reserve" | "draw"): WithdrawalAccount[] {
+  const withoutGic = baseOrder.filter((account) => account !== "interestBearing");
+  return bufferMode === "draw" ? ["interestBearing", ...withoutGic] : [...withoutGic, "interestBearing"];
+}
+
+function totalInterestBearingAcross(balancesByPerson: Record<string, AccountBalances>) {
+  return Object.values(balancesByPerson).reduce((sum, balances) => sum + balances.interestBearing, 0);
+}
 
 // Splits one year's already-drawn annual return into N sub-period returns that compound back to exactly that annual number,
 // so a down year isn't withdrawn from as if returns were flat all year, without changing any annual-level Monte Carlo statistics.
@@ -100,6 +144,98 @@ function standardNormal(random: () => number) {
   return Math.sqrt(-2 * Math.log(first)) * Math.cos(2 * Math.PI * second);
 }
 
+// Abramowitz & Stegun 7.1.26 error-function approximation (max error ~1.5e-7).
+function erf(x: number): number {
+  const sign = x < 0 ? -1 : 1;
+  const absX = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * absX);
+  const poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+  return sign * (1 - poly * Math.exp(-absX * absX));
+}
+
+function standardNormalCdf(z: number): number {
+  return 0.5 * (1 + erf(z / Math.SQRT2));
+}
+
+// Peter Acklam's rational approximation of the inverse standard normal CDF (relative error < 1.15e-9).
+function inverseStandardNormalCdf(p: number): number {
+  const a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00];
+  const b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01];
+  const c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00];
+  const d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00];
+  const pLow = 0.02425;
+  const pHigh = 1 - pLow;
+  if (p < pLow) {
+    const q = Math.sqrt(-2 * Math.log(p));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+      / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  if (p <= pHigh) {
+    const q = p - 0.5;
+    const r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
+      / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+  }
+  const q = Math.sqrt(-2 * Math.log(1 - p));
+  return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+    / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+}
+
+// A proper truncated normal, sampled via inverse-CDF (not rejection sampling or a clip-and-shift transform): pick a
+// uniform value between how much probability mass sits below the floor and below the ceiling, then invert it back to
+// a return. This always succeeds in one step and never artificially piles years up exactly at a bound (unlike hard
+// clamping) - density naturally tapers off approaching floor/ceiling instead. The underlying (pre-truncation) mean is
+// solved for (not just set to targetMean) so the truncated distribution's actual average still lands on target -
+// this is what naturally "prefers one side": if floor/ceiling sit off-center from targetMean, the solved mean skews
+// the shape toward whichever side has more room, rather than forcing symmetric floor/ceiling to get an accurate
+// average. Shared by the deterministic Ledger path and Monte Carlo.
+export function sampleAnnualReturn(random: () => number, targetMean: number, standardDeviation: number, floor: number, ceiling: number): number {
+  if (ceiling <= floor) return targetMean;
+  const stdDev = Math.max(0, standardDeviation);
+  if (stdDev === 0) return Math.min(ceiling, Math.max(floor, targetMean));
+  const untruncatedMean = solveUntruncatedMean(targetMean, stdDev, floor, ceiling);
+  const probabilityBelowFloor = standardNormalCdf((floor - untruncatedMean) / stdDev);
+  const probabilityBelowCeiling = standardNormalCdf((ceiling - untruncatedMean) / stdDev);
+  const uniformInRange = probabilityBelowFloor + random() * Math.max(0, probabilityBelowCeiling - probabilityBelowFloor);
+  const clampedUniform = Math.min(1 - 1e-12, Math.max(1e-12, uniformInRange));
+  const value = untruncatedMean + inverseStandardNormalCdf(clampedUniform) * stdDev;
+  return Math.min(ceiling, Math.max(floor, value));
+}
+
+function standardNormalPdf(z: number): number {
+  return Math.exp(-0.5 * z * z) / Math.sqrt(2 * Math.PI);
+}
+
+// Mean of a normal(mu, stdDev) truncated to [floor, ceiling].
+function truncatedNormalMean(mu: number, stdDev: number, floor: number, ceiling: number): number {
+  const alpha = (floor - mu) / stdDev;
+  const beta = (ceiling - mu) / stdDev;
+  const mass = standardNormalCdf(beta) - standardNormalCdf(alpha);
+  if (mass <= 1e-12) return Math.min(ceiling, Math.max(floor, mu));
+  return mu + stdDev * (standardNormalPdf(alpha) - standardNormalPdf(beta)) / mass;
+}
+
+// Same (targetMean, stdDev, floor, ceiling) tuple is reused across every year and every Monte Carlo run, so caching the
+// bisection result avoids re-solving it on every single sample.
+const untruncatedMeanCache = new Map<string, number>();
+function solveUntruncatedMean(targetMean: number, stdDev: number, floor: number, ceiling: number): number {
+  const cacheKey = `${targetMean}|${stdDev}|${floor}|${ceiling}`;
+  const cached = untruncatedMeanCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  let low = floor - 6 * stdDev;
+  let high = ceiling + 6 * stdDev;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const mid = (low + high) / 2;
+    if (truncatedNormalMean(mid, stdDev, floor, ceiling) < targetMean) low = mid;
+    else high = mid;
+  }
+  const solved = (low + high) / 2;
+  if (untruncatedMeanCache.size > 500) untruncatedMeanCache.clear();
+  untruncatedMeanCache.set(cacheKey, solved);
+  return solved;
+}
+
+
 function createFallbackRandom(seed?: number) {
   if (seed === undefined) return Math.random;
   let state = seed >>> 0;
@@ -120,6 +256,7 @@ export function projectRetirementPlan(
   const years: YearProjection[] = [];
   const roster = buildRoster(inputs);
   let balancesByPerson = initialBalancesByPerson(inputs, roster);
+  const startedGicIds = startedGicIdsSeed(roster);
   let cumulativeInflation = 1;
   // Streams with "partialInflation"/"fixedRate" indexing compound independently of the shared inflation multiplier.
   const streamIndexMultipliers: Record<string, number> = Object.fromEntries(
@@ -129,14 +266,24 @@ export function projectRetirementPlan(
   let peakValue = totalPortfolioAcross(balancesByPerson);
   let portfolioPeakAge = inputs.personalInfo.currentAge;
   let portfolioDepleted = false;
+  const gicBufferSettings: GicBufferSettings | undefined = inputs.strategy.gicBuffer;
+  // Tracks the market's own performance, isolated from contributions/withdrawals (like a fund's NAV), so decumulation itself
+  // is never mistaken for a market drawdown - only actual negative returns move this index down from its peak.
+  let marketIndex = 1;
+  let marketIndexPeak = 1;
+  let gicBufferMode: "reserve" | "draw" = "reserve";
+  const initialGicTotal = totalInterestBearingAcross(balancesByPerson);
   // "age" throughout this loop always tracks the primary's age; other people's targetDeathAge is in their OWN age scale, so compare by year index (years since simulation start), not raw age.
   const maxLifespanIndex = Math.max(...roster.map((person) => person.targetDeathAge - person.currentAge));
   const finalAge = inputs.personalInfo.currentAge + maxLifespanIndex;
   const livingIds = new Set(roster.map((person) => person.id));
-  const retirementStartAge = Math.min(
+  const fallbackRetirementAge = Math.min(
     ...inputs.spendingPlan.phases.map((phase) => phase.startAge),
     finalAge + 1,
   );
+  const householdRetirement = householdRetirementDate(inputs, roster, fallbackRetirementAge);
+  const retirementStartAge = householdRetirement.age;
+  const retirementStartMonth = householdRetirement.month;
   const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
   // Used only when the caller doesn't supply pre-generated subPeriodReturns, so a bare projectRetirementPlan(inputs) call is still deterministic per seed.
   const fallbackRandom = createFallbackRandom(inputs.simulation.randomSeed);
@@ -156,9 +303,31 @@ export function projectRetirementPlan(
     const activePhase = inputs.spendingPlan.phases.find(
       (phase) => age >= phase.startAge && age <= phase.endAge,
     );
-    const spendingTarget = activePhase
+    const annualSpendingTarget = activePhase
       ? activePhase.annualSpending * (inputs.spendingPlan.indexedToInflation ? cumulativeInflation : 1)
       : 0;
+    const spendingTarget = age < retirementStartAge
+      ? 0
+      : age === retirementStartAge && subPeriodCount > 1
+        ? annualSpendingTarget * (subPeriodCount - retirementStartMonth + 1) / subPeriodCount
+        : annualSpendingTarget;
+
+    let withdrawalOrderForYear = inputs.strategy.withdrawalOrder ?? DEFAULT_WITHDRAWAL_ORDER;
+    let gicRefillCap = 0;
+    if (gicBufferSettings?.enabled) {
+      // Uses the index as it stood entering this year (last year's realized returns only) - this year's own return isn't
+      // "known" yet when the withdrawal decision is made, matching how a real investor would decide.
+      const drawdown = marketIndexPeak <= 0 ? 0 : (marketIndexPeak - marketIndex) / marketIndexPeak;
+      gicBufferMode = nextGicBufferMode(gicBufferMode, drawdown, gicBufferSettings.triggerDrawdown, gicBufferSettings.recoveryDrawdown);
+      withdrawalOrderForYear = effectiveWithdrawalOrder(withdrawalOrderForYear, gicBufferMode);
+      if (gicBufferMode === "reserve" && gicBufferSettings.refillFromSurplus) {
+        const currentGicTotal = totalInterestBearingAcross(openingBalancesByPerson);
+        const target = gicBufferSettings.targetBalance ?? initialGicTotal;
+        gicRefillCap = Math.max(0, target - currentGicTotal);
+      }
+    }
+    marketIndex *= 1 + portfolioReturn;
+    marketIndexPeak = Math.max(marketIndexPeak, marketIndex);
 
     const result = fundHousehold(
       inputs,
@@ -170,9 +339,16 @@ export function projectRetirementPlan(
       spendingTarget,
       retirementStartAge,
       age,
+      baseYear + index,
       portfolioReturn,
       periodReturns,
+      withdrawalOrderForYear,
+      gicRefillCap,
+      startedGicIds,
+      annualSpendingTarget,
+      retirementStartMonth,
     );
+
 
     // With sub-annual withdrawals, growth was already applied period-by-period inside fundHousehold; annual mode still grows once, after the single withdrawal pass.
     balancesByPerson = result.growthAlreadyApplied
@@ -180,11 +356,12 @@ export function projectRetirementPlan(
       : Object.fromEntries(
         Object.entries(result.balancesByPerson).map(([personId, balances]) => [
           personId,
-          applyAnnualReturn(balances, portfolioReturn, roster.find((person) => person.id === personId)?.interestBearingRate ?? portfolioReturn),
+          applyAnnualReturn(balances, portfolioReturn, 1),
         ]),
       );
     let estateValue = totalPortfolioAcross(balancesByPerson);
-    let yearTax = result.tax.totalTax;
+    const yearTax = result.tax.totalTax;
+    let yearEstateTax = 0;
 
     // Anyone reaching their own death age this year has their accounts settled: rolled over tax-free to a surviving person, or fully taxed/probated if no one is left.
     const dyingThisYear = roster.filter((person) => livingIds.has(person.id) && person.currentAge + index === person.targetDeathAge);
@@ -198,7 +375,7 @@ export function projectRetirementPlan(
         }
       } else {
         const grossEstate = totalPortfolioAcross(balancesByPerson);
-        const estateTax = dyingThisYear.reduce((sum, person) => sum + calculateTax(
+        yearEstateTax = dyingThisYear.reduce((sum, person) => sum + calculateTax(
           {
             // Any deferred (not-yet-matured) GIC/PPN growth is deemed realized at death, same as the RRSP.
             ordinaryIncome: balancesByPerson[person.id].rrsp + balancesByPerson[person.id].interestBearingAccrued,
@@ -210,13 +387,12 @@ export function projectRetirementPlan(
           inputs.simulation.capitalGainsInclusionRate,
           inputs.taxSettings,
         ).totalTax, 0);
-        yearTax += estateTax;
-        estateValue = Math.max(0, grossEstate - estateTax);
+        estateValue = Math.max(0, grossEstate - yearEstateTax);
         estateValue *= 1 - inputs.simulation.probateFeeRate;
       }
     }
 
-    lifetimeTax += yearTax;
+    lifetimeTax += yearTax + yearEstateTax;
     const closingBalancesByPerson = mapValues(balancesByPerson, cloneBalances);
     const currentPortfolio = totalPortfolioAcross(closingBalancesByPerson);
     if (currentPortfolio > peakValue) {
@@ -244,7 +420,9 @@ export function projectRetirementPlan(
       portfolioReturn,
       inflationRate,
       estateValue,
+      estateTax: yearEstateTax,
       depleted,
+      gicBufferMode: gicBufferSettings?.enabled ? gicBufferMode : undefined,
       subPeriods: result.subPeriods,
     });
     cumulativeInflation *= 1 + inflationRate;
@@ -266,6 +444,44 @@ export function projectRetirementPlan(
   };
 }
 
+// "GIC rate" is entered as the TOTAL guaranteed return over the whole term (e.g. "5% for a 2-year GIC"), matching how
+// these products are usually marketed - not a per-year rate. Convert it to the effective annual rate actually compounded.
+function effectiveAnnualGicRate(totalRateOverTerm: number, termYears: number) {
+  return Math.pow(1 + totalRateOverTerm, 1 / termYears) - 1;
+}
+
+// Resolves a person's configured GIC ladder into ready-to-use configs (effective annual rate already computed). Falls
+// back to the legacy single-GIC fields (as one "external, renew forever, starts immediately" entry) for scenarios
+// saved before the ladder was configurable, or when `gics` is simply empty.
+function resolveGicConfigs(assets: { gics?: GicHolding[]; interestBearingBalance?: number; interestBearingTermYears?: number; interestBearingRate?: number } | undefined, currentAge: number, fallbackAnnualRate: number): ResolvedGicConfig[] {
+  if (assets?.gics && assets.gics.length > 0) {
+    return assets.gics.map((holding, index) => {
+      const termYears = Math.max(1, finiteNumber(holding.termYears, 1));
+      return {
+        id: holding.id || `gic-${index}`,
+        balance: Math.max(0, finiteNumber(holding.balance, 0)),
+        annualRate: effectiveAnnualGicRate(finiteNumber(holding.rate, fallbackAnnualRate), termYears),
+        termYears,
+        startAge: finiteNumber(holding.startAge, currentAge),
+        fundingSource: holding.fundingSource ?? "nonRegistered",
+        maturityAction: holding.maturityAction ?? "renew",
+      };
+    });
+  }
+  const legacyBalance = finiteNumber(assets?.interestBearingBalance, 0);
+  if (legacyBalance <= 0) return [];
+  const termYears = Math.max(1, finiteNumber(assets?.interestBearingTermYears, 1));
+  return [{
+    id: "legacy",
+    balance: legacyBalance,
+    annualRate: effectiveAnnualGicRate(finiteNumber(assets?.interestBearingRate, fallbackAnnualRate), termYears),
+    termYears,
+    startAge: currentAge,
+    fundingSource: "nonRegistered",
+    maturityAction: "renew",
+  }];
+}
+
 function buildRoster(inputs: RetirementInputs): PersonRoster[] {
   return [
     {
@@ -277,21 +493,22 @@ function buildRoster(inputs: RetirementInputs): PersonRoster[] {
       receivesCpp: inputs.personalInfo.receivesCpp ?? true,
       cppPayoutRate: Math.max(0, finiteNumber(inputs.personalInfo.cppPayoutRate, 0.6)),
       receivesOas: inputs.personalInfo.receivesOas ?? true,
-      interestBearingTermYears: Math.max(1, finiteNumber(inputs.existingAssets.interestBearingTermYears, 1)),
-      interestBearingRate: finiteNumber(inputs.existingAssets.interestBearingRate, inputs.assumptions.returnMean),
+      gicConfigs: resolveGicConfigs(inputs.existingAssets, inputs.personalInfo.currentAge, inputs.assumptions.returnMean),
     },
-    ...(inputs.personalInfo.additionalPeople ?? []).map((person) => ({
-      id: person.id,
-      label: person.label || "Person",
-      currentAge: finiteNumber(person.currentAge, inputs.personalInfo.currentAge),
-      targetDeathAge: finiteNumber(person.targetDeathAge, inputs.personalInfo.targetDeathAge),
-      birthMonth: person.birthMonth,
-      receivesCpp: person.receivesCpp ?? true,
-      cppPayoutRate: Math.max(0, finiteNumber(person.cppPayoutRate, 0.6)),
-      receivesOas: person.receivesOas ?? true,
-      interestBearingTermYears: Math.max(1, finiteNumber(person.existingAssets?.interestBearingTermYears, 1)),
-      interestBearingRate: finiteNumber(person.existingAssets?.interestBearingRate, inputs.assumptions.returnMean),
-    })),
+    ...(inputs.personalInfo.additionalPeople ?? []).map((person) => {
+      const currentAge = finiteNumber(person.currentAge, inputs.personalInfo.currentAge);
+      return {
+        id: person.id,
+        label: person.label || "Person",
+        currentAge,
+        targetDeathAge: finiteNumber(person.targetDeathAge, inputs.personalInfo.targetDeathAge),
+        birthMonth: person.birthMonth,
+        receivesCpp: person.receivesCpp ?? true,
+        cppPayoutRate: Math.max(0, finiteNumber(person.cppPayoutRate, 0.6)),
+        receivesOas: person.receivesOas ?? true,
+        gicConfigs: resolveGicConfigs(person.existingAssets, currentAge, inputs.assumptions.returnMean),
+      };
+    }),
   ];
 }
 
@@ -301,18 +518,59 @@ function initialBalancesByPerson(inputs: RetirementInputs, roster: PersonRoster[
     const assets = person.id === "primary"
       ? inputs.existingAssets
       : inputs.personalInfo.additionalPeople?.find((candidate) => candidate.id === person.id)?.existingAssets;
+    // GICs whose start age has already arrived (typically age <= currentAge) are active from day one; later ones are
+    // instantiated once the simulation reaches their start age (see startNewGics in fundHousehold).
+    const gicPositions: GicPositionState[] = person.gicConfigs
+      .filter((config) => config.startAge <= person.currentAge)
+      .map((config) => ({
+        id: config.id,
+        balance: config.balance,
+        accrued: 0,
+        fundingSource: config.fundingSource,
+        termElapsed: 0,
+        termYears: config.termYears,
+        annualRate: config.annualRate,
+        maturityAction: config.maturityAction,
+      }));
     balances[person.id] = {
       rrsp: assets?.rrspBalance ?? 0,
       tfsa: assets?.tfsaBalance ?? 0,
       nonRegistered: assets?.nonRegisteredBalance ?? 0,
       nonRegisteredBookValue: assets?.nonRegisteredBookValue ?? 0,
-      interestBearing: assets?.interestBearingBalance ?? 0,
+      interestBearing: gicPositions.reduce((sum, position) => sum + position.balance, 0),
       interestBearingAccrued: 0,
-      interestBearingTermElapsed: 0,
+      taxableInterestBearingAccrued: 0,
+      gicPositions,
     };
   }
   return balances;
 }
+
+function startedGicIdsSeed(roster: PersonRoster[]): Set<string> {
+  const started = new Set<string>();
+  for (const person of roster) {
+    for (const config of person.gicConfigs) {
+      if (config.startAge <= person.currentAge) started.add(config.id);
+    }
+  }
+  return started;
+}
+
+function householdRetirementDate(inputs: RetirementInputs, roster: PersonRoster[], fallbackAge: number) {
+  const employmentEndDates = roster.flatMap((person) => {
+    const streams = inputs.incomeStreams.filter((stream) => (stream.ownerId || "primary") === person.id && stream.taxTreatment === "employment");
+    return streams.length === 0 ? [] : [streams.reduce((latest, stream) => {
+      const yearIndex = stream.endAge - person.currentAge;
+      const month = stream.endMonth ?? 12;
+      return yearIndex * 12 + month > latest.value
+        ? { value: yearIndex * 12 + month, yearIndex, month }
+        : latest;
+    }, { value: Number.NEGATIVE_INFINITY, yearIndex: 0, month: 1 })];
+  });
+  const earliest = employmentEndDates.reduce((best, date) => date.yearIndex * 12 + date.month < best.value ? { value: date.yearIndex * 12 + date.month, yearIndex: date.yearIndex, month: date.month } : best, { value: Number.POSITIVE_INFINITY, yearIndex: fallbackAge - roster[0].currentAge, month: 1 });
+  return { age: roster[0].currentAge + earliest.yearIndex, month: earliest.month };
+}
+
 
 // Funds one calendar year across every person's own income/accounts/tax return, then rolls the results up into household totals.
 function fundHousehold(
@@ -325,41 +583,70 @@ function fundHousehold(
   spendingTarget: number,
   retirementStartAge: number,
   age: number,
+  calendarYear: number,
   portfolioReturn: number,
   periodReturns: number[],
+  withdrawalOrder: WithdrawalAccount[],
+  gicRefillCap: number,
+  startedGicIds: Set<string>,
+  annualSpendingTarget: number,
+  retirementStartMonth: number,
 ) {
   const states: PersonYearState[] = roster.map((person) => {
-    const fixed = personFixedIncome(inputs, person, yearIndex, inflationMultiplier, streamIndexMultipliers);
+    const fixed = personFixedIncome(inputs, person, yearIndex, calendarYear, inflationMultiplier, streamIndexMultipliers);
     const opening = balancesByPerson[person.id];
-    // GIC/PPN-style interest uses its own guaranteed rate (not the market return) and compounds tax-deferred within the term; the full accumulated growth is only taxed the year the term matures.
-    const growth = opening.interestBearing * Math.max(0, person.interestBearingRate);
-    const accruedAfterGrowth = opening.interestBearingAccrued + growth;
-    const termElapsed = opening.interestBearingTermElapsed + 1;
-    const maturityReached = termElapsed >= person.interestBearingTermYears;
-    const interestIncome = maturityReached ? accruedAfterGrowth : 0;
-    const fixedTaxable = { ...fixed.taxableIncome, ordinaryIncome: fixed.taxableIncome.ordinaryIncome + interestIncome };
+    // Each GIC/PPN position uses its own guaranteed rate (not the market return) and compounds within its own term.
+    // Only non-registered GIC growth is taxable; registered GIC growth remains tax-sheltered.
+    let totalInterestIncome = 0;
+    let cashedOutTotal = 0;
+    const grownPositions: GicPositionState[] = [];
+    for (const position of opening.gicPositions) {
+      const growth = position.balance * Math.max(0, position.annualRate);
+      const accruedAfterGrowth = position.accrued + growth;
+      const termElapsed = position.termElapsed + 1;
+      const maturityReached = termElapsed >= position.termYears;
+      if (!maturityReached) {
+        grownPositions.push({ ...position, accrued: accruedAfterGrowth, termElapsed });
+        continue;
+      }
+      if (position.fundingSource !== "registered") totalInterestIncome += accruedAfterGrowth;
+      if (position.maturityAction === "cashOut") {
+        cashedOutTotal += position.balance;
+      } else {
+        grownPositions.push({ ...position, accrued: 0, termElapsed: 0 });
+      }
+    }
+    const fixedTaxable = { ...fixed.taxableIncome, ordinaryIncome: fixed.taxableIncome.ordinaryIncome + totalInterestIncome };
     return {
       id: person.id,
       age: person.currentAge + yearIndex,
       balances: {
         ...cloneBalances(opening),
-        interestBearingAccrued: maturityReached ? 0 : accruedAfterGrowth,
-        interestBearingTermElapsed: maturityReached ? 0 : termElapsed,
+        gicPositions: grownPositions,
+        interestBearing: grownPositions.reduce((sum, position) => sum + position.balance, 0),
+        interestBearingAccrued: grownPositions.reduce((sum, position) => sum + position.accrued, 0),
+        taxableInterestBearingAccrued: grownPositions.reduce((sum, position) => sum + (position.fundingSource === "registered" ? 0 : position.accrued), 0),
         // Contributions from income streams (e.g. salary deductions) land directly in the relevant account.
-        rrsp: opening.rrsp + fixed.rrspContribution,
-        tfsa: opening.tfsa + fixed.tfsaContribution,
-        nonRegistered: opening.nonRegistered + fixed.nonRegisteredContribution,
-        nonRegisteredBookValue: opening.nonRegisteredBookValue + fixed.nonRegisteredContribution,
+        rrsp: opening.rrsp + fixed.rrspContribution + (periodReturns.length <= 1 ? fixed.monthlyRrspContribution * 12 : 0),
+        tfsa: opening.tfsa + fixed.tfsaContribution + (periodReturns.length <= 1 ? fixed.monthlyTfsaContribution * 12 : 0),
+        nonRegistered: opening.nonRegistered + fixed.nonRegisteredContribution + (periodReturns.length <= 1 ? fixed.monthlyNonRegisteredContribution * 12 : 0) + cashedOutTotal,
+        nonRegisteredBookValue: opening.nonRegisteredBookValue + fixed.nonRegisteredContribution + (periodReturns.length <= 1 ? fixed.monthlyNonRegisteredContribution * 12 : 0) + cashedOutTotal,
       },
-      income: { ...fixed.income, interest: fixed.income.interest + interestIncome },
+      income: { ...fixed.income, interest: fixed.income.interest + totalInterestIncome },
       withdrawals: { rrsp: 0, tfsa: 0, nonRegistered: 0, interestBearing: 0 },
       fixedTaxable,
+      cashContribution: fixed.cashContribution,
+      monthlyRrspContribution: fixed.monthlyRrspContribution,
+      monthlyTfsaContribution: fixed.monthlyTfsaContribution,
+      monthlyNonRegisteredContribution: fixed.monthlyNonRegisteredContribution,
       tax: calculateTax(fixedTaxable, inputs.personalInfo.province, inputs.simulation.capitalGainsInclusionRate, inputs.taxSettings),
     };
   });
 
-  const netCashTotal = () => states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) + sumWithdrawals(state.withdrawals) - state.tax.totalTax), 0);
-  const recurringNetIncome = states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) - state.tax.totalTax), 0);
+  startNewGicsForYear(states, roster, age, inputs, startedGicIds);
+
+  const netCashTotal = () => states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) + sumWithdrawals(state.withdrawals) - state.tax.totalTax - state.cashContribution), 0);
+  const recurringNetIncome = states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) - state.tax.totalTax - state.cashContribution), 0);
   // Snapshot each state's tax bill with zero withdrawals, so sub-period cash-flow math can prorate the FIXED income across the year instead of treating it as fully received in period 1.
   const fixedTaxBaselineByState = new Map(states.map((state) => [state.id, state.tax.totalTax]));
 
@@ -383,8 +670,7 @@ function fundHousehold(
   };
 
   // Interest-bearing balances get no further tax benefit from staying invested (already taxed annually as it accrues), so they're drawn down first by default.
-  // Falls back to the historical default order for scenarios saved before withdrawal order was configurable.
-  const withdrawalOrder = inputs.strategy.withdrawalOrder ?? ["interestBearing", "nonRegistered", "tfsa", "rrsp"];
+  // Falls back to the historical default order for scenarios saved before withdrawal order was configurable; may already be reordered by the GIC buffer strategy for this year.
   const subPeriodCount = periodReturns.length;
   let subPeriods: SubPeriodProjection[] | undefined;
 
@@ -413,21 +699,27 @@ function fundHousehold(
     subPeriods = [];
     for (let period = 0; period < subPeriodCount; period += 1) {
       for (const state of states) {
-        const rosterPerson = roster.find((person) => person.id === state.id);
-        const interestBearingRate = rosterPerson?.interestBearingRate ?? portfolioReturn;
-        const periodInterestRate = (1 + Math.max(0, interestBearingRate)) ** (1 / subPeriodCount) - 1;
-        state.balances = applyAnnualReturn(state.balances, periodReturns[period], periodInterestRate);
+        const periodContributionFactor = 12 / subPeriodCount;
+        state.balances.rrsp += state.monthlyRrspContribution * periodContributionFactor;
+        state.balances.tfsa += state.monthlyTfsaContribution * periodContributionFactor;
+        state.balances.nonRegistered += state.monthlyNonRegisteredContribution * periodContributionFactor;
+        state.balances.nonRegisteredBookValue += state.monthlyNonRegisteredContribution * periodContributionFactor;
+        state.balances = applyAnnualReturn(state.balances, periodReturns[period], 1 / subPeriodCount);
       }
       const withdrawalsBefore = new Map(states.map((state) => [state.id, { ...state.withdrawals }]));
       // Mandatory RRIF minimum installments are spread evenly across periods (matches how real RRIF minimums are usually paid out) instead of vanishing from the monthly breakdown as one hidden annual lump.
       for (const state of states) withdrawRrifMinimum(state, (rrifMinimumByState.get(state.id) ?? 0) / subPeriodCount);
       // Compare cumulative cash-so-far against the cumulative (not per-period-flat) spending target, so tax-bracket effects from earlier periods still carry through correctly.
-      const cumulativeTarget = (spendingTarget * (period + 1)) / subPeriodCount;
+      const cumulativeTarget = age < retirementStartAge
+        ? 0
+        : age === retirementStartAge
+          ? (annualSpendingTarget * Math.max(0, period - retirementStartMonth + 2)) / subPeriodCount
+          : (spendingTarget * (period + 1)) / subPeriodCount;
       const elapsedFraction = (period + 1) / subPeriodCount;
       // Prorates the FIXED (annual) recurring income by how much of the year has elapsed, rather than crediting the whole year's income as already banked in period 1.
       const netCashSoFar = () => states.reduce((sum, state) => {
         const fixedTaxBaseline = fixedTaxBaselineByState.get(state.id) ?? 0;
-        const recurringNet = cashFromIncome(state.income) - fixedTaxBaseline;
+        const recurringNet = cashFromIncome(state.income) - fixedTaxBaseline - state.cashContribution;
         const withdrawalTax = state.tax.totalTax - fixedTaxBaseline;
         return sum + Math.max(0, recurringNet * elapsedFraction + sumWithdrawals(state.withdrawals) - withdrawalTax);
       }, 0);
@@ -466,7 +758,7 @@ function fundHousehold(
     }
   }
 
-  if (inputs.strategy.aggressiveRrspMeltdown && age >= retirementStartAge) {
+  if (inputs.strategy.aggressiveRrspMeltdown && spendingTarget > 0) {
     // Smoothed evenly across periods below, so it doesn't show up as a single hidden 13th withdrawal.
     const meltByState = new Map<string, number>();
     for (const state of states) {
@@ -499,34 +791,115 @@ function fundHousehold(
     }
   }
 
-  // OAS recovery tax: applied last, against each person's final income for the year (including any withdrawals above), so it reflects the actual year's outcome.
-  let oasClawback = 0;
-  for (const state of states) {
-    if (state.income.oas <= 0) continue;
-    const totalOrdinaryIncome = taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances).ordinaryIncome;
-    const otherOrdinaryIncome = totalOrdinaryIncome - state.income.oas;
-    const clawback = calculateOasClawback(state.income.oas, otherOrdinaryIncome, state.age, inflationMultiplier);
-    if (clawback <= 0) continue;
-    oasClawback += clawback;
-    state.income = { ...state.income, oas: state.income.oas - clawback };
-    state.fixedTaxable = { ...state.fixedTaxable, ordinaryIncome: state.fixedTaxable.ordinaryIncome - clawback };
-    state.tax = calculateTax(
-      taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances),
-      inputs.personalInfo.province,
-      inputs.simulation.capitalGainsInclusionRate,
-      inputs.taxSettings,
-    );
+  // OAS recovery tax: applied against each person's final income for the year (including any withdrawals above), so it
+  // reflects the actual year's outcome. Designed to be re-run safely (it always recomputes from each state's untouched
+  // base income rather than compounding on top of its own previous reduction), because a clawback discovered here can
+  // itself create a cash shortfall that needs another withdrawal top-up below.
+  const baseFixedTaxableByState = new Map(states.map((state) => [state.id, state.fixedTaxable]));
+  const baseOasByState = new Map(states.map((state) => [state.id, state.income.oas]));
+  const applyOasClawback = () => {
+    let total = 0;
+    for (const state of states) {
+      const baseOas = baseOasByState.get(state.id) ?? 0;
+      if (baseOas <= 0) continue;
+      const baseFixedTaxable = baseFixedTaxableByState.get(state.id)!;
+      const totalOrdinaryIncome = taxableIncomeForYear(baseFixedTaxable, state.withdrawals, state.balances).ordinaryIncome;
+      const otherOrdinaryIncome = totalOrdinaryIncome - baseOas;
+      const clawback = calculateOasClawback(baseOas, otherOrdinaryIncome, state.age, inflationMultiplier);
+      total += clawback;
+      state.income = { ...state.income, oas: baseOas - clawback };
+      state.fixedTaxable = { ...baseFixedTaxable, ordinaryIncome: baseFixedTaxable.ordinaryIncome - clawback };
+      state.tax = calculateTax(
+        taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances),
+        inputs.personalInfo.province,
+        inputs.simulation.capitalGainsInclusionRate,
+        inputs.taxSettings,
+      );
+    }
+    return total;
+  };
+  let oasClawback = applyOasClawback();
+
+  // The clawback above is only known once withdrawals are finalized, and reduces net cash after the fact - if that
+  // pushes below the spending target, draw a bit more (same order) instead of reporting a shortfall/"depleted" year
+  // while other accounts still hold plenty. Re-deriving the clawback each pass converges quickly since it's capped at
+  // a fraction of OAS itself, so each extra withdrawal needed shrinks geometrically.
+  const withdrawalsBeforeTopUp = new Map(states.map((state) => [state.id, { ...state.withdrawals }]));
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    if (spendingTarget - netCashTotal() <= 0) break;
+    let drewAny = false;
+    for (const account of withdrawalOrder) {
+      for (const state of states) {
+        const requiredCash = spendingTarget - netCashTotal();
+        const available = state.balances[account];
+        if (requiredCash <= 0 || available <= 0) continue;
+        const amount = requiredWithdrawal(requiredCash, available, account, state.balances, state.withdrawals, state.fixedTaxable, inputs);
+        if (amount <= 0) continue;
+        state.balances = removeWithdrawal(state.balances, account, amount);
+        state.withdrawals[account] += amount;
+        state.tax = calculateTax(
+          taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances),
+          inputs.personalInfo.province,
+          inputs.simulation.capitalGainsInclusionRate,
+          inputs.taxSettings,
+        );
+        drewAny = true;
+      }
+    }
+    if (!drewAny) break;
+    oasClawback = applyOasClawback();
+  }
+  // The top-up amount is only known after the full year's clawback is resolved, so - like the meltdown above - it's
+  // spread evenly back across periods for display rather than dumped entirely into the last one.
+  const totalTopUp = states.reduce((total, state) => {
+    const before = withdrawalsBeforeTopUp.get(state.id)!;
+    return {
+      rrsp: total.rrsp + (state.withdrawals.rrsp - before.rrsp),
+      tfsa: total.tfsa + (state.withdrawals.tfsa - before.tfsa),
+      nonRegistered: total.nonRegistered + (state.withdrawals.nonRegistered - before.nonRegistered),
+      interestBearing: total.interestBearing + (state.withdrawals.interestBearing - before.interestBearing),
+    };
+  }, { rrsp: 0, tfsa: 0, nonRegistered: 0, interestBearing: 0 } as AccountWithdrawals);
+  if (subPeriods && (totalTopUp.rrsp + totalTopUp.tfsa + totalTopUp.nonRegistered + totalTopUp.interestBearing) > 0) {
+    const perPeriod: AccountWithdrawals = {
+      rrsp: totalTopUp.rrsp / subPeriods.length,
+      tfsa: totalTopUp.tfsa / subPeriods.length,
+      nonRegistered: totalTopUp.nonRegistered / subPeriods.length,
+      interestBearing: totalTopUp.interestBearing / subPeriods.length,
+    };
+    subPeriods.forEach((period, periodIndex) => {
+      const remainingPeriods = subPeriods!.length - (periodIndex + 1);
+      period.withdrawals = {
+        rrsp: period.withdrawals.rrsp + perPeriod.rrsp,
+        tfsa: period.withdrawals.tfsa + perPeriod.tfsa,
+        nonRegistered: period.withdrawals.nonRegistered + perPeriod.nonRegistered,
+        interestBearing: period.withdrawals.interestBearing + perPeriod.interestBearing,
+      };
+      period.closingBalances = {
+        ...period.closingBalances,
+        rrsp: Math.max(0, period.closingBalances.rrsp - perPeriod.rrsp * remainingPeriods),
+        tfsa: Math.max(0, period.closingBalances.tfsa - perPeriod.tfsa * remainingPeriods),
+        nonRegistered: Math.max(0, period.closingBalances.nonRegistered - perPeriod.nonRegistered * remainingPeriods),
+        interestBearing: Math.max(0, period.closingBalances.interestBearing - perPeriod.interestBearing * remainingPeriods),
+      };
+    });
   }
 
   // Any leftover retirement-era cash beyond the spending need (RRIF minimum, meltdown, or income exceeding spending) gets reinvested rather than vanishing.
   // Before retirement, saving is explicit per income stream (RRSP/TFSA/non-registered contributions above) - any other leftover salary is assumed spent on living, not auto-invested.
-  const finalSurplus = age >= retirementStartAge ? Math.max(0, netCashTotal() - spendingTarget) : 0;
+  // Before a spending phase begins, leftover employment income is assumed spent on ordinary living costs rather than
+  // silently invested. This matters when employment ends before the first retirement spending phase starts.
+  const finalSurplus = spendingTarget > 0 ? Math.max(0, netCashTotal() - spendingTarget) : 0;
   if (finalSurplus > 0) {
     const surplusState = states.find((state) => state.id === "primary") ?? states[0];
+    // When the GIC buffer strategy is reserving/refilling, leftover cash tops the GIC back up first, before TFSA/non-registered.
+    const gicContribution = Math.min(finalSurplus, Math.max(0, gicRefillCap));
+    const remainingSurplus = finalSurplus - gicContribution;
     // TFSA is fully tax-free, so it's filled first (up to the annual room) before falling back to non-registered.
     const tfsaRoom = Math.max(0, tfsaAnnualContributionLimit * inflationMultiplier);
-    const tfsaContribution = Math.min(finalSurplus, tfsaRoom);
-    const nonRegisteredContribution = finalSurplus - tfsaContribution;
+    const tfsaContribution = Math.min(remainingSurplus, tfsaRoom);
+    const nonRegisteredContribution = remainingSurplus - tfsaContribution;
+    surplusState.balances.interestBearing += gicContribution;
     surplusState.balances.tfsa += tfsaContribution;
     surplusState.balances.nonRegistered += nonRegisteredContribution;
     surplusState.balances.nonRegisteredBookValue += nonRegisteredContribution;
@@ -570,10 +943,51 @@ function fundHousehold(
     totalIncome: cashFromIncome(combinedIncome),
     recurringNetIncome,
     netSpendableCash,
-    depleted: netSpendableCash < spendingTarget,
+    // A shortfall only means the portfolio is actually "depleted" if there's nothing left anywhere to draw from -
+    // otherwise it's just a same-year timing/rounding gap (e.g. a late-discovered OAS clawback the top-up above
+    // couldn't fully close), which shouldn't be reported as running out of money while millions remain in other accounts.
+    depleted: netSpendableCash < spendingTarget - 0.01
+      && states.reduce((sum, state) => sum + totalPortfolio(state.balances), 0) <= 0.01,
     subPeriods,
     growthAlreadyApplied: subPeriodCount > 1,
   };
+}
+
+// Instantiates any GIC whose configured start age arrives this year. The configured balance is a separate holding;
+// fundingSource only determines whether its interest is registered or taxable.
+function startNewGicsForYear(
+  states: PersonYearState[],
+  roster: PersonRoster[],
+  age: number,
+  inputs: RetirementInputs,
+  startedGicIds: Set<string>,
+) {
+  for (const state of states) {
+    const person = roster.find((candidate) => candidate.id === state.id);
+    if (!person) continue;
+    for (const config of person.gicConfigs) {
+      if (config.startAge !== age || startedGicIds.has(config.id)) continue;
+      startedGicIds.add(config.id);
+      let netAmount = config.balance;
+      if (netAmount <= 0) continue;
+      const newPosition: GicPositionState = {
+        id: config.id,
+        balance: netAmount,
+        accrued: 0,
+        fundingSource: config.fundingSource,
+        termElapsed: 0,
+        termYears: config.termYears,
+        annualRate: config.annualRate,
+        maturityAction: config.maturityAction,
+      };
+      state.balances = {
+        ...state.balances,
+        gicPositions: [...state.balances.gicPositions, newPosition],
+        interestBearing: state.balances.interestBearing + netAmount,
+        taxableInterestBearingAccrued: state.balances.taxableInterestBearingAccrued,
+      };
+    }
+  }
 }
 
 // A household-level summary of otherwise-separate tax returns; marginal rate reports the highest bracket anyone in the household is in.
@@ -609,18 +1023,22 @@ function streamIndexMultiplier(stream: IncomeStream, inflationMultiplier: number
   }
 }
 
-function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearIndex: number, inflationMultiplier: number, streamIndexMultipliers: Record<string, number>) {
+function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearIndex: number, calendarYear: number, inflationMultiplier: number, streamIndexMultipliers: Record<string, number>) {
   const income: IncomeBySource = { employment: 0, cpp: 0, oas: 0, interest: 0, rrspWithdrawal: 0, tfsaWithdrawal: 0, nonRegisteredWithdrawal: 0, interestBearingWithdrawal: 0 };
   const taxableIncome: TaxableIncome = { ordinaryIncome: 0, capitalGains: 0, eligibleDividends: 0, nonEligibleDividends: 0 };
   const age = person.currentAge + yearIndex;
   let rrspContribution = 0;
   let tfsaContribution = 0;
   let nonRegisteredContribution = 0;
+  let cashContribution = 0;
+  let monthlyRrspContribution = 0;
+  let monthlyTfsaContribution = 0;
+  let monthlyNonRegisteredContribution = 0;
 
   for (const stream of inputs.incomeStreams) {
     const ownerId = stream.ownerId || "primary";
     if (ownerId !== person.id) continue;
-    // Death is a birthday cutoff too, same as any other endAge: whichever of the stream's own end or the person's death comes first prorates this final year.
+    // Death is a birthday cutoff: the person's final age year is prorated when a birth month is available.
     const deathBindsFirst = person.targetDeathAge < stream.endAge;
     const effectiveEndAge = deathBindsFirst ? person.targetDeathAge : stream.endAge;
     const eligibleForAge = age >= stream.startAge && age <= effectiveEndAge;
@@ -632,9 +1050,16 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
       : stream.taxTreatment === "oas"
         ? calculateOasAnnualBenefit(stream.annualAmount || oasAnnualMaximum, inputs.strategy.oasStartAge)
         : stream.annualAmount;
-    // Death always cuts off on the person's own birthday; the stream's own end can be overridden to a different month (e.g. retiring in June despite a December birthday).
-    const endMonth = deathBindsFirst ? person.birthMonth : (stream.endMonth ?? person.birthMonth);
-    const proration = incomeProrationFraction(age, stream.startAge, effectiveEndAge, stream.startMonth ?? person.birthMonth, endMonth, yearIndex);
+    // Employment/pension income ending at retirement is paid through the selected retirement month in that final work year.
+    const proration = incomeProrationFraction(
+      age,
+      stream.startAge,
+      effectiveEndAge,
+      stream.startMonth ?? 1,
+      deathBindsFirst ? person.birthMonth : stream.endMonth ?? 12,
+      yearIndex,
+      true,
+    );
     const indexMultiplier = streamIndexMultiplier(stream, inflationMultiplier, streamIndexMultipliers);
     const amount = baseAmount * indexMultiplier * proration;
     if (stream.taxTreatment === "cpp") {
@@ -644,18 +1069,8 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
       income.oas += amount;
       taxableIncome.ordinaryIncome += amount;
     } else if (stream.taxTreatment === "employment" || stream.taxTreatment === "pension") {
-      // RRSP contributions are tax-deductible (reduce taxable income); TFSA/non-registered contributions come from after-tax cash and don't.
-      const streamIndexMultiplierWithProration = indexMultiplier * proration;
-      const streamRrspContribution = Math.min(amount, (stream.annualRrspContribution ?? 0) * streamIndexMultiplierWithProration);
-      const afterRrsp = amount - streamRrspContribution;
-      const streamTfsaContribution = Math.min(afterRrsp, (stream.annualTfsaContribution ?? 0) * streamIndexMultiplierWithProration);
-      const afterTfsa = afterRrsp - streamTfsaContribution;
-      const streamNonRegisteredContribution = Math.min(afterTfsa, (stream.annualNonRegisteredContribution ?? 0) * streamIndexMultiplierWithProration);
-      rrspContribution += streamRrspContribution;
-      tfsaContribution += streamTfsaContribution;
-      nonRegisteredContribution += streamNonRegisteredContribution;
-      income.employment += afterTfsa - streamNonRegisteredContribution;
-      taxableIncome.ordinaryIncome += amount - streamRrspContribution;
+      income.employment += amount;
+      taxableIncome.ordinaryIncome += amount;
     } else if (stream.taxTreatment === "rrspWithdrawal") {
       income.rrspWithdrawal += amount;
       taxableIncome.ordinaryIncome += amount;
@@ -667,6 +1082,29 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
       else if (stream.taxTreatment === "nonEligibleDividend") taxableIncome.nonEligibleDividends += amount;
       else if (stream.taxTreatment === "capitalGains") taxableIncome.capitalGains += amount;
     }
+  }
+
+  const schedules = (inputs.contributionSchedules ?? []).filter((schedule) => schedule.ownerId === person.id);
+  for (const schedule of schedules) {
+    const endYear = schedule.endYear ?? schedule.year;
+    if (calendarYear < schedule.year || calendarYear > endYear) continue;
+    const proration = 1;
+    const multiplier = proration;
+    const frequencyMultiplier = schedule.frequency === "monthly" ? 12 : 1;
+    const rrspAmount = Math.max(0, schedule.annualRrspContribution ?? 0) * frequencyMultiplier * multiplier;
+    const tfsaAmount = Math.max(0, schedule.annualTfsaContribution ?? 0) * frequencyMultiplier * multiplier;
+    const nonRegisteredAmount = Math.max(0, schedule.annualNonRegisteredContribution ?? 0) * frequencyMultiplier * multiplier;
+    if (schedule.frequency === "monthly") {
+      monthlyRrspContribution += rrspAmount / 12;
+      monthlyTfsaContribution += tfsaAmount / 12;
+      monthlyNonRegisteredContribution += nonRegisteredAmount / 12;
+    } else {
+      rrspContribution += rrspAmount;
+      tfsaContribution += tfsaAmount;
+      nonRegisteredContribution += nonRegisteredAmount;
+    }
+    cashContribution += rrspAmount + tfsaAmount + nonRegisteredAmount;
+    taxableIncome.ordinaryIncome = Math.max(0, taxableIncome.ordinaryIncome - rrspAmount);
   }
 
   if (age <= person.targetDeathAge) {
@@ -686,11 +1124,9 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
     }
   }
 
-  return { income, taxableIncome, rrspContribution, tfsaContribution, nonRegisteredContribution };
+  return { income, taxableIncome, rrspContribution, tfsaContribution, nonRegisteredContribution, cashContribution, monthlyRrspContribution, monthlyTfsaContribution, monthlyNonRegisteredContribution };
 }
 
-// Approximates a mid-year start/end of eligibility using the relevant month; skipped for single-year windows (would double-shrink) and for the plan's first year (already ongoing, not a new mid-year start).
-// startMonth/endMonth default to the person's birth month, but a stream can override either independently (e.g. retiring in June despite a December birthday).
 function incomeProrationFraction(
   age: number,
   startAge: number,
@@ -698,10 +1134,11 @@ function incomeProrationFraction(
   startMonth: number | undefined,
   endMonth: number | undefined,
   yearIndex: number,
+  endMonthInclusive = false,
 ) {
   if (startAge === endAge) return 1;
-  if (age === startAge) return !startMonth ? 1 : (yearIndex === 0 ? 1 : (13 - startMonth) / 12);
-  if (age === endAge) return !endMonth ? 1 : (endMonth - 1) / 12;
+  if (age === startAge) return !startMonth || yearIndex === 0 ? 1 : (13 - startMonth) / 12;
+  if (age === endAge) return !endMonth ? 1 : (endMonthInclusive ? endMonth : endMonth - 1) / 12;
   return 1;
 }
 
@@ -722,8 +1159,9 @@ function sumBalances(balancesByPerson: Record<string, AccountBalances>): Account
     nonRegisteredBookValue: total.nonRegisteredBookValue + balances.nonRegisteredBookValue,
     interestBearing: total.interestBearing + balances.interestBearing,
     interestBearingAccrued: total.interestBearingAccrued + balances.interestBearingAccrued,
-    interestBearingTermElapsed: 0,
-  }), { rrsp: 0, tfsa: 0, nonRegistered: 0, nonRegisteredBookValue: 0, interestBearing: 0, interestBearingAccrued: 0, interestBearingTermElapsed: 0 });
+    taxableInterestBearingAccrued: total.taxableInterestBearingAccrued + balances.taxableInterestBearingAccrued,
+    gicPositions: [],
+  }), { rrsp: 0, tfsa: 0, nonRegistered: 0, nonRegisteredBookValue: 0, interestBearing: 0, interestBearingAccrued: 0, taxableInterestBearingAccrued: 0, gicPositions: [] });
 }
 
 function totalPortfolioAcross(balancesByPerson: Record<string, AccountBalances>) {
@@ -739,12 +1177,13 @@ function mergeBalances(target: AccountBalances, source: AccountBalances): Accoun
     nonRegisteredBookValue: target.nonRegisteredBookValue + source.nonRegisteredBookValue,
     interestBearing: target.interestBearing + source.interestBearing,
     interestBearingAccrued: target.interestBearingAccrued + source.interestBearingAccrued,
-    interestBearingTermElapsed: Math.max(target.interestBearingTermElapsed, source.interestBearingTermElapsed),
+    taxableInterestBearingAccrued: target.taxableInterestBearingAccrued + source.taxableInterestBearingAccrued,
+    gicPositions: [...target.gicPositions, ...source.gicPositions],
   };
 }
 
 function zeroBalances(): AccountBalances {
-  return { rrsp: 0, tfsa: 0, nonRegistered: 0, nonRegisteredBookValue: 0, interestBearing: 0, interestBearingAccrued: 0, interestBearingTermElapsed: 0 };
+  return { rrsp: 0, tfsa: 0, nonRegistered: 0, nonRegisteredBookValue: 0, interestBearing: 0, interestBearingAccrued: 0, taxableInterestBearingAccrued: 0, gicPositions: [] };
 }
 
 export function calculateTax(
@@ -830,7 +1269,7 @@ function taxableIncomeForYear(
   // Cashing out early crystallizes a proportional share of the still-deferred (untaxed) growth for that term.
   const interestBearingAccruedRatio = startingBalances.interestBearing <= 0
     ? 0
-    : startingBalances.interestBearingAccrued / startingBalances.interestBearing;
+    : startingBalances.taxableInterestBearingAccrued / startingBalances.interestBearing;
   return {
     ...fixedTaxable,
     ordinaryIncome: fixedTaxable.ordinaryIncome + withdrawals.rrsp + withdrawals.interestBearing * interestBearingAccruedRatio,
@@ -875,28 +1314,42 @@ function removeWithdrawal(balances: AccountBalances, account: keyof AccountWithd
     next.nonRegistered = Math.max(0, balanceBefore - amount);
     next.nonRegisteredBookValue = Math.max(0, next.nonRegisteredBookValue - bookValueReduction);
   } else if (account === "interestBearing") {
+    // Reduces every GIC position proportionally to how much of the aggregate balance it holds, so each rung's own
+    // deferred-growth ratio stays consistent with what's actually left in it.
     const balanceBefore = next.interestBearing;
-    const accruedReduction = balanceBefore === 0 ? 0 : next.interestBearingAccrued * (amount / balanceBefore);
+    const ratio = balanceBefore === 0 ? 0 : Math.min(1, amount / balanceBefore);
+    next.gicPositions = next.gicPositions.map((position) => ({
+      ...position,
+      balance: Math.max(0, position.balance - position.balance * ratio),
+      accrued: Math.max(0, position.accrued - position.accrued * ratio),
+    }));
     next.interestBearing = Math.max(0, balanceBefore - amount);
-    next.interestBearingAccrued = Math.max(0, next.interestBearingAccrued - accruedReduction);
+    next.interestBearingAccrued = next.gicPositions.reduce((sum, position) => sum + position.accrued, 0);
   } else {
     next[account] = Math.max(0, next[account] - amount);
   }
   return next;
 }
 
-function applyAnnualReturn(balances: AccountBalances, portfolioReturn: number, interestBearingRate: number): AccountBalances {
+// periodFraction is 1 for a full annual pass, or 1/subPeriodCount when compounding a single sub-period. portfolioReturn
+// is already period-scaled by the caller (e.g. one month's decomposed return) - only each GIC position's own ANNUAL
+// rate needs converting to an equivalent period rate here, since it's principal-protected and grows independent of
+// the market return.
+function applyAnnualReturn(balances: AccountBalances, portfolioReturn: number, periodFraction: number): AccountBalances {
   const returnMultiplier = Math.max(0, 1 + portfolioReturn);
-  // GICs/PPNs carry their own guaranteed rate rather than the market return, and are principal-protected (never decline).
-  const interestMultiplier = 1 + Math.max(0, interestBearingRate);
+  const gicPositions = balances.gicPositions.map((position) => ({
+    ...position,
+    balance: position.balance * ((1 + Math.max(0, position.annualRate)) ** periodFraction),
+  }));
   return {
     rrsp: balances.rrsp * returnMultiplier,
     tfsa: balances.tfsa * returnMultiplier,
     nonRegistered: balances.nonRegistered * returnMultiplier,
     nonRegisteredBookValue: balances.nonRegisteredBookValue,
-    interestBearing: balances.interestBearing * interestMultiplier,
+    interestBearing: gicPositions.reduce((sum, position) => sum + position.balance, 0),
     interestBearingAccrued: balances.interestBearingAccrued,
-    interestBearingTermElapsed: balances.interestBearingTermElapsed,
+    taxableInterestBearingAccrued: balances.taxableInterestBearingAccrued,
+    gicPositions,
   };
 }
 
@@ -914,5 +1367,5 @@ function totalPortfolio(balances: AccountBalances) {
 }
 
 function cloneBalances(balances: AccountBalances): AccountBalances {
-  return { ...balances };
+  return { ...balances, gicPositions: balances.gicPositions.map((position) => ({ ...position })) };
 }

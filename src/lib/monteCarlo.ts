@@ -1,4 +1,4 @@
-import { decomposeAnnualReturn, projectRetirementPlan, subPeriodsPerYear } from "@/lib/simulationEngine";
+import { decomposeAnnualReturn, projectRetirementPlan, sampleAnnualReturn, subPeriodsPerYear } from "@/lib/simulationEngine";
 import type {
   DeterministicProjection,
   FailureAnalysis,
@@ -23,7 +23,7 @@ export function runMonteCarloSimulation(inputs: RetirementInputs): SimulationOut
   const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
 
   for (let run = 0; run < inputs.simulation.iterations; run += 1) {
-    const annualReturns = Array.from({ length: yearCount }, () => boundedLognormalReturn(
+    const annualReturns = Array.from({ length: yearCount }, () => sampleAnnualReturn(
       random,
       inputs.assumptions.returnMean,
       inputs.assumptions.returnStdDev,
@@ -129,24 +129,6 @@ function normalRandom(random: () => number, mean: number, standardDeviation: num
   const second = random();
   const standardNormal = Math.sqrt(-2 * Math.log(first)) * Math.cos(2 * Math.PI * second);
   return mean + standardNormal * standardDeviation;
-}
-
-function lognormalReturn(random: () => number, arithmeticMean: number, standardDeviation: number) {
-  if (arithmeticMean <= -1) return -0.999;
-  const grossMean = 1 + arithmeticMean;
-  const logVariance = Math.log(1 + (standardDeviation ** 2) / (grossMean ** 2));
-  const logStandardDeviation = Math.sqrt(logVariance);
-  const logMean = Math.log(grossMean) - logVariance / 2;
-  const standardNormal = normalRandom(random, 0, 1);
-  return Math.exp(logMean + logStandardDeviation * standardNormal) - 1;
-}
-
-function boundedLognormalReturn(random: () => number, arithmeticMean: number, standardDeviation: number, floor: number, ceiling: number) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const sample = lognormalReturn(random, arithmeticMean, standardDeviation);
-    if (sample >= floor && sample <= ceiling) return sample;
-  }
-  return Math.min(ceiling, Math.max(floor, arithmeticMean));
 }
 
 function createRandom(seed?: number) {
