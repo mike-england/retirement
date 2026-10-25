@@ -4,6 +4,7 @@ export type TaxTreatment =
   | "cpp"
   | "oas"
   | "rrspWithdrawal"
+  | "rrifWithdrawal"
   | "eligibleDividend"
   | "nonEligibleDividend"
   | "capitalGains"
@@ -57,6 +58,7 @@ export interface PersonalInfo {
   cppPayoutRate: number;
   receivesOas: boolean;
   additionalPeople: PlanPerson[];
+  rrifConversionAge?: number;
 }
 
 export interface PlanPerson {
@@ -69,6 +71,7 @@ export interface PlanPerson {
   cppPayoutRate: number;
   receivesOas: boolean;
   existingAssets?: ExistingAssets;
+  rrifConversionAge?: number;
 }
 
 export type IndexationMode = "none" | "fullInflation" | "partialInflation" | "fixedRate";
@@ -86,6 +89,7 @@ export interface IncomeStream {
   indexationRate?: number;
   startMonth?: number;
   endMonth?: number;
+  pensionEligibleForSplitting?: boolean;
 }
 
 export interface ContributionSchedule {
@@ -164,6 +168,8 @@ export interface StrategySettings {
   cppStartAge: 60 | 65 | 70;
   oasStartAge: 60 | 65 | 70;
   aggressiveRrspMeltdown: boolean;
+  taxAwareWithdrawals?: boolean;
+  pensionIncomeSplitting?: { enabled: boolean };
   // Order accounts are drawn down to cover each year's spending shortfall, e.g. ["interestBearing", "nonRegistered", "tfsa", "rrsp"].
   withdrawalOrder: WithdrawalAccount[];
   // Defaults to "annual" (a single year-end withdrawal) for scenarios saved before this was configurable.
@@ -264,6 +270,10 @@ export interface PersonTaxBreakdown {
   federalTax: number;
   provincialTax: number;
   totalTax: number;
+  pensionSplitTransfer?: number;
+  oasClawback?: number;
+  oasRecoveryIncome?: number;
+  rrspWithdrawals?: number;
 }
 
 export interface YearProjection {
@@ -278,6 +288,7 @@ export interface YearProjection {
   taxes: TaxResult;
   taxesByPerson: PersonTaxBreakdown[];
   oasClawback: number;
+  pensionSplit?: { fromPersonId: string; toPersonId: string; amount: number };
   recurringNetIncome: number;
   netSpendableCash: number;
   spendingTarget: number;

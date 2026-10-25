@@ -4,6 +4,10 @@
 - Moved Monte Carlo simulations into a background worker with an animated concentric-arc loader, live completed-run counts and percentage.
 - Enabled Delete for the New Scenario draft when saved scenarios exist; discarding the draft switches to a saved scenario and hides the draft entry until New is clicked or the page is reloaded.
 - Added cookie-free GoatCounter page-visit analytics with automatic filtering of localhost and local-network visits, a fixed page path and title, no referrer reporting or click tracking, and no scenario data included in analytics.
+- Allowed tax-aware withdrawals and aggressive RRSP meltdown to be enabled together, and grouped them with withdrawal order, frequency, and pension splitting. Separated CPP/OAS start ages into Government benefits and clarified that meltdown runs after spending is funded and can increase tax or OAS recovery.
+- Made tax-aware withdrawals prioritize the user's account order, with only a limited OAS-reducing exception for the next non-registered account ahead of RRSP withdrawals. Removed the pension-splitting partner selector; enabling splitting assumes the primary and first additional person are eligible spouses/common-law partners.
+- Added optional tax-aware household withdrawals and eligible spouse/common-law pension splitting, including employer pensions, RRIF income from age 65, CPP income in the tax assessment, and OAS recovery. Added per-person RRIF conversion ages, registered-GIC minimum withdrawals, and expandable Ledger tax-allocation reporting.
+- Added lifetime OAS recovery to Dashboard and Compare, and corrected the OAS recovery income basis to include OAS itself, taxable capital gains, and dividend gross-ups. Strategies target current after-tax cash flow, not a guaranteed lifetime optimum; CPP pension sharing and tax-refund timing are not modeled.
 
 # 1.2.0 (September 27, 2026)
 - Derived household retirement timing from employment income end ages/months instead of a separate retirement date. Monthly spending and withdrawals begin when the last employment stream ends, while income streams can define their own partial first/final years.

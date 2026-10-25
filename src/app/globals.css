@@ -34,6 +34,14 @@ button, input, select { font: inherit; } button { cursor: pointer; }
 .tax-availability { max-width: 280px; padding-bottom: 8px; color: var(--muted); font-family: Arial, sans-serif; font-size: 11px; }
 .section-note { max-width: 480px; margin: 12px 0 0; padding: 8px 10px; border-radius: 6px; background: #f1f5f9; font-size: 11px; line-height: 1.5; }
 .field-label-text { display: flex; align-items: flex-start; gap: 5px; min-height: 15px; }
+.strategy-inputs .strategy-field-label, .strategy-inputs .check-row { color: var(--muted); font-family: Arial, sans-serif; font-size: 10px; font-weight: 700; line-height: 1.5; }
+.strategy-inputs .check-row { align-items: flex-start; margin-top: 12px; }
+.strategy-inputs .check-row input { flex: 0 0 14px; margin: 0; }
+.strategy-inputs .field-hint { flex-shrink: 0; }
+.strategy-inputs .check-row .field-hint { margin-left: auto; }
+.strategy-inputs .strategy-section-heading { align-items: center; margin-bottom: 3px; }
+.strategy-inputs .strategy-section-heading h2 { margin-bottom: 0; }
+.strategy-inputs .withdrawal-order-list li { color: var(--ink); font-size: 12px; font-weight: 400; }
 .field-hint { display: inline-flex; align-items: center; justify-content: center; width: 13px; height: 13px; border-radius: 50%; background: var(--line); color: var(--muted); font-family: Georgia, serif; font-style: italic; font-size: 9px; font-weight: 700; line-height: 1; cursor: help; }
 .field-hint-tooltip { position: fixed; z-index: 9999; width: 240px; transform: translate(-50%, calc(-100% - 8px)); padding: 8px 10px; border-radius: 6px; background: #1e293b; color: #f8fafc; font-family: Arial, sans-serif; font-size: 11px; font-weight: 400; line-height: 1.5; text-transform: none; letter-spacing: normal; pointer-events: none; box-shadow: 0 8px 20px rgba(15, 23, 42, .25); }
 .chart-panel-note { margin: 0 0 16px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: #f8fafc; font-size: 12px; }

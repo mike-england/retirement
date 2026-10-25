@@ -40,7 +40,7 @@ export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (
     const subPeriodReturns = subPeriodCount <= 1
       ? undefined
       : annualReturns.map((annualReturn) => decomposeAnnualReturn(random, annualReturn, subPeriodCount, inputs.assumptions.returnStdDev));
-    projections.push(projectRetirementPlan(inputs, { annualReturns, annualInflation, subPeriodReturns }));
+    projections.push(projectRetirementPlan(inputs, { annualReturns, annualInflation, subPeriodReturns, pensionSplittingPolicy: "simple", fastWithdrawalSizing: true }));
     averageAnnualReturns.push(average(annualReturns));
     if (onProgress && Date.now() - lastProgressAt >= 100) {
       onProgress(run + 1, inputs.simulation.iterations);
@@ -50,7 +50,7 @@ export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (
 
   onProgress?.(projections.length, inputs.simulation.iterations);
   const sortedByEstate = [...projections].sort((first, second) => first.finalEstateValue - second.finalEstateValue);
-  const medianRun = projectRetirementPlan(inputs);
+  const medianRun = projectRetirementPlan(inputs, { pensionSplittingPolicy: "simple", fastWithdrawalSizing: true });
   const successfulRuns = projections.filter((projection) => !projection.portfolioDepleted).length;
   const successRate = projections.length === 0 ? 0 : successfulRuns / projections.length;
   // The bottom (1 - successRate) share of runs run out of money, so that rank marks the worst run that still survives.

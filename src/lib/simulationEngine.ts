@@ -13,6 +13,7 @@ import type {
   ProvinceCode,
   RetirementInputs,
   SubPeriodProjection,
+  TaxJurisdictionSettings,
   TaxRateBracket,
   TaxResult,
   TaxSettings,
@@ -74,10 +75,154 @@ type PersonYearState = {
   monthlyRrspContribution: number;
   monthlyTfsaContribution: number;
   monthlyNonRegisteredContribution: number;
+  eligiblePensionIncome: number;
+  eligibleRrifWithdrawals: boolean;
+  withdrawalTaxable?: { ordinaryIncome: number; capitalGains: number };
 };
+
+type HouseholdAssessment = {
+  cost: number;
+  people: { tax: TaxResult; oasClawback: number; transfer: number; oasRecoveryIncome: number }[];
+  pensionSplit?: YearProjection["pensionSplit"];
+};
+
+function netIncomeForBenefits(income: TaxableIncome, inclusionRate: number): number {
+  return Math.max(0, income.ordinaryIncome) + Math.max(0, income.capitalGains) * inclusionRate
+    + Math.max(0, income.eligibleDividends) * 1.38 + Math.max(0, income.nonEligibleDividends) * 1.15;
+}
+
+function withdrawFromState(state: PersonYearState, account: WithdrawalAccount, amount: number, registeredOnly = false): PersonYearState {
+  const taxable = state.withdrawalTaxable;
+  const balances = state.balances;
+  const gainRatio = balances.nonRegistered > 0 ? Math.max(0, 1 - balances.nonRegisteredBookValue / balances.nonRegistered) : 0;
+  const registeredBalance = balances.gicPositions.filter((position) => position.fundingSource === "registered").reduce((sum, position) => sum + position.balance, 0);
+  const registeredRatio = registeredOnly ? 1 : balances.interestBearing > 0 ? registeredBalance / balances.interestBearing : 0;
+  const interestRatio = !registeredOnly && balances.interestBearing > 0
+    ? balances.gicPositions.filter((position) => position.fundingSource !== "registered").reduce((sum, position) => sum + position.accrued, 0) / balances.interestBearing : 0;
+  const nextBalances = removeWithdrawal(balances, account, amount);
+  if (registeredOnly && account === "interestBearing") {
+    nextBalances.gicPositions = balances.gicPositions.map((position) => position.fundingSource === "registered" ? {
+      ...position, balance: position.balance * (1 - amount / registeredBalance), accrued: position.accrued * (1 - amount / registeredBalance),
+    } : position);
+    nextBalances.interestBearingAccrued = nextBalances.gicPositions.reduce((sum, position) => sum + position.accrued, 0);
+    nextBalances.taxableInterestBearingAccrued = balances.taxableInterestBearingAccrued;
+  }
+  return {
+    ...state,
+    balances: nextBalances,
+    withdrawals: { ...state.withdrawals, [account]: state.withdrawals[account] + amount },
+    eligiblePensionIncome: state.eligiblePensionIncome + (state.eligibleRrifWithdrawals && account === "interestBearing" ? amount * registeredRatio : 0),
+    withdrawalTaxable: taxable ? {
+      ordinaryIncome: taxable.ordinaryIncome + (account === "rrsp" ? amount : account === "interestBearing" ? amount * (registeredRatio + interestRatio) : 0),
+      capitalGains: taxable.capitalGains + (account === "nonRegistered" ? amount * gainRatio : 0),
+    } : undefined,
+  };
+}
+
+type PensionSplittingPolicy = "detailed" | "simple";
+
+function assessHousehold(states: PersonYearState[], inputs: RetirementInputs, inflationMultiplier: number, pensionSplittingPolicy: PensionSplittingPolicy): HouseholdAssessment {
+  const taxable = states.map((state) => state.withdrawalTaxable ? {
+    ...state.fixedTaxable,
+    ordinaryIncome: state.fixedTaxable.ordinaryIncome + state.withdrawalTaxable.ordinaryIncome,
+    capitalGains: state.fixedTaxable.capitalGains + state.withdrawalTaxable.capitalGains,
+  } : taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances));
+  const splitting = inputs.strategy.pensionIncomeSplitting;
+  const primaryIndex = states.findIndex((state) => state.id === "primary");
+  const partner = inputs.personalInfo.additionalPeople?.[0];
+  const partnerIndex = states.findIndex((state) => state.id === partner?.id);
+  const canSplit = splitting?.enabled && primaryIndex >= 0 && partnerIndex >= 0 && primaryIndex !== partnerIndex
+    && states[primaryIndex].age <= inputs.personalInfo.targetDeathAge && partner && states[partnerIndex].age <= partner.targetDeathAge;
+  function evaluate(amount: number): HouseholdAssessment {
+    const people = states.map((state, index) => {
+      const transfer = index === primaryIndex ? -amount : index === partnerIndex ? amount : 0;
+      const income = { ...taxable[index], ordinaryIncome: taxable[index].ordinaryIncome + transfer };
+      const benefitIncome = netIncomeForBenefits(income, inputs.simulation.capitalGainsInclusionRate);
+      const oasClawback = calculateOasClawback(state.income.oas, benefitIncome, state.age, inflationMultiplier);
+      const tax = calculateTax({ ...income, ordinaryIncome: income.ordinaryIncome - oasClawback }, inputs.personalInfo.province, inputs.simulation.capitalGainsInclusionRate, inputs.taxSettings);
+      return { tax, oasClawback, transfer, oasRecoveryIncome: benefitIncome };
+    });
+    return {
+      people,
+      cost: people.reduce((sum, person) => sum + person.tax.totalTax + person.oasClawback, 0),
+      pensionSplit: Math.abs(amount) > 0.01 ? {
+        fromPersonId: states[amount > 0 ? primaryIndex : partnerIndex].id,
+        toPersonId: states[amount > 0 ? partnerIndex : primaryIndex].id,
+        amount: Math.abs(amount),
+      } : undefined,
+    };
+  }
+  if (!canSplit) return evaluate(0);
+  const eligible = (index: number) => Math.max(0, Math.min(taxable[index].ordinaryIncome,
+    states[index].eligiblePensionIncome + (states[index].eligibleRrifWithdrawals ? states[index].withdrawals.rrsp : 0)));
+  const minimum = -eligible(partnerIndex) / 2;
+  const maximum = eligible(primaryIndex) / 2;
+  if (minimum === 0 && maximum === 0) return evaluate(0);
+  const staticIncome = taxable.map((income) => ({
+    gains: Math.max(0, income.capitalGains) * inputs.simulation.capitalGainsInclusionRate,
+    eligible: Math.max(0, income.eligibleDividends) * 1.38,
+    nonEligible: Math.max(0, income.nonEligibleDividends) * 1.15,
+  }));
+  const federalSettings = inputs.taxSettings.federal;
+  const provincialSettings = inputs.taxSettings.provinces[inputs.personalInfo.province];
+  const costs = new Map<number, number>();
+  function evaluateCost(amount: number): number {
+    const cached = costs.get(amount);
+    if (cached !== undefined) return cached;
+    let cost = 0;
+    for (let index = 0; index < states.length; index += 1) {
+      const transfer = index === primaryIndex ? -amount : index === partnerIndex ? amount : 0;
+      const ordinary = taxable[index].ordinaryIncome + transfer;
+      const fixed = staticIncome[index];
+      const benefitIncome = Math.max(0, ordinary) + fixed.gains + fixed.eligible + fixed.nonEligible;
+      const recovery = calculateOasClawback(states[index].income.oas, benefitIncome, states[index].age, inflationMultiplier);
+      const totalIncome = Math.max(0, ordinary - recovery) + fixed.gains + fixed.eligible + fixed.nonEligible;
+      const dividendCredit = fixed.eligible * 0.150198 + fixed.nonEligible * 0.090301;
+      const federal = federalTaxForIncome(totalIncome, dividendCredit, federalSettings, provincialSettings.abatementRate);
+      const provincial = provincialTaxForIncome(totalIncome, provincialSettings);
+      cost += (federal + provincial) + recovery;
+    }
+    costs.set(amount, cost);
+    return cost;
+  }
+  let bestCost = evaluateCost(0);
+  let bestAmount = 0;
+  if (pensionSplittingPolicy === "simple") {
+    const balanced = Math.max(minimum, Math.min(maximum,
+      (netIncomeForBenefits(taxable[primaryIndex], inputs.simulation.capitalGainsInclusionRate)
+        - netIncomeForBenefits(taxable[partnerIndex], inputs.simulation.capitalGainsInclusionRate)) / 2));
+    for (const amount of new Set([minimum, maximum, balanced])) {
+      if (amount === 0) continue;
+      const candidateCost = evaluateCost(amount);
+      if (candidateCost < bestCost - 0.005) { bestCost = candidateCost; bestAmount = amount; }
+    }
+    return evaluate(bestAmount);
+  }
+  for (const limit of [minimum, maximum]) {
+    if (limit === 0) continue;
+    for (let step = 1; step <= 10; step += 1) {
+      const amount = limit * step / 10;
+      const candidateCost = evaluateCost(amount);
+      if (candidateCost < bestCost - 0.005) { bestCost = candidateCost; bestAmount = amount; }
+    }
+  }
+  let radius = Math.max(Math.abs(minimum), maximum) / 10;
+  for (let pass = 0; pass < 5; pass += 1) {
+    const center = bestAmount;
+    for (const direction of [-1, 1]) {
+      const amount = Math.max(minimum, Math.min(maximum, center + direction * radius / 2));
+      const candidateCost = evaluateCost(amount);
+      if (candidateCost < bestCost - 0.005) { bestCost = candidateCost; bestAmount = amount; }
+    }
+    radius /= 2;
+  }
+  return evaluate(bestAmount);
+}
 
 export type ProjectionOptions = {
   calendarYear?: number;
+  pensionSplittingPolicy?: PensionSplittingPolicy;
+  fastWithdrawalSizing?: boolean;
   annualReturns?: number[];
   annualInflation?: number[];
   // Per year index, the realized return for each sub-period (month/quarter/half) when withdrawalFrequency isn't "annual". Falls back to an internally generated split if omitted.
@@ -347,6 +492,8 @@ export function projectRetirementPlan(
       startedGicIds,
       annualSpendingTarget,
       retirementStartMonth,
+      options.pensionSplittingPolicy ?? "detailed",
+      options.fastWithdrawalSizing ?? false,
     );
 
 
@@ -414,6 +561,7 @@ export function projectRetirementPlan(
       taxes: { ...result.tax, totalTax: yearTax },
       taxesByPerson: result.taxesByPerson,
       oasClawback: result.oasClawback,
+      pensionSplit: result.pensionSplit,
       recurringNetIncome: result.recurringNetIncome,
       netSpendableCash: result.netSpendableCash,
       spendingTarget,
@@ -591,7 +739,11 @@ function fundHousehold(
   startedGicIds: Set<string>,
   annualSpendingTarget: number,
   retirementStartMonth: number,
+  pensionSplittingPolicy: PensionSplittingPolicy,
+  fastWithdrawalSizing: boolean,
 ) {
+  const useHouseholdTax = Boolean(inputs.strategy.taxAwareWithdrawals || inputs.strategy.pensionIncomeSplitting?.enabled
+    || inputs.personalInfo.rrifConversionAge !== undefined || inputs.personalInfo.additionalPeople?.some((person) => person.rrifConversionAge !== undefined));
   const states: PersonYearState[] = roster.map((person) => {
     const fixed = personFixedIncome(inputs, person, yearIndex, calendarYear, inflationMultiplier, streamIndexMultipliers);
     const opening = balancesByPerson[person.id];
@@ -639,28 +791,125 @@ function fundHousehold(
       monthlyRrspContribution: fixed.monthlyRrspContribution,
       monthlyTfsaContribution: fixed.monthlyTfsaContribution,
       monthlyNonRegisteredContribution: fixed.monthlyNonRegisteredContribution,
+      eligiblePensionIncome: fixed.eligiblePensionIncome,
+      eligibleRrifWithdrawals: person.currentAge + yearIndex >= 65
+        && person.currentAge + yearIndex >= (rrifConversionAgeFor(inputs, person.id) ?? 71),
+      withdrawalTaxable: useHouseholdTax ? { ordinaryIncome: 0, capitalGains: 0 } : undefined,
       tax: calculateTax(fixedTaxable, inputs.personalInfo.province, inputs.simulation.capitalGainsInclusionRate, inputs.taxSettings),
     };
   });
 
   startNewGicsForYear(states, roster, age, inputs, startedGicIds);
 
-  const netCashTotal = () => states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) + sumWithdrawals(state.withdrawals) - state.tax.totalTax - state.cashContribution), 0);
-  const recurringNetIncome = states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) - state.tax.totalTax - state.cashContribution), 0);
+  const grossFixedCash = states.reduce((sum, state) => sum + cashFromIncome(state.income) - state.cashContribution, 0);
+  const baselineAssessment = useHouseholdTax ? assessHousehold(states, inputs, inflationMultiplier, pensionSplittingPolicy) : undefined;
+  let finalAssessment: HouseholdAssessment | undefined;
+  const assessment = () => finalAssessment ?? assessHousehold(states, inputs, inflationMultiplier, pensionSplittingPolicy);
+  const netCashTotal = () => useHouseholdTax
+    ? Math.max(0, grossFixedCash + states.reduce((sum, state) => sum + sumWithdrawals(state.withdrawals), 0) - assessment().cost)
+    : states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) + sumWithdrawals(state.withdrawals) - state.tax.totalTax - state.cashContribution), 0);
+  const recurringNetIncome = baselineAssessment ? Math.max(0, grossFixedCash - baselineAssessment.cost)
+    : states.reduce((sum, state) => sum + Math.max(0, cashFromIncome(state.income) - state.tax.totalTax - state.cashContribution), 0);
+  const fundOptimizedGap = (target: number, fraction = 1) => {
+    let currentAssessment = assessment();
+    const netCash = () => grossFixedCash * fraction + states.reduce((sum, state) => sum + sumWithdrawals(state.withdrawals), 0)
+      - currentAssessment.cost + (baselineAssessment?.cost ?? 0) * (1 - fraction);
+    for (let attempt = 0; attempt < 256; attempt += 1) {
+      const needed = target - netCash();
+      if (needed <= 0.01) break;
+      const before = currentAssessment;
+      const beforeCost = before.cost;
+      const beforeRecovery = before.people.reduce((sum, person) => sum + person.oasClawback, 0);
+      let candidates = withdrawalOrder.flatMap((account) => states.map((state, index) => ({ account, state, index })))
+        .filter(({ account, state }) => state.balances[account] > 0.01);
+      if (inputs.strategy.gicBuffer?.enabled) {
+        const preferred = withdrawalOrder[0] === "interestBearing"
+          ? candidates.filter(({ account }) => account === "interestBearing")
+          : candidates.filter(({ account }) => account !== "interestBearing");
+        if (preferred.length > 0) candidates = preferred;
+      }
+      const preferredAccount = candidates[0]?.account;
+      const nextAccount = candidates.find(({ account }) => account !== preferredAccount)?.account;
+      const allowOasException = inputs.strategy.taxAwareWithdrawals && preferredAccount === "rrsp" && nextAccount === "nonRegistered";
+      candidates = inputs.strategy.taxAwareWithdrawals
+        ? candidates.filter(({ account }) => account === preferredAccount || (allowOasException && account === "nonRegistered"))
+        : candidates.slice(0, 1);
+      let best: { index: number; account: WithdrawalAccount; amount: number; gain: number; efficiency: number; recoveryRate: number } | undefined;
+      const costAfter = (index: number, account: WithdrawalAccount, amount: number) => assessHousehold(
+        states.map((state, candidateIndex) => candidateIndex === index ? withdrawFromState(state, account, amount) : state), inputs, inflationMultiplier, pensionSplittingPolicy,
+      );
+      for (const { account, state, index } of candidates) {
+        const amount = Math.min(state.balances[account], Math.max(100, Math.min(10_000, needed)));
+        const after = costAfter(index, account, amount);
+        const gain = amount - (after.cost - beforeCost);
+        const efficiency = gain / amount;
+        const recoveryRate = (after.people.reduce((sum, person) => sum + person.oasClawback, 0) - beforeRecovery) / amount;
+        const improvesPriority = account === preferredAccount;
+        const improvesOas = best && recoveryRate < best.recoveryRate - 0.000001;
+        if (gain > 0.001 && (!best || ((improvesPriority || improvesOas) && efficiency > best.efficiency + 0.000001))) {
+          best = { index, account, amount, gain, efficiency, recoveryRate };
+        }
+      }
+      if (!best) break;
+      let amount = best.amount;
+      if (best.gain > needed) {
+        let low = 0;
+        let high = amount;
+        let lowGain = 0;
+        let highGain = best.gain;
+        let converged = false;
+        if (fastWithdrawalSizing) {
+          for (let pass = 0; pass < 4; pass += 1) {
+            const candidate = low + (needed - lowGain) * (high - low) / (highGain - lowGain);
+            if (!Number.isFinite(candidate) || candidate <= low || candidate >= high) break;
+            const gain = candidate - (costAfter(best.index, best.account, candidate).cost - beforeCost);
+            if (!Number.isFinite(gain)) break;
+            if (Math.abs(gain - needed) <= 0.005) {
+              amount = candidate;
+              converged = true;
+              break;
+            }
+            if (gain >= needed) { high = candidate; highGain = gain; }
+            else { low = candidate; lowGain = gain; }
+          }
+        }
+        if (!converged) {
+          for (let pass = 0; pass < 20; pass += 1) {
+            const middle = (low + high) / 2;
+            if (middle - (costAfter(best.index, best.account, middle).cost - beforeCost) >= needed) high = middle;
+            else low = middle;
+          }
+          amount = high;
+        }
+      }
+      states[best.index] = withdrawFromState(states[best.index], best.account, amount);
+      currentAssessment = assessment();
+    }
+  };
   // Snapshot each state's tax bill with zero withdrawals, so sub-period cash-flow math can prorate the FIXED income across the year instead of treating it as fully received in period 1.
   const fixedTaxBaselineByState = new Map(states.map((state) => [state.id, state.tax.totalTax]));
 
   // RRIF minimum withdrawals are mandatory once converted (by 71), regardless of spending need, based on the fund's value at the start of the year.
-  const rrifMinimumByState = new Map(states.map((state) => [
-    state.id,
-    Math.max(0, Math.min(calculateRrifMinimumWithdrawal(balancesByPerson[state.id].rrsp, state.age), state.balances.rrsp)),
-  ]));
+  const rrifMinimumByState = new Map(states.map((state) => {
+    const registeredGics = useHouseholdTax ? balancesByPerson[state.id].gicPositions
+      .filter((position) => position.fundingSource === "registered").reduce((sum, position) => sum + position.balance, 0) : 0;
+    const available = state.balances.rrsp + registeredGics;
+    return [state.id, Math.max(0, Math.min(calculateRrifMinimumWithdrawal(
+      balancesByPerson[state.id].rrsp + registeredGics, state.age, rrifConversionAgeFor(inputs, state.id),
+    ), available))] as const;
+  }));
   const rrifMinimumWithdrawal = [...rrifMinimumByState.values()].reduce((sum, amount) => sum + amount, 0);
 
   const withdrawRrifMinimum = (state: PersonYearState, amount: number) => {
     if (amount <= 0) return;
-    state.balances = removeWithdrawal(state.balances, "rrsp", amount);
-    state.withdrawals.rrsp += amount;
+    const rrspAmount = Math.min(amount, state.balances.rrsp);
+    Object.assign(state, withdrawFromState(state, "rrsp", rrspAmount));
+    if (useHouseholdTax && amount > rrspAmount) {
+      const registeredGics = state.balances.gicPositions.filter((position) => position.fundingSource === "registered")
+        .reduce((sum, position) => sum + position.balance, 0);
+      const gicAmount = Math.min(amount - rrspAmount, registeredGics);
+      if (gicAmount > 0) Object.assign(state, withdrawFromState(state, "interestBearing", gicAmount, true));
+    }
     state.tax = calculateTax(
       taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances),
       inputs.personalInfo.province,
@@ -677,7 +926,8 @@ function fundHousehold(
   if (subPeriodCount <= 1) {
     // Single annual withdrawal, unchanged: growth is applied once by the caller, after this whole pass.
     for (const state of states) withdrawRrifMinimum(state, rrifMinimumByState.get(state.id) ?? 0);
-    for (const account of withdrawalOrder) {
+    if (useHouseholdTax) fundOptimizedGap(spendingTarget);
+    else for (const account of withdrawalOrder) {
       for (const state of states) {
         const requiredCash = spendingTarget - netCashTotal();
         const available = state.balances[account];
@@ -723,7 +973,8 @@ function fundHousehold(
         const withdrawalTax = state.tax.totalTax - fixedTaxBaseline;
         return sum + Math.max(0, recurringNet * elapsedFraction + sumWithdrawals(state.withdrawals) - withdrawalTax);
       }, 0);
-      for (const account of withdrawalOrder) {
+      if (useHouseholdTax) fundOptimizedGap(cumulativeTarget, elapsedFraction);
+      else for (const account of withdrawalOrder) {
         for (const state of states) {
           const requiredCash = cumulativeTarget - netCashSoFar();
           const available = state.balances[account];
@@ -768,8 +1019,7 @@ function fundHousehold(
       const meltAmount = Math.min(state.balances.rrsp, Math.max(0, nextLimit - currentOrdinaryIncome));
       if (meltAmount <= 0) continue;
       meltByState.set(state.id, meltAmount);
-      state.balances = removeWithdrawal(state.balances, "rrsp", meltAmount);
-      state.withdrawals.rrsp += meltAmount;
+      Object.assign(state, withdrawFromState(state, "rrsp", meltAmount));
       state.tax = calculateTax(
         taxableIncomeForYear(state.fixedTaxable, state.withdrawals, state.balances),
         inputs.personalInfo.province,
@@ -803,9 +1053,8 @@ function fundHousehold(
       const baseOas = baseOasByState.get(state.id) ?? 0;
       if (baseOas <= 0) continue;
       const baseFixedTaxable = baseFixedTaxableByState.get(state.id)!;
-      const totalOrdinaryIncome = taxableIncomeForYear(baseFixedTaxable, state.withdrawals, state.balances).ordinaryIncome;
-      const otherOrdinaryIncome = totalOrdinaryIncome - baseOas;
-      const clawback = calculateOasClawback(baseOas, otherOrdinaryIncome, state.age, inflationMultiplier);
+      const benefitIncome = netIncomeForBenefits(taxableIncomeForYear(baseFixedTaxable, state.withdrawals, state.balances), inputs.simulation.capitalGainsInclusionRate);
+      const clawback = calculateOasClawback(baseOas, benefitIncome, state.age, inflationMultiplier);
       total += clawback;
       state.income = { ...state.income, oas: baseOas - clawback };
       state.fixedTaxable = { ...baseFixedTaxable, ordinaryIncome: baseFixedTaxable.ordinaryIncome - clawback };
@@ -818,14 +1067,16 @@ function fundHousehold(
     }
     return total;
   };
-  let oasClawback = applyOasClawback();
+  let oasClawback = useHouseholdTax ? assessment().people.reduce((sum, person) => sum + person.oasClawback, 0) : applyOasClawback();
 
   // The clawback above is only known once withdrawals are finalized, and reduces net cash after the fact - if that
   // pushes below the spending target, draw a bit more (same order) instead of reporting a shortfall/"depleted" year
   // while other accounts still hold plenty. Re-deriving the clawback each pass converges quickly since it's capped at
   // a fraction of OAS itself, so each extra withdrawal needed shrinks geometrically.
   const withdrawalsBeforeTopUp = new Map(states.map((state) => [state.id, { ...state.withdrawals }]));
+  if (useHouseholdTax) fundOptimizedGap(spendingTarget);
   for (let attempt = 0; attempt < 16; attempt += 1) {
+    if (useHouseholdTax) break;
     if (spendingTarget - netCashTotal() <= 0) break;
     let drewAny = false;
     for (const account of withdrawalOrder) {
@@ -848,6 +1099,14 @@ function fundHousehold(
     }
     if (!drewAny) break;
     oasClawback = applyOasClawback();
+  }
+  if (useHouseholdTax) {
+    finalAssessment = assessment();
+    oasClawback = finalAssessment.people.reduce((sum, person) => sum + person.oasClawback, 0);
+    states.forEach((state, index) => {
+      state.tax = finalAssessment!.people[index].tax;
+      state.income = { ...state.income, oas: state.income.oas - finalAssessment!.people[index].oasClawback };
+    });
   }
   // The top-up amount is only known after the full year's clawback is resolved, so - like the meltdown above - it's
   // spread evenly back across periods for display rather than dumped entirely into the last one.
@@ -924,12 +1183,16 @@ function fundHousehold(
   }), { rrsp: 0, tfsa: 0, nonRegistered: 0, interestBearing: 0 } as AccountWithdrawals);
   const combinedTax = combineTax(states.map((state) => state.tax));
   const balancesByPersonNext = Object.fromEntries(states.map((state) => [state.id, state.balances]));
-  const taxesByPerson = states.map((state) => ({
+  const taxesByPerson = states.map((state, index) => ({
     id: state.id,
     label: roster.find((person) => person.id === state.id)?.label ?? state.id,
     federalTax: state.tax.federalTax,
     provincialTax: state.tax.provincialTax,
     totalTax: state.tax.totalTax,
+    pensionSplitTransfer: finalAssessment?.people[index].transfer,
+    oasClawback: finalAssessment?.people[index].oasClawback,
+    oasRecoveryIncome: finalAssessment?.people[index].oasRecoveryIncome,
+    rrspWithdrawals: state.withdrawals.rrsp,
   }));
 
   return {
@@ -940,6 +1203,7 @@ function fundHousehold(
     tax: combinedTax,
     taxesByPerson,
     oasClawback,
+    pensionSplit: finalAssessment?.pensionSplit,
     totalIncome: cashFromIncome(combinedIncome),
     recurringNetIncome,
     netSpendableCash,
@@ -1034,6 +1298,7 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
   let monthlyRrspContribution = 0;
   let monthlyTfsaContribution = 0;
   let monthlyNonRegisteredContribution = 0;
+  let eligiblePensionIncome = 0;
 
   for (const stream of inputs.incomeStreams) {
     const ownerId = stream.ownerId || "primary";
@@ -1071,9 +1336,11 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
     } else if (stream.taxTreatment === "employment" || stream.taxTreatment === "pension") {
       income.employment += amount;
       taxableIncome.ordinaryIncome += amount;
-    } else if (stream.taxTreatment === "rrspWithdrawal") {
+      if (stream.taxTreatment === "pension" && stream.pensionEligibleForSplitting !== false) eligiblePensionIncome += Math.max(0, amount);
+    } else if (stream.taxTreatment === "rrspWithdrawal" || stream.taxTreatment === "rrifWithdrawal") {
       income.rrspWithdrawal += amount;
       taxableIncome.ordinaryIncome += amount;
+      if (stream.taxTreatment === "rrifWithdrawal" && age >= 65) eligiblePensionIncome += Math.max(0, amount);
     }
     else if (stream.taxTreatment === "taxFree") income.tfsaWithdrawal += amount;
     else {
@@ -1124,7 +1391,13 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
     }
   }
 
-  return { income, taxableIncome, rrspContribution, tfsaContribution, nonRegisteredContribution, cashContribution, monthlyRrspContribution, monthlyTfsaContribution, monthlyNonRegisteredContribution };
+  return { income, taxableIncome, rrspContribution, tfsaContribution, nonRegisteredContribution, cashContribution, monthlyRrspContribution, monthlyTfsaContribution, monthlyNonRegisteredContribution, eligiblePensionIncome };
+}
+
+function rrifConversionAgeFor(inputs: RetirementInputs, personId: string): number | undefined {
+  const value = personId === "primary" ? inputs.personalInfo.rrifConversionAge
+    : inputs.personalInfo.additionalPeople?.find((person) => person.id === personId)?.rrifConversionAge;
+  return value === undefined ? undefined : Math.max(0, Math.min(71, Math.round(value)));
 }
 
 function incomeProrationFraction(
@@ -1186,6 +1459,18 @@ function zeroBalances(): AccountBalances {
   return { rrsp: 0, tfsa: 0, nonRegistered: 0, nonRegisteredBookValue: 0, interestBearing: 0, interestBearingAccrued: 0, taxableInterestBearingAccrued: 0, gicPositions: [] };
 }
 
+function federalTaxForIncome(totalIncome: number, dividendCredit: number, settings: TaxJurisdictionSettings, abatementRate: number): number {
+  const grossTax = bracketTax(totalIncome, settings.brackets);
+  const basicCredit = Math.min(settings.basicPersonalAmount, totalIncome) * settings.taxCreditRate;
+  return Math.max(0, grossTax - basicCredit - dividendCredit) * (1 - abatementRate);
+}
+
+function provincialTaxForIncome(totalIncome: number, settings: TaxJurisdictionSettings): number {
+  const baseTax = Math.max(0, bracketTax(totalIncome, settings.brackets)
+    - Math.min(settings.basicPersonalAmount, totalIncome) * settings.taxCreditRate);
+  return baseTax + bracketTax(baseTax, settings.surtaxBrackets);
+}
+
 export function calculateTax(
   taxableIncome: TaxableIncome,
   province: ProvinceCode,
@@ -1199,17 +1484,11 @@ export function calculateTax(
     + capitalGainsTaxableAmount
     + eligibleDividendTaxableAmount
     + nonEligibleDividendTaxableAmount;
-  const grossFederalTax = bracketTax(totalTaxableIncome, taxSettings.federal.brackets);
-  const federalBasicCredit = Math.min(taxSettings.federal.basicPersonalAmount, totalTaxableIncome)
-    * taxSettings.federal.taxCreditRate;
   const federalDividendCredit = eligibleDividendTaxableAmount * 0.150198
     + nonEligibleDividendTaxableAmount * 0.090301;
-  const federalTaxBeforeAbatement = Math.max(0, grossFederalTax - federalBasicCredit - federalDividendCredit);
-  const federalTax = federalTaxBeforeAbatement * (1 - taxSettings.provinces[province].abatementRate);
   const provincialSettings = taxSettings.provinces[province];
-  const provincialBaseTax = Math.max(0, bracketTax(totalTaxableIncome, provincialSettings.brackets)
-    - Math.min(provincialSettings.basicPersonalAmount, totalTaxableIncome) * provincialSettings.taxCreditRate);
-  const provincialTax = provincialBaseTax + bracketTax(provincialBaseTax, provincialSettings.surtaxBrackets);
+  const federalTax = federalTaxForIncome(totalTaxableIncome, federalDividendCredit, taxSettings.federal, provincialSettings.abatementRate);
+  const provincialTax = provincialTaxForIncome(totalTaxableIncome, provincialSettings);
   const totalTax = federalTax + provincialTax;
   const marginalRate = totalTaxableIncome === 0
     ? 0
