@@ -17,6 +17,10 @@ Encryption runs locally using the browser's Web Crypto API: AES-256-GCM with a f
 
 Passwords are not persisted and cannot be recovered. Use a strong, unique passphrase and keep it in a password manager. Encryption protects the exported file only: **Save** and imported scenarios still use unencrypted browser local storage. It does not provide expiration or prevent a recipient from keeping decrypted data.
 
+## Page-visit analytics
+
+The site loads GoatCounter for cookie-free page-visit counts at https://retirement-planner.goatcounter.com, with no analytics build flag required. The script loads locally too, but its default hostname filtering skips counting visits from localhost and local-network addresses. Analytics uses a fixed `/retirement/` path and `Retirement Planner` title, with referrer reporting and click tracking disabled. Scenario names, financial inputs, passwords, and file contents are not included in analytics. Ad blockers and browser privacy settings may prevent visits from being counted.
+
 ## Running locally
 
 ### Option 1: Node.js dev server

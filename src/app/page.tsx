@@ -16,7 +16,7 @@ import {
 } from "react";
 import { defaultRetirementInputs } from "@/lib/default-inputs";
 import packageJson from "../../package.json";
-import { runMonteCarloSimulation } from "@/lib/monteCarlo";
+import type { MonteCarloWorkerMessage } from "@/lib/monteCarlo.worker";
 import { sampleAnnualReturn } from "@/lib/simulationEngine";
 import { projectWithVariableReturns } from "@/lib/projectionPath";
 import {
@@ -95,6 +95,8 @@ type SavedScenario = {
   updatedAt: string;
 };
 
+type MonteCarloProgress = { completed: number; total: number };
+
 export default function Home() {
   const [inputs, setInputs] = useState(defaultRetirementInputs);
   const [activeView, setActiveView] = useState("Dashboard");
@@ -104,9 +106,12 @@ export default function Home() {
   );
   const [monteCarloOutput, setMonteCarloOutput] =
     useState<SimulationOutput | null>(null);
+  const [monteCarloProgress, setMonteCarloProgress] = useState<MonteCarloProgress | null>(null);
+  const [monteCarloError, setMonteCarloError] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [scenarios, setScenarios] = useState<SavedScenario[]>([]);
   const [activeScenarioId, setActiveScenarioId] = useState("draft");
+  const [isDraftDismissed, setIsDraftDismissed] = useState(false);
   const [scenarioName, setScenarioName] = useState("New Scenario");
   const [justSaved, setJustSaved] = useState(false);
   const [fileDialog, setFileDialog] = useState<
@@ -250,6 +255,7 @@ export default function Home() {
   }
 
   function createNewScenario() {
+    setIsDraftDismissed(false);
     setActiveScenarioId("draft");
     setScenarioName("New Scenario");
     setInputs(structuredClone(defaultRetirementInputs));
@@ -311,6 +317,13 @@ export default function Home() {
   }
 
   function deleteScenario() {
+    if (activeScenarioId === "draft") {
+      const nextScenario = scenarios.find((scenario) => isRetirementInputs(scenario.inputs)) ?? scenarios[0];
+      if (!nextScenario || !window.confirm(`Discard New Scenario and load ${nextScenario.name}? Any unsaved draft changes will be lost.`)) return;
+      setIsDraftDismissed(true);
+      loadScenario(nextScenario.id);
+      return;
+    }
     const scenario = scenarios.find(
       (current) => current.id === activeScenarioId,
     );
@@ -474,10 +487,48 @@ export default function Home() {
 
   useEffect(() => {
     if (activeView !== "Monte Carlo") return;
+    let worker: Worker | null = null;
+    let cancelled = false;
+    function fail(message: string) {
+      if (cancelled) return;
+      setMonteCarloError(message);
+      setMonteCarloProgress(null);
+      worker?.terminate();
+    }
     const simulationTimer = window.setTimeout(() => {
-      setMonteCarloOutput(runMonteCarloSimulation(inputs));
+      setMonteCarloOutput(null);
+      setMonteCarloError("");
+      setMonteCarloProgress({ completed: 0, total: inputs.simulation.iterations });
+      try {
+        worker = new Worker(new URL("../lib/monteCarlo.worker.ts", import.meta.url), { type: "module" });
+        worker.onmessage = (event: MessageEvent<MonteCarloWorkerMessage>) => {
+          if (cancelled) return;
+          const message = event.data;
+          if (message.type === "progress") {
+            setMonteCarloProgress({ completed: message.completed, total: message.total });
+          } else if (message.type === "complete") {
+            setMonteCarloOutput(message.output);
+            setMonteCarloProgress(null);
+            worker?.terminate();
+          } else {
+            fail(message.message);
+          }
+        };
+        worker.onerror = (event) => {
+          event.preventDefault();
+          fail("Unable to run the Monte Carlo simulation. Please try again.");
+        };
+        worker.onmessageerror = () => fail("Unable to read the simulation results. Please try again.");
+        worker.postMessage(inputs);
+      } catch {
+        fail("Unable to start the Monte Carlo simulation. Please try again.");
+      }
     }, 0);
-    return () => window.clearTimeout(simulationTimer);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(simulationTimer);
+      worker?.terminate();
+    };
   }, [activeView, inputs]);
 
   return (
@@ -495,7 +546,7 @@ export default function Home() {
             value={activeScenarioId}
             onChange={(event) => loadScenario(event.target.value)}
           >
-            <option value="draft">New Scenario</option>
+            {!isDraftDismissed && <option value="draft">New Scenario</option>}
             {scenarios.map((scenario) => (
               <option key={scenario.id} value={scenario.id}>
                 {scenario.name}
@@ -531,7 +582,7 @@ export default function Home() {
           <button
             className="button button-quiet"
             onClick={deleteScenario}
-            disabled={activeScenarioId === "draft"}
+            disabled={activeScenarioId === "draft" && scenarios.length === 0}
           >
             Delete
           </button>
@@ -1447,7 +1498,7 @@ export default function Home() {
             />
           )}
           {activeView === "Monte Carlo" && (
-            <MonteCarloView simulationOutput={monteCarloOutput} />
+            <MonteCarloView simulationOutput={monteCarloOutput} progress={monteCarloProgress} error={monteCarloError} />
           )}
           {activeView === "Compare" && (
             <CompareView
@@ -2600,19 +2651,35 @@ function SubPeriodTable({
 }
 function MonteCarloView({
   simulationOutput,
+  progress,
+  error,
 }: {
   simulationOutput: SimulationOutput | null;
+  progress: MonteCarloProgress | null;
+  error: string;
 }) {
-  if (!simulationOutput)
+  if (error) return <section className="ledger-panel"><h2>Simulation could not finish</h2><p role="alert">{error}</p></section>;
+  if (progress || !simulationOutput) {
+    const percent = progress ? Math.round(progress.completed / Math.max(1, progress.total) * 100) : 0;
+    const preparingResults = progress !== null && progress.completed >= progress.total;
     return (
-      <section className="ledger-panel">
-        <h2>No simulation results yet</h2>
-        <p>
-          Run the configured simulation to calculate success rate, percentile
-          bands, and the median path.
-        </p>
+      <section className="monte-carlo-progress" aria-busy="true">
+        <div className="monte-carlo-spinner" aria-hidden="true">
+          <span className="monte-carlo-spinner-arc" />
+          <span className="monte-carlo-spinner-arc" />
+          <span className="monte-carlo-spinner-arc" />
+          <strong>{progress ? `${percent}%` : "..."}</strong>
+        </div>
+        <div className="monte-carlo-progress-copy">
+          <h2>{preparingResults ? "Preparing results" : "Simulating your retirement"}</h2>
+          <p role="status">
+            {progress ? `${progress.completed.toLocaleString("en-CA")} of ${progress.total.toLocaleString("en-CA")} simulations complete` : "Starting simulation..."}
+          </p>
+        </div>
+        <progress className="monte-carlo-progress-accessible" max={100} value={progress ? percent : undefined} aria-label="Monte Carlo simulation progress" />
       </section>
     );
+  }
   return (
     <section className="ledger-panel">
       <div className="panel-heading">
@@ -3377,7 +3444,7 @@ function GuideView() {
       title: "Your data stays on this device",
       body: (
         <>
-          <p>All calculations run locally in your browser. This tool has no telemetry, does not send your scenario to a server, and does not store your financial information anywhere off this device.</p>
+          <p>All calculations run locally in your browser. We count page visits only, without cookies or click tracking. Scenario names, financial inputs, passwords, and file contents are not included in these counts. Scenarios stay in this browser unless you export or share them.</p>
           <p><strong>Save</strong> keeps a scenario in this browser on this device so you can return to it later. It is not an online account, and it will not automatically appear on another computer or phone.</p>
           <p><strong>Export</strong> downloads ordinary JSON or an optional password-protected file. Lost passwords cannot be recovered. <strong>Import</strong> accepts either format and asks for the password when needed. Password protection applies only to the exported file; scenarios saved in this browser remain unencrypted.</p>
           <p>Clearing browser data or using private browsing can remove locally saved scenarios. Export important scenarios before doing that.</p>
@@ -3389,6 +3456,7 @@ function GuideView() {
       body: (
         <>
           <p><strong>Save</strong> stores the current scenario in this browser. Saving again updates the selected scenario. <strong>New</strong> starts a fresh scenario without deleting saved ones, and <strong>Delete</strong> removes the selected saved scenario.</p>
+          <p>When another saved scenario is available, <strong>Delete</strong> can also discard the unsaved <strong>New Scenario</strong> draft and switch to a saved scenario. The draft is removed from the dropdown until you click <strong>New</strong> or reload the page.</p>
           <p><strong>Export</strong> makes a backup, optionally protected by a password. At least 12 characters are recommended, but no minimum length is enforced. <strong>Import</strong> opens JSON or encrypted backups and creates an unencrypted browser-saved scenario. Keep your password safe: there is no password recovery.</p>
           <p>If an imported name matches a saved scenario, <strong>Keep both</strong> adds a uniquely named copy, <strong>Replace existing</strong> updates the saved scenario, and <strong>Cancel</strong> leaves everything unchanged. Names are compared without capitalization or surrounding whitespace. Encrypted files are checked after decryption.</p>
         </>
@@ -3400,7 +3468,7 @@ function GuideView() {
         <>
           <p><strong>Dashboard</strong>: the main projection, KPIs, charts, and strategy comparison.</p>
           <p><strong>Ledger</strong>: the same projection in a year-by-year table. Edit annual returns and expand years to inspect monthly, quarterly, or semi-annual returns and withdrawals.</p>
-          <p><strong>Monte Carlo</strong>: randomized runs summarized as percentile bands, success rate, and failure analysis.</p>
+          <p><strong>Monte Carlo</strong>: randomized runs summarized as percentile bands, success rate, and failure analysis. Simulations run in the background with an animated progress indicator, percentage, and completed-run count, followed by a Preparing results stage. Changing inputs restarts the simulation; leaving the tab cancels it.</p>
           <p><strong>Compare</strong>: run two saved scenarios side by side to see how changing inputs affects the result.</p>
           <p><strong>Tax Info</strong>: the editable tax brackets, credits, and rates used by the model.</p>
         </>

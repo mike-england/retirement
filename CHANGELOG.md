@@ -1,6 +1,9 @@
 # 1.3.0 (October 25, 2026)
 - Added optional password-protected scenario exports using browser-local PBKDF2 and AES-256-GCM encryption, with password confirmation and automatic encrypted-file detection on import. Existing JSON imports and exports remain supported; browser-saved scenarios remain unencrypted.
 - Added a duplicate-name import prompt with Keep both (the default), Replace existing, and Cancel. Name matching ignores capitalization and surrounding whitespace; copies receive unique names and replacements preserve the saved scenario ID.
+- Moved Monte Carlo simulations into a background worker with an animated concentric-arc loader, live completed-run counts and percentage.
+- Enabled Delete for the New Scenario draft when saved scenarios exist; discarding the draft switches to a saved scenario and hides the draft entry until New is clicked or the page is reloaded.
+- Added cookie-free GoatCounter page-visit analytics with automatic filtering of localhost and local-network visits, a fixed page path and title, no referrer reporting or click tracking, and no scenario data included in analytics.
 
 # 1.2.0 (September 27, 2026)
 - Derived household retirement timing from employment income end ages/months instead of a separate retirement date. Monthly spending and withdrawals begin when the last employment stream ends, while income streams can define their own partial first/final years.
