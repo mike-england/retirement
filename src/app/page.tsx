@@ -27,6 +27,8 @@ import {
 import { ageYearLabel, maxHouseholdAge, monthYearLabel } from "@/lib/planDates";
 import { calculateCppAnnualBenefit, cppAnnualMaximum } from "@/lib/governmentBenefits";
 import { SimulationCharts } from "@/components/SimulationCharts";
+import { ScenarioFileDialog, ScenarioImportConflictDialog } from "@/components/ScenarioFileDialog";
+import { decryptScenario, encryptScenario, isEncryptedScenario } from "@/lib/scenarioEncryption";
 import type {
   DeterministicProjection,
   ContributionSchedule,
@@ -107,6 +109,12 @@ export default function Home() {
   const [activeScenarioId, setActiveScenarioId] = useState("draft");
   const [scenarioName, setScenarioName] = useState("New Scenario");
   const [justSaved, setJustSaved] = useState(false);
+  const [fileDialog, setFileDialog] = useState<
+    | { mode: "export"; payload: string; name: string }
+    | { mode: "import"; payload: unknown; name: string }
+    | null
+  >(null);
+  const [pendingImport, setPendingImport] = useState<{ scenario: SavedScenario; existingId: string } | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const gicBuffer = inputs.strategy.gicBuffer ?? defaultGicBuffer;
   const updateGicBuffer = (patch: Partial<GicBufferSettings>) =>
@@ -334,14 +342,70 @@ export default function Home() {
       null,
       2,
     );
-    const downloadUrl = URL.createObjectURL(
-      new Blob([payload], { type: "application/json" }),
-    );
+    setFileDialog({ mode: "export", payload, name: activeScenario?.name ?? "retirement-scenario" });
+  }
+
+  function importScenarioData(parsed: unknown, fileName: string) {
+    if (!parsed || typeof parsed !== "object") throw new Error("This file does not contain a valid scenario.");
+    const importedInputs = "inputs" in parsed ? parsed.inputs : parsed;
+    if (!isRetirementInputs(importedInputs)) throw new Error("This file does not contain a supported scenario.");
+    const importedScenario: SavedScenario = {
+      id: `scenario-${Date.now()}`,
+      name: "name" in parsed && typeof parsed.name === "string" && parsed.name.trim()
+        ? parsed.name.trim() : fileName.replace(/\.(encrypted\.)?json$/i, "").trim() || "Imported Scenario",
+      inputs: importedInputs,
+      updatedAt: new Date().toISOString(),
+    };
+    const existingScenario = scenarios.find((scenario) => scenario.name.trim().toLowerCase() === importedScenario.name.toLowerCase());
+    if (existingScenario) {
+      setPendingImport({ scenario: importedScenario, existingId: existingScenario.id });
+      return;
+    }
+    saveImportedScenario(importedScenario);
+  }
+
+  function saveImportedScenario(importedScenario: SavedScenario, replaceId?: string) {
+    persistScenarios(replaceId === undefined
+      ? [...scenarios, importedScenario]
+      : scenarios.map((scenario) => scenario.id === replaceId ? importedScenario : scenario));
+    setActiveScenarioId(importedScenario.id);
+    setScenarioName(importedScenario.name);
+    setInputs(structuredClone(importedScenario.inputs));
+  }
+
+  function resolveImportConflict(choice: "copy" | "replace") {
+    if (!pendingImport) return;
+    const { scenario, existingId } = pendingImport;
+    if (choice === "replace") {
+      saveImportedScenario({ ...scenario, id: existingId }, existingId);
+    } else {
+      const existingNames = new Set(scenarios.map((saved) => saved.name.trim().toLowerCase()));
+      let copyNumber = 1;
+      let name = `${scenario.name} (copy)`;
+      while (existingNames.has(name.toLowerCase())) {
+        copyNumber += 1;
+        name = `${scenario.name} (copy ${copyNumber})`;
+      }
+      saveImportedScenario({ ...scenario, name });
+    }
+    setPendingImport(null);
+  }
+
+  async function submitScenarioFile(password?: string) {
+    if (!fileDialog) return;
+    if (fileDialog.mode === "import") {
+      const plaintext = await decryptScenario(fileDialog.payload, password ?? "");
+      importScenarioData(JSON.parse(plaintext), fileDialog.name);
+      return;
+    }
+    const payload = password === undefined ? fileDialog.payload : await encryptScenario(fileDialog.payload, password);
+    const downloadUrl = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
     const link = document.createElement("a");
     link.href = downloadUrl;
-    link.download = `${(activeScenario?.name ?? "retirement-scenario").toLowerCase().replace(/[^a-z0-9]+/g, "-")}.json`;
+    const fileName = fileDialog.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "retirement-scenario";
+    link.download = `${fileName}${password === undefined ? ".json" : ".encrypted.json"}`;
     link.click();
-    URL.revokeObjectURL(downloadUrl);
+    window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
   }
 
   async function importScenario(event: ChangeEvent<HTMLInputElement>) {
@@ -349,26 +413,14 @@ export default function Home() {
     event.target.value = "";
     if (!file) return;
     try {
-      const parsed = JSON.parse(await file.text()) as
-        | { name?: string; inputs?: RetirementInputs }
-        | RetirementInputs;
-      const importedInputs = "inputs" in parsed ? parsed.inputs : parsed;
-      if (!isRetirementInputs(importedInputs)) return;
-      const importedScenario: SavedScenario = {
-        id: `scenario-${Date.now()}`,
-        name:
-          "name" in parsed && parsed.name
-            ? parsed.name
-            : file.name.replace(/\.json$/i, ""),
-        inputs: importedInputs,
-        updatedAt: new Date().toISOString(),
-      };
-      persistScenarios([...scenarios, importedScenario]);
-      setActiveScenarioId(importedScenario.id);
-      setScenarioName(importedScenario.name);
-      setInputs(structuredClone(importedScenario.inputs));
-    } catch {
-      return;
+      const parsed: unknown = JSON.parse(await file.text());
+      if (isEncryptedScenario(parsed)) {
+        setFileDialog({ mode: "import", payload: parsed, name: file.name });
+      } else {
+        importScenarioData(parsed, file.name);
+      }
+    } catch (cause) {
+      window.alert(cause instanceof SyntaxError ? "This file is not valid scenario JSON." : cause instanceof Error ? cause.message : "Unable to import this scenario.");
     }
   }
 
@@ -430,6 +482,8 @@ export default function Home() {
 
   return (
     <main className="planner-shell">
+      {fileDialog && <ScenarioFileDialog mode={fileDialog.mode} onSubmit={submitScenarioFile} onClose={() => setFileDialog(null)} />}
+      {pendingImport && <ScenarioImportConflictDialog name={pendingImport.scenario.name} onResolve={resolveImportConflict} onClose={() => setPendingImport(null)} />}
       <header className="topbar">
         <div className="brand-mark" aria-hidden="true">
           RP
@@ -949,7 +1003,7 @@ export default function Home() {
             </div>
             <div className="field-label-text gic-section-heading">
               <span>GICs / interest-bearing holdings</span>
-              <FieldHint text="Guaranteed Investment Certificates, Principal Protected Notes, and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior - e.g. a laddered set of GICs, or one starting partway through retirement." />
+              <FieldHint text="Guaranteed Investment Certificates (GICs), Principal Protected Notes (PPNs), High Interest Savings Accounts (HISAs), and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior. For a HISA, use a 1-year term, its assumed annual interest rate, and Auto-renew. The model holds that rate constant; actual HISA rates can change." />
             </div>
             <GicListEditor
               gics={deriveGicList(inputs.existingAssets, inputs.personalInfo.currentAge)}
@@ -1021,7 +1075,7 @@ export default function Home() {
                 </div>
                 <div className="field-label-text gic-section-heading">
                   <span>GICs / interest-bearing holdings</span>
-                  <FieldHint text="Guaranteed Investment Certificates, Principal Protected Notes, and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior." />
+                  <FieldHint text="Guaranteed Investment Certificates (GICs), Principal Protected Notes (PPNs), High Interest Savings Accounts (HISAs), and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior. For a HISA, use a 1-year term, its assumed annual interest rate, and Auto-renew. The model holds that rate constant; actual HISA rates can change." />
                 </div>
                 <GicListEditor
                   gics={deriveGicList(assets, person.currentAge)}
@@ -1268,8 +1322,8 @@ export default function Home() {
           </section>
           <section className="input-section">
             <div className="field-label-text">
-              <h2 style={{ display: "inline" }}>GIC buffer strategy</h2>
-              <FieldHint text="Instead of always drawing the GIC in a fixed order position, hold it in reserve while the market's own return (isolated from your withdrawals) is near its peak, and draw it first once the market is down significantly from that peak - so you're not selling depressed investments to fund spending. Once the market recovers, it stops drawing the GIC and (optionally) tops it back up from any leftover cash." />
+              <h2 style={{ display: "inline" }}>GIC / HISA buffer strategy</h2>
+              <FieldHint text="Applies to all GIC / interest-bearing holdings, including PPNs and HISAs. Instead of always drawing these holdings in a fixed order position, hold them in reserve while the market's own return (isolated from your withdrawals) is near its peak, and draw them first once the market is down significantly from that peak - so you're not selling depressed investments to fund spending. Once the market recovers, the buffer is reserved again and (optionally) topped up from leftover cash. Model a HISA with a 1-year term and Auto-renew at an assumed constant annual rate." />
             </div>
             <label className="check-row emphasis">
               <input
@@ -1277,7 +1331,7 @@ export default function Home() {
                 checked={gicBuffer.enabled}
                 onChange={(event) => updateGicBuffer({ enabled: event.target.checked })}
               />{" "}
-              Reserve the GIC for down markets
+              Reserve the buffer for down markets
             </label>
             {gicBuffer.enabled && (
               <>
@@ -1286,7 +1340,7 @@ export default function Home() {
                     label="Draw trigger"
                     suffix="%"
                     step={1}
-                    tooltip="How far the market portfolio (RRSP+TFSA+non-registered) has to fall from its highest-ever value before the GIC starts being drawn first. A single bad year rarely justifies this; 10-15% (a real correction, not just noise) is a reasonable starting point."
+                    tooltip="How far the market portfolio (RRSP+TFSA+non-registered) has to fall from its highest-ever value before the GIC / HISA buffer starts being drawn first. A single bad year rarely justifies this; 10-15% (a real correction, not just noise) is a reasonable starting point."
                     value={oneDecimalPercent(gicBuffer.triggerDrawdown)}
                     onChange={(value) => updateGicBuffer({ triggerDrawdown: Number(value) / 100 })}
                   />
@@ -1294,7 +1348,7 @@ export default function Home() {
                     label="Recovery threshold"
                     suffix="%"
                     step={1}
-                    tooltip="Once drawing the GIC, the market has to recover back to within this % of its old peak before the GIC reverts to being reserved (and refilled, if enabled). Keep this lower than the draw trigger, or it'll flip back and forth every year."
+                    tooltip="Once drawing the GIC / HISA buffer, the market has to recover back to within this % of its old peak before the buffer reverts to being reserved (and refilled, if enabled). Keep this lower than the draw trigger, or it'll flip back and forth every year."
                     value={oneDecimalPercent(gicBuffer.recoveryDrawdown)}
                     onChange={(value) => updateGicBuffer({ recoveryDrawdown: Number(value) / 100 })}
                   />
@@ -1305,13 +1359,13 @@ export default function Home() {
                     checked={gicBuffer.refillFromSurplus}
                     onChange={(event) => updateGicBuffer({ refillFromSurplus: event.target.checked })}
                   />{" "}
-                  Refill the GIC from leftover cash once the market recovers
+                  Refill the buffer from leftover cash once the market recovers
                 </label>
                 {gicBuffer.refillFromSurplus && (
                   <NumberField
                     label="Refill target balance"
                     prefix="$"
-                    tooltip="Balance to top the GIC back up toward using leftover cash (e.g. RRIF minimums exceeding spending need) while reserved. Defaults to the household's combined starting GIC balance if left blank."
+                    tooltip="Balance to top the GIC / HISA buffer back up toward using leftover cash (e.g. RRIF minimums exceeding spending need) while reserved. Defaults to the household's combined starting interest-bearing balance if left blank."
                     value={gicBuffer.targetBalance ?? startingGicBalance}
                     onChange={(value) => updateGicBuffer({ targetBalance: Number(value) })}
                   />
@@ -1512,7 +1566,7 @@ function GicListEditor({
               label="Rate"
               suffix="%"
               step={0.1}
-              tooltip="The guaranteed TOTAL return for the whole term (e.g. '5% for a 2-year GIC' means 5% over those 2 years, not per year). Compounded into an equivalent annual rate internally and never randomized in Monte Carlo."
+              tooltip="The assumed TOTAL return for the whole term (e.g. '5% for a 2-year GIC' means 5% over those 2 years, not per year). For a HISA, use a 1-year term and its assumed annual interest rate. Converted into an equivalent annual rate internally and never randomized in Monte Carlo; actual HISA rates can change."
               value={oneDecimalPercent(gic.rate)}
               onChange={(value) => updateGic(gic.id, { rate: Number(value) / 100 })}
             />
@@ -3265,7 +3319,8 @@ function GuideView() {
           <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. Once you turn 71, a mandatory minimum withdrawal kicks in automatically each year (the CRA's prescribed percentage of the RRIF's value at the start of that year) - see the "RRIF withdrawal rate" chart to compare it against what's actually withdrawn.</p>
           <p><strong>TFSA</strong>: withdrawals are always tax-free and never counted as income anywhere.</p>
           <p><strong>Non-registered</strong> + <strong>Adjusted cost base (ACB)</strong>: only the gain above your ACB is taxable, and only that portion is a capital gain (taxed at the capital gains inclusion rate on the Assumptions tab, currently 50% or 66.67% included). If ACB equals the account balance there's no gain and changing it further won't do anything; the same applies at death, where any remaining unrealized gain is deemed realized.</p>
-          <p><strong>GIC / interest income</strong>: modeled separately from market-return accounts because it earns its own guaranteed rate and is principal-protected. The rate you enter is the total return for the whole term (e.g. 5% for a 2-year GIC means 5% over those 2 years), compounded tax-deferred until the term matures, when the accumulated growth is taxed as ordinary income all at once. An early withdrawal realizes a proportional share of deferred growth.</p>
+          <p><strong>GIC / interest income</strong>: modeled separately from market-return accounts because it earns its own assumed rate rather than a simulated market return. The rate you enter is the total return for the whole term (e.g. 5% for a 2-year GIC means 5% over those 2 years), compounded tax-deferred until the term matures, when the accumulated growth is taxed as ordinary income all at once. An early withdrawal realizes a proportional share of deferred growth.</p>
+          <p><strong>High Interest Savings Accounts (HISAs)</strong> can be included in the GIC / interest-bearing holdings using a 1-year term, an assumed annual interest rate, and Auto-renew. This models annual interest taxation for a non-registered HISA and includes it in the GIC / HISA buffer strategy. The rate stays constant in projections, even though actual HISA rates can change.</p>
         </>
       ),
     },
@@ -3324,7 +3379,7 @@ function GuideView() {
         <>
           <p>All calculations run locally in your browser. This tool has no telemetry, does not send your scenario to a server, and does not store your financial information anywhere off this device.</p>
           <p><strong>Save</strong> keeps a scenario in this browser on this device so you can return to it later. It is not an online account, and it will not automatically appear on another computer or phone.</p>
-          <p><strong>Export</strong> downloads a copy of your scenario as a file. Keep that file somewhere safe if you want a backup or need to move the scenario to another device. <strong>Import</strong> lets you choose that file and load the scenario into the app on the new device.</p>
+          <p><strong>Export</strong> downloads ordinary JSON or an optional password-protected file. Lost passwords cannot be recovered. <strong>Import</strong> accepts either format and asks for the password when needed. Password protection applies only to the exported file; scenarios saved in this browser remain unencrypted.</p>
           <p>Clearing browser data or using private browsing can remove locally saved scenarios. Export important scenarios before doing that.</p>
         </>
       ),
@@ -3334,7 +3389,8 @@ function GuideView() {
       body: (
         <>
           <p><strong>Save</strong> stores the current scenario in this browser. Saving again updates the selected scenario. <strong>New</strong> starts a fresh scenario without deleting saved ones, and <strong>Delete</strong> removes the selected saved scenario.</p>
-          <p><strong>Export</strong> makes a file you can keep as a backup. <strong>Import</strong> loads one of those files back into the app and creates a saved scenario from it. This is the way to move a scenario between devices.</p>
+          <p><strong>Export</strong> makes a backup, optionally protected by a password. At least 12 characters are recommended, but no minimum length is enforced. <strong>Import</strong> opens JSON or encrypted backups and creates an unencrypted browser-saved scenario. Keep your password safe: there is no password recovery.</p>
+          <p>If an imported name matches a saved scenario, <strong>Keep both</strong> adds a uniquely named copy, <strong>Replace existing</strong> updates the saved scenario, and <strong>Cancel</strong> leaves everything unchanged. Names are compared without capitalization or surrounding whitespace. Encrypted files are checked after decryption.</p>
         </>
       ),
     },

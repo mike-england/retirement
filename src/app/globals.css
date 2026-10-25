@@ -90,3 +90,20 @@ button, input, select { font: inherit; } button { cursor: pointer; }
 .gic-label-input:focus { outline: none; border-bottom: 1px solid var(--blue); }
 
 .button-saved, .button-saved:hover { display: inline-flex; align-items: center; gap: 4px; border-color: var(--green); background: var(--green); color: white; }
+
+.scenario-file-dialog { margin: auto; width: min(440px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; padding: 24px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); color: var(--ink); }
+.scenario-file-dialog::backdrop { background: rgb(0 0 0 / 40%); }
+.scenario-file-dialog h2 { margin: 0 0 20px; font-size: 20px; }
+.scenario-file-dialog fieldset { display: grid; gap: 16px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.scenario-file-check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.scenario-file-check input { width: 16px; height: 16px; }
+.scenario-file-field { display: grid; gap: 6px; min-width: 0; font-size: 14px; }
+.scenario-file-field input { width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); color: var(--ink); }
+.scenario-file-password { display: flex; gap: 6px; min-width: 0; }
+.scenario-file-password .button { display: grid; place-items: center; flex: 0 0 38px; padding: 0; }
+.scenario-file-warning { margin: 0; color: var(--muted); font-size: 13px; }
+.scenario-file-error { margin: 16px 0 0; color: #b91c1c; font-size: 14px; overflow-wrap: anywhere; }
+.scenario-file-conflict { margin: 0; overflow-wrap: anywhere; }
+.scenario-file-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 24px; }
+.scenario-file-actions .button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 38px; white-space: normal; }
+.scenario-file-dialog button:disabled { cursor: wait; opacity: .6; }

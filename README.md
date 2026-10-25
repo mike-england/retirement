@@ -5,6 +5,18 @@ strategies, and Monte Carlo simulations.
 
 **Hosted at: https://mike-england.github.io/retirement/**
 
+## Scenario files and passwords
+
+**Export** offers ordinary JSON or an optional password-protected file. Enable **Password protect file**, enter a password, and confirm it. We recommend at least 12 characters, but no minimum length is enforced. Both formats use the scenario name: `My Retirement` becomes `my-retirement.json` or `my-retirement.encrypted.json`. The encrypted file's contents are protected, but its filename reveals the scenario name.
+
+**Import** accepts both existing JSON scenarios and encrypted files. Encrypted files prompt for the password before importing; an incorrect password or damaged file leaves the current scenario unchanged.
+
+If an imported name matches a saved scenario (ignoring capitalization and surrounding whitespace), choose **Keep both**, **Replace existing**, or **Cancel**. **Keep both** is the default and adds `(copy)`, `(copy 2)`, and so on to avoid duplicate names. **Replace existing** updates the saved scenario while keeping its ID. **Cancel** leaves saved scenarios and the current selection unchanged. Encrypted imports check for matching names only after successful decryption.
+
+Encryption runs locally using the browser's Web Crypto API: AES-256-GCM with a fresh 16-byte salt and 12-byte nonce per export, and PBKDF2-HMAC-SHA-256 with 600,000 iterations. Only ciphertext and non-secret format/cryptographic metadata are stored in the encrypted file. HTTPS or localhost is required.
+
+Passwords are not persisted and cannot be recovered. Use a strong, unique passphrase and keep it in a password manager. Encryption protects the exported file only: **Save** and imported scenarios still use unencrypted browser local storage. It does not provide expiration or prevent a recipient from keeping decrypted data.
+
 ## Running locally
 
 ### Option 1: Node.js dev server

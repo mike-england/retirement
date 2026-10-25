@@ -18,7 +18,7 @@ const charts: ChartDefinition[] = [
   { title: "Annual cash surplus / shortfall", description: "All post-tax income and drawdowns compared with spending target", kind: "cashFlow" },
   { title: "Tax paid over time", description: "Federal and provincial tax in dollars", kind: "taxDollars" },
   { title: "Tax rates over time", description: "Marginal and average tax rates", kind: "taxRates" },
-  { title: "RRIF withdrawal rate over time", description: "Actual RRSP/RRIF withdrawal rate vs. the mandatory minimum", kind: "withdrawalRate" },
+  { title: "RRSP/RRIF withdrawal rate over time", description: "Actual RRSP withdrawals at any age; mandatory RRIF minimums apply from age 71", kind: "withdrawalRate" },
   { title: "Income & Drawdown Sources", description: "Employment, government benefits, and account withdrawals", kind: "income" },
 ];
 
@@ -198,7 +198,7 @@ function chartOption(kind: ChartKind, inputs: RetirementInputs, projection: Dete
       tooltip: { ...base.tooltip, valueFormatter: (value: any) => `${(Number(value) * 100).toFixed(1)}%` },
       yAxis: { ...base.yAxis, axisLabel: { formatter: (value: number) => `${Math.round(value * 100)}%`, fontSize: 10 } },
       series: [
-        lineSeries("RRIF withdrawal rate", rrifWithdrawalRates, "#2563eb", inputs, ages, true),
+        lineSeries("Actual RRSP/RRIF withdrawal rate", rrifWithdrawalRates, "#2563eb", inputs, ages, true),
         lineSeries("Required minimum rate", rrifMinimumRates, "#ef4444", inputs, ages),
       ],
     } as EChartsOption;
