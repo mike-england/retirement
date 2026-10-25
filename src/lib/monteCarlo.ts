@@ -8,7 +8,7 @@ import type {
   SimulationOutput,
 } from "@/types/retirement";
 
-export function runMonteCarloSimulation(inputs: RetirementInputs): SimulationOutput {
+export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (completed: number, total: number) => void): SimulationOutput {
   const random = createRandom(inputs.simulation.randomSeed);
   // The plan can run past the primary's own death if someone else in the household outlives them; targetDeathAge is in each person's own age scale, so compare lifespan lengths, not raw ages.
   const maxLifespanIndex = Math.max(
@@ -21,6 +21,8 @@ export function runMonteCarloSimulation(inputs: RetirementInputs): SimulationOut
   const returnFloor = inputs.assumptions.returnFloor ?? -0.08;
   const returnCeiling = Math.max(returnFloor, inputs.assumptions.returnCeiling ?? 0.15);
   const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
+  let lastProgressAt = Date.now();
+  onProgress?.(0, inputs.simulation.iterations);
 
   for (let run = 0; run < inputs.simulation.iterations; run += 1) {
     const annualReturns = Array.from({ length: yearCount }, () => sampleAnnualReturn(
@@ -38,12 +40,17 @@ export function runMonteCarloSimulation(inputs: RetirementInputs): SimulationOut
     const subPeriodReturns = subPeriodCount <= 1
       ? undefined
       : annualReturns.map((annualReturn) => decomposeAnnualReturn(random, annualReturn, subPeriodCount, inputs.assumptions.returnStdDev));
-    projections.push(projectRetirementPlan(inputs, { annualReturns, annualInflation, subPeriodReturns }));
+    projections.push(projectRetirementPlan(inputs, { annualReturns, annualInflation, subPeriodReturns, pensionSplittingPolicy: "simple", fastWithdrawalSizing: true }));
     averageAnnualReturns.push(average(annualReturns));
+    if (onProgress && Date.now() - lastProgressAt >= 100) {
+      onProgress(run + 1, inputs.simulation.iterations);
+      lastProgressAt = Date.now();
+    }
   }
 
+  onProgress?.(projections.length, inputs.simulation.iterations);
   const sortedByEstate = [...projections].sort((first, second) => first.finalEstateValue - second.finalEstateValue);
-  const medianRun = projectRetirementPlan(inputs);
+  const medianRun = projectRetirementPlan(inputs, { pensionSplittingPolicy: "simple", fastWithdrawalSizing: true });
   const successfulRuns = projections.filter((projection) => !projection.portfolioDepleted).length;
   const successRate = projections.length === 0 ? 0 : successfulRuns / projections.length;
   // The bottom (1 - successRate) share of runs run out of money, so that rank marks the worst run that still survives.

@@ -1,3 +1,14 @@
+# 1.3.0 (October 25, 2026)
+- Added optional password-protected scenario exports using browser-local PBKDF2 and AES-256-GCM encryption, with password confirmation and automatic encrypted-file detection on import. Existing JSON imports and exports remain supported; browser-saved scenarios remain unencrypted.
+- Added a duplicate-name import prompt with Keep both (the default), Replace existing, and Cancel. Name matching ignores capitalization and surrounding whitespace; copies receive unique names and replacements preserve the saved scenario ID.
+- Moved Monte Carlo simulations into a background worker with an animated concentric-arc loader, live completed-run counts and percentage.
+- Enabled Delete for the New Scenario draft when saved scenarios exist; discarding the draft switches to a saved scenario and hides the draft entry until New is clicked or the page is reloaded.
+- Added cookie-free GoatCounter page-visit analytics with automatic filtering of localhost and local-network visits, a fixed page path and title, no referrer reporting or click tracking, and no scenario data included in analytics.
+- Allowed tax-aware withdrawals and aggressive RRSP meltdown to be enabled together, and grouped them with withdrawal order, frequency, and pension splitting. Separated CPP/OAS start ages into Government benefits and clarified that meltdown runs after spending is funded and can increase tax or OAS recovery.
+- Made tax-aware withdrawals prioritize the user's account order, with only a limited OAS-reducing exception for the next non-registered account ahead of RRSP withdrawals. Removed the pension-splitting partner selector; enabling splitting assumes the primary and first additional person are eligible spouses/common-law partners.
+- Added optional tax-aware household withdrawals and eligible spouse/common-law pension splitting, including employer pensions, RRIF income from age 65, CPP income in the tax assessment, and OAS recovery. Added per-person RRIF conversion ages, registered-GIC minimum withdrawals, and expandable Ledger tax-allocation reporting.
+- Added lifetime OAS recovery to Dashboard and Compare, and corrected the OAS recovery income basis to include OAS itself, taxable capital gains, and dividend gross-ups. Strategies target current after-tax cash flow, not a guaranteed lifetime optimum; CPP pension sharing and tax-refund timing are not modeled.
+
 # 1.2.0 (September 27, 2026)
 - Derived household retirement timing from employment income end ages/months instead of a separate retirement date. Monthly spending and withdrawals begin when the last employment stream ends, while income streams can define their own partial first/final years.
 - Income start/end age tooltips now show calendar month/year boundaries using the person's current age and birth month; income starts default to January and ends default to December.

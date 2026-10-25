@@ -16,7 +16,7 @@ import {
 } from "react";
 import { defaultRetirementInputs } from "@/lib/default-inputs";
 import packageJson from "../../package.json";
-import { runMonteCarloSimulation } from "@/lib/monteCarlo";
+import type { MonteCarloWorkerMessage } from "@/lib/monteCarlo.worker";
 import { sampleAnnualReturn } from "@/lib/simulationEngine";
 import { projectWithVariableReturns } from "@/lib/projectionPath";
 import {
@@ -27,6 +27,8 @@ import {
 import { ageYearLabel, maxHouseholdAge, monthYearLabel } from "@/lib/planDates";
 import { calculateCppAnnualBenefit, cppAnnualMaximum } from "@/lib/governmentBenefits";
 import { SimulationCharts } from "@/components/SimulationCharts";
+import { ScenarioFileDialog, ScenarioImportConflictDialog } from "@/components/ScenarioFileDialog";
+import { decryptScenario, encryptScenario, isEncryptedScenario } from "@/lib/scenarioEncryption";
 import type {
   DeterministicProjection,
   ContributionSchedule,
@@ -93,6 +95,8 @@ type SavedScenario = {
   updatedAt: string;
 };
 
+type MonteCarloProgress = { completed: number; total: number };
+
 export default function Home() {
   const [inputs, setInputs] = useState(defaultRetirementInputs);
   const [activeView, setActiveView] = useState("Dashboard");
@@ -102,11 +106,20 @@ export default function Home() {
   );
   const [monteCarloOutput, setMonteCarloOutput] =
     useState<SimulationOutput | null>(null);
+  const [monteCarloProgress, setMonteCarloProgress] = useState<MonteCarloProgress | null>(null);
+  const [monteCarloError, setMonteCarloError] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [scenarios, setScenarios] = useState<SavedScenario[]>([]);
   const [activeScenarioId, setActiveScenarioId] = useState("draft");
+  const [isDraftDismissed, setIsDraftDismissed] = useState(false);
   const [scenarioName, setScenarioName] = useState("New Scenario");
   const [justSaved, setJustSaved] = useState(false);
+  const [fileDialog, setFileDialog] = useState<
+    | { mode: "export"; payload: string; name: string }
+    | { mode: "import"; payload: unknown; name: string }
+    | null
+  >(null);
+  const [pendingImport, setPendingImport] = useState<{ scenario: SavedScenario; existingId: string } | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const gicBuffer = inputs.strategy.gicBuffer ?? defaultGicBuffer;
   const updateGicBuffer = (patch: Partial<GicBufferSettings>) =>
@@ -136,6 +149,7 @@ export default function Home() {
   const lifetimeOas = projection
     ? projection.years.reduce((sum, year) => sum + year.income.oas, 0)
     : 0;
+  const lifetimeOasRecovery = projection ? projection.years.reduce((sum, year) => sum + year.oasClawback, 0) : 0;
   const endOfLifeTax = projection
     ? projection.years.reduce((sum, year) => sum + year.estateTax, 0)
     : 0;
@@ -172,6 +186,7 @@ export default function Home() {
         ],
         ["Lifetime CPP", formatCurrency(lifetimeCpp), "All eligible people"],
         ["Lifetime OAS", formatCurrency(lifetimeOas), "All eligible people"],
+        ["OAS recovered", formatCurrency(lifetimeOasRecovery), "Lifetime OAS clawed back by the government"],
         [
           "Portfolio peak age",
           `${projection.portfolioPeakAge}`,
@@ -242,6 +257,7 @@ export default function Home() {
   }
 
   function createNewScenario() {
+    setIsDraftDismissed(false);
     setActiveScenarioId("draft");
     setScenarioName("New Scenario");
     setInputs(structuredClone(defaultRetirementInputs));
@@ -303,6 +319,13 @@ export default function Home() {
   }
 
   function deleteScenario() {
+    if (activeScenarioId === "draft") {
+      const nextScenario = scenarios.find((scenario) => isRetirementInputs(scenario.inputs)) ?? scenarios[0];
+      if (!nextScenario || !window.confirm(`Discard New Scenario and load ${nextScenario.name}? Any unsaved draft changes will be lost.`)) return;
+      setIsDraftDismissed(true);
+      loadScenario(nextScenario.id);
+      return;
+    }
     const scenario = scenarios.find(
       (current) => current.id === activeScenarioId,
     );
@@ -334,14 +357,70 @@ export default function Home() {
       null,
       2,
     );
-    const downloadUrl = URL.createObjectURL(
-      new Blob([payload], { type: "application/json" }),
-    );
+    setFileDialog({ mode: "export", payload, name: activeScenario?.name ?? "retirement-scenario" });
+  }
+
+  function importScenarioData(parsed: unknown, fileName: string) {
+    if (!parsed || typeof parsed !== "object") throw new Error("This file does not contain a valid scenario.");
+    const importedInputs = "inputs" in parsed ? parsed.inputs : parsed;
+    if (!isRetirementInputs(importedInputs)) throw new Error("This file does not contain a supported scenario.");
+    const importedScenario: SavedScenario = {
+      id: `scenario-${Date.now()}`,
+      name: "name" in parsed && typeof parsed.name === "string" && parsed.name.trim()
+        ? parsed.name.trim() : fileName.replace(/\.(encrypted\.)?json$/i, "").trim() || "Imported Scenario",
+      inputs: importedInputs,
+      updatedAt: new Date().toISOString(),
+    };
+    const existingScenario = scenarios.find((scenario) => scenario.name.trim().toLowerCase() === importedScenario.name.toLowerCase());
+    if (existingScenario) {
+      setPendingImport({ scenario: importedScenario, existingId: existingScenario.id });
+      return;
+    }
+    saveImportedScenario(importedScenario);
+  }
+
+  function saveImportedScenario(importedScenario: SavedScenario, replaceId?: string) {
+    persistScenarios(replaceId === undefined
+      ? [...scenarios, importedScenario]
+      : scenarios.map((scenario) => scenario.id === replaceId ? importedScenario : scenario));
+    setActiveScenarioId(importedScenario.id);
+    setScenarioName(importedScenario.name);
+    setInputs(structuredClone(importedScenario.inputs));
+  }
+
+  function resolveImportConflict(choice: "copy" | "replace") {
+    if (!pendingImport) return;
+    const { scenario, existingId } = pendingImport;
+    if (choice === "replace") {
+      saveImportedScenario({ ...scenario, id: existingId }, existingId);
+    } else {
+      const existingNames = new Set(scenarios.map((saved) => saved.name.trim().toLowerCase()));
+      let copyNumber = 1;
+      let name = `${scenario.name} (copy)`;
+      while (existingNames.has(name.toLowerCase())) {
+        copyNumber += 1;
+        name = `${scenario.name} (copy ${copyNumber})`;
+      }
+      saveImportedScenario({ ...scenario, name });
+    }
+    setPendingImport(null);
+  }
+
+  async function submitScenarioFile(password?: string) {
+    if (!fileDialog) return;
+    if (fileDialog.mode === "import") {
+      const plaintext = await decryptScenario(fileDialog.payload, password ?? "");
+      importScenarioData(JSON.parse(plaintext), fileDialog.name);
+      return;
+    }
+    const payload = password === undefined ? fileDialog.payload : await encryptScenario(fileDialog.payload, password);
+    const downloadUrl = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
     const link = document.createElement("a");
     link.href = downloadUrl;
-    link.download = `${(activeScenario?.name ?? "retirement-scenario").toLowerCase().replace(/[^a-z0-9]+/g, "-")}.json`;
+    const fileName = fileDialog.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "retirement-scenario";
+    link.download = `${fileName}${password === undefined ? ".json" : ".encrypted.json"}`;
     link.click();
-    URL.revokeObjectURL(downloadUrl);
+    window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
   }
 
   async function importScenario(event: ChangeEvent<HTMLInputElement>) {
@@ -349,26 +428,14 @@ export default function Home() {
     event.target.value = "";
     if (!file) return;
     try {
-      const parsed = JSON.parse(await file.text()) as
-        | { name?: string; inputs?: RetirementInputs }
-        | RetirementInputs;
-      const importedInputs = "inputs" in parsed ? parsed.inputs : parsed;
-      if (!isRetirementInputs(importedInputs)) return;
-      const importedScenario: SavedScenario = {
-        id: `scenario-${Date.now()}`,
-        name:
-          "name" in parsed && parsed.name
-            ? parsed.name
-            : file.name.replace(/\.json$/i, ""),
-        inputs: importedInputs,
-        updatedAt: new Date().toISOString(),
-      };
-      persistScenarios([...scenarios, importedScenario]);
-      setActiveScenarioId(importedScenario.id);
-      setScenarioName(importedScenario.name);
-      setInputs(structuredClone(importedScenario.inputs));
-    } catch {
-      return;
+      const parsed: unknown = JSON.parse(await file.text());
+      if (isEncryptedScenario(parsed)) {
+        setFileDialog({ mode: "import", payload: parsed, name: file.name });
+      } else {
+        importScenarioData(parsed, file.name);
+      }
+    } catch (cause) {
+      window.alert(cause instanceof SyntaxError ? "This file is not valid scenario JSON." : cause instanceof Error ? cause.message : "Unable to import this scenario.");
     }
   }
 
@@ -422,14 +489,54 @@ export default function Home() {
 
   useEffect(() => {
     if (activeView !== "Monte Carlo") return;
+    let worker: Worker | null = null;
+    let cancelled = false;
+    function fail(message: string) {
+      if (cancelled) return;
+      setMonteCarloError(message);
+      setMonteCarloProgress(null);
+      worker?.terminate();
+    }
     const simulationTimer = window.setTimeout(() => {
-      setMonteCarloOutput(runMonteCarloSimulation(inputs));
+      setMonteCarloOutput(null);
+      setMonteCarloError("");
+      setMonteCarloProgress({ completed: 0, total: inputs.simulation.iterations });
+      try {
+        worker = new Worker(new URL("../lib/monteCarlo.worker.ts", import.meta.url), { type: "module" });
+        worker.onmessage = (event: MessageEvent<MonteCarloWorkerMessage>) => {
+          if (cancelled) return;
+          const message = event.data;
+          if (message.type === "progress") {
+            setMonteCarloProgress({ completed: message.completed, total: message.total });
+          } else if (message.type === "complete") {
+            setMonteCarloOutput(message.output);
+            setMonteCarloProgress(null);
+            worker?.terminate();
+          } else {
+            fail(message.message);
+          }
+        };
+        worker.onerror = (event) => {
+          event.preventDefault();
+          fail("Unable to run the Monte Carlo simulation. Please try again.");
+        };
+        worker.onmessageerror = () => fail("Unable to read the simulation results. Please try again.");
+        worker.postMessage(inputs);
+      } catch {
+        fail("Unable to start the Monte Carlo simulation. Please try again.");
+      }
     }, 0);
-    return () => window.clearTimeout(simulationTimer);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(simulationTimer);
+      worker?.terminate();
+    };
   }, [activeView, inputs]);
 
   return (
     <main className="planner-shell">
+      {fileDialog && <ScenarioFileDialog mode={fileDialog.mode} onSubmit={submitScenarioFile} onClose={() => setFileDialog(null)} />}
+      {pendingImport && <ScenarioImportConflictDialog name={pendingImport.scenario.name} onResolve={resolveImportConflict} onClose={() => setPendingImport(null)} />}
       <header className="topbar">
         <div className="brand-mark" aria-hidden="true">
           RP
@@ -441,7 +548,7 @@ export default function Home() {
             value={activeScenarioId}
             onChange={(event) => loadScenario(event.target.value)}
           >
-            <option value="draft">New Scenario</option>
+            {!isDraftDismissed && <option value="draft">New Scenario</option>}
             {scenarios.map((scenario) => (
               <option key={scenario.id} value={scenario.id}>
                 {scenario.name}
@@ -477,7 +584,7 @@ export default function Home() {
           <button
             className="button button-quiet"
             onClick={deleteScenario}
-            disabled={activeScenarioId === "draft"}
+            disabled={activeScenarioId === "draft" && scenarios.length === 0}
           >
             Delete
           </button>
@@ -949,8 +1056,10 @@ export default function Home() {
             </div>
             <div className="field-label-text gic-section-heading">
               <span>GICs / interest-bearing holdings</span>
-              <FieldHint text="Guaranteed Investment Certificates, Principal Protected Notes, and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior - e.g. a laddered set of GICs, or one starting partway through retirement." />
+              <FieldHint text="Guaranteed Investment Certificates (GICs), Principal Protected Notes (PPNs), High Interest Savings Accounts (HISAs), and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior. For a HISA, use a 1-year term, its assumed annual interest rate, and Auto-renew. The model holds that rate constant; actual HISA rates can change." />
             </div>
+            <RrifConversionSelect value={inputs.personalInfo.rrifConversionAge} onChange={(rrifConversionAge) =>
+              setInputs((current) => ({ ...current, personalInfo: { ...current.personalInfo, rrifConversionAge } }))} />
             <GicListEditor
               gics={deriveGicList(inputs.existingAssets, inputs.personalInfo.currentAge)}
               currentAge={inputs.personalInfo.currentAge}
@@ -1021,8 +1130,13 @@ export default function Home() {
                 </div>
                 <div className="field-label-text gic-section-heading">
                   <span>GICs / interest-bearing holdings</span>
-                  <FieldHint text="Guaranteed Investment Certificates, Principal Protected Notes, and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior." />
+                  <FieldHint text="Guaranteed Investment Certificates (GICs), Principal Protected Notes (PPNs), High Interest Savings Accounts (HISAs), and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior. For a HISA, use a 1-year term, its assumed annual interest rate, and Auto-renew. The model holds that rate constant; actual HISA rates can change." />
                 </div>
+                <RrifConversionSelect value={person.rrifConversionAge} onChange={(rrifConversionAge) => setInputs((current) => ({
+                  ...current,
+                  personalInfo: { ...current.personalInfo, additionalPeople: (current.personalInfo.additionalPeople ?? []).map((candidate) =>
+                    candidate.id === person.id ? { ...candidate, rrifConversionAge } : candidate) },
+                }))} />
                 <GicListEditor
                   gics={deriveGicList(assets, person.currentAge)}
                   currentAge={person.currentAge}
@@ -1158,9 +1272,9 @@ export default function Home() {
             </p>
           </section>
           </div>
-          <div hidden={activeInputTab !== "Strategy"}>
+          <div className="strategy-inputs" hidden={activeInputTab !== "Strategy"}>
           <section className="input-section">
-            <h2>Withdrawal strategy</h2>
+            <h2>Government benefits</h2>
             <div className="field-grid two-up benefit-start-ages">
               <AgeSelect
                 label="CPP start age"
@@ -1185,9 +1299,12 @@ export default function Home() {
                 }
               />
             </div>
-            <div className="field-label-text">
+          </section>
+          <section className="input-section">
+            <h2>Withdrawal strategy</h2>
+            <div className="field-label-text strategy-field-label">
               <span>Withdrawal order</span>
-              <FieldHint text="Which account gets drawn down first to cover each year's spending shortfall, once income and mandatory RRIF minimums aren't enough. Move an account up to spend it down sooner, or down to preserve it longer (e.g. for estate planning)." />
+              <FieldHint text="Your preferred account order for funding spending after income and mandatory RRIF withdrawals. Tax-aware mode preserves this order and optimizes between people; it may use the next non-registered account ahead of RRSPs only to reduce OAS recovery and improve after-tax cash. TFSA is not promoted for tax savings. The GIC buffer rule still applies." />
             </div>
             <ol className="withdrawal-order-list">
               {(inputs.strategy.withdrawalOrder ?? defaultWithdrawalOrder).map((account, index) => (
@@ -1250,6 +1367,22 @@ export default function Home() {
               </select>
             </label>
             <label className="check-row emphasis">
+              <input type="checkbox" checked={inputs.strategy.taxAwareWithdrawals ?? false} onChange={(event) => setInputs((current) => ({
+                ...current, strategy: { ...current.strategy, taxAwareWithdrawals: event.target.checked },
+              }))} />
+              Tax-aware household withdrawals
+              <FieldHint text="Uses your withdrawal order as the baseline and chooses the more tax-efficient person within the first available account type. When non-registered is the next available account after RRSP, it may supplement from non-registered funds only if that reduces additional OAS recovery and improves after-tax cash. It does not jump to TFSA for lower tax. Mandatory RRIF withdrawals and the GIC buffer rule still apply. Includes CPP income and eligible pension splitting when enabled. Can be combined with aggressive RRSP meltdown, which runs after spending is funded and can increase current tax or OAS recovery. This is a current-cash-flow heuristic, not a lifetime optimum." />
+            </label>
+            <label className="check-row emphasis">
+              <input type="checkbox" checked={inputs.strategy.pensionIncomeSplitting?.enabled ?? false}
+                disabled={(inputs.personalInfo.additionalPeople ?? []).length === 0}
+                onChange={(event) => setInputs((current) => ({ ...current, strategy: { ...current.strategy,
+                  pensionIncomeSplitting: { enabled: event.target.checked },
+                } }))} />
+              Eligible pension income splitting
+              <FieldHint text="Assumes the primary person and first additional person are eligible spouses or common-law partners meeting CRA residency and relationship requirements. Searches an annual allocation of up to 50% of one partner's eligible pension income to reduce combined income tax and OAS recovery. Eligible employer pensions do not require RRSP conversion. To split registered-account withdrawals, the RRSP must be converted to a RRIF and the donor must generally be at least 65; set the RRIF conversion age in Accounts. Ordinary RRSP withdrawals, CPP and OAS are not eligible. CPP pension sharing is separate. The split changes taxable income, not cash ownership, and does not model withholding or refund timing." />
+            </label>
+            <label className="check-row emphasis">
               <input
                 type="checkbox"
                 checked={inputs.strategy.aggressiveRrspMeltdown}
@@ -1264,12 +1397,13 @@ export default function Home() {
                 }
               />{" "}
               Aggressive RRSP meltdown
+              <FieldHint text="Withdraws additional RRSP/RRIF funds after spending is funded, aiming to fill the next federal ordinary-income bracket. Can be combined with tax-aware household withdrawals and eligible pension splitting. Final income tax and OAS recovery are recalculated afterward; the extra withdrawal can increase current tax or reduce OAS. Eligible surplus is reinvested under the model's existing rules." />
             </label>
           </section>
           <section className="input-section">
-            <div className="field-label-text">
-              <h2 style={{ display: "inline" }}>GIC buffer strategy</h2>
-              <FieldHint text="Instead of always drawing the GIC in a fixed order position, hold it in reserve while the market's own return (isolated from your withdrawals) is near its peak, and draw it first once the market is down significantly from that peak - so you're not selling depressed investments to fund spending. Once the market recovers, it stops drawing the GIC and (optionally) tops it back up from any leftover cash." />
+            <div className="field-label-text strategy-section-heading">
+              <h2>GIC / HISA buffer strategy</h2>
+              <FieldHint text="Applies to all GIC / interest-bearing holdings, including PPNs and HISAs. Instead of always drawing these holdings in a fixed order position, hold them in reserve while the market's own return (isolated from your withdrawals) is near its peak, and draw them first once the market is down significantly from that peak - so you're not selling depressed investments to fund spending. Once the market recovers, the buffer is reserved again and (optionally) topped up from leftover cash. Model a HISA with a 1-year term and Auto-renew at an assumed constant annual rate." />
             </div>
             <label className="check-row emphasis">
               <input
@@ -1277,7 +1411,7 @@ export default function Home() {
                 checked={gicBuffer.enabled}
                 onChange={(event) => updateGicBuffer({ enabled: event.target.checked })}
               />{" "}
-              Reserve the GIC for down markets
+              Reserve the buffer for down markets
             </label>
             {gicBuffer.enabled && (
               <>
@@ -1286,7 +1420,7 @@ export default function Home() {
                     label="Draw trigger"
                     suffix="%"
                     step={1}
-                    tooltip="How far the market portfolio (RRSP+TFSA+non-registered) has to fall from its highest-ever value before the GIC starts being drawn first. A single bad year rarely justifies this; 10-15% (a real correction, not just noise) is a reasonable starting point."
+                    tooltip="How far the market portfolio (RRSP+TFSA+non-registered) has to fall from its highest-ever value before the GIC / HISA buffer starts being drawn first. A single bad year rarely justifies this; 10-15% (a real correction, not just noise) is a reasonable starting point."
                     value={oneDecimalPercent(gicBuffer.triggerDrawdown)}
                     onChange={(value) => updateGicBuffer({ triggerDrawdown: Number(value) / 100 })}
                   />
@@ -1294,7 +1428,7 @@ export default function Home() {
                     label="Recovery threshold"
                     suffix="%"
                     step={1}
-                    tooltip="Once drawing the GIC, the market has to recover back to within this % of its old peak before the GIC reverts to being reserved (and refilled, if enabled). Keep this lower than the draw trigger, or it'll flip back and forth every year."
+                    tooltip="Once drawing the GIC / HISA buffer, the market has to recover back to within this % of its old peak before the buffer reverts to being reserved (and refilled, if enabled). Keep this lower than the draw trigger, or it'll flip back and forth every year."
                     value={oneDecimalPercent(gicBuffer.recoveryDrawdown)}
                     onChange={(value) => updateGicBuffer({ recoveryDrawdown: Number(value) / 100 })}
                   />
@@ -1305,13 +1439,13 @@ export default function Home() {
                     checked={gicBuffer.refillFromSurplus}
                     onChange={(event) => updateGicBuffer({ refillFromSurplus: event.target.checked })}
                   />{" "}
-                  Refill the GIC from leftover cash once the market recovers
+                  Refill the buffer from leftover cash once the market recovers
                 </label>
                 {gicBuffer.refillFromSurplus && (
                   <NumberField
                     label="Refill target balance"
                     prefix="$"
-                    tooltip="Balance to top the GIC back up toward using leftover cash (e.g. RRIF minimums exceeding spending need) while reserved. Defaults to the household's combined starting GIC balance if left blank."
+                    tooltip="Balance to top the GIC / HISA buffer back up toward using leftover cash (e.g. RRIF minimums exceeding spending need) while reserved. Defaults to the household's combined starting interest-bearing balance if left blank."
                     value={gicBuffer.targetBalance ?? startingGicBalance}
                     onChange={(value) => updateGicBuffer({ targetBalance: Number(value) })}
                   />
@@ -1393,7 +1527,7 @@ export default function Home() {
             />
           )}
           {activeView === "Monte Carlo" && (
-            <MonteCarloView simulationOutput={monteCarloOutput} />
+            <MonteCarloView simulationOutput={monteCarloOutput} progress={monteCarloProgress} error={monteCarloError} />
           )}
           {activeView === "Compare" && (
             <CompareView
@@ -1512,7 +1646,7 @@ function GicListEditor({
               label="Rate"
               suffix="%"
               step={0.1}
-              tooltip="The guaranteed TOTAL return for the whole term (e.g. '5% for a 2-year GIC' means 5% over those 2 years, not per year). Compounded into an equivalent annual rate internally and never randomized in Monte Carlo."
+              tooltip="The assumed TOTAL return for the whole term (e.g. '5% for a 2-year GIC' means 5% over those 2 years, not per year). For a HISA, use a 1-year term and its assumed annual interest rate. Converted into an equivalent annual rate internally and never randomized in Monte Carlo; actual HISA rates can change."
               value={oneDecimalPercent(gic.rate)}
               onChange={(value) => updateGic(gic.id, { rate: Number(value) / 100 })}
             />
@@ -1686,6 +1820,21 @@ function FieldHint({ text }: { text: string }) {
     </span>
   );
 }
+function RrifConversionSelect({ value, onChange }: { value: number | undefined; onChange: (value: number | undefined) => void }) {
+  return (
+    <label className="field-label">
+      <span className="field-label-text">RRIF conversion age
+        <FieldHint text="Optional whole-account conversion of the RRSP/RRIF balance and registered GIC holdings. RRIF withdrawals become eligible for pension splitting from age 65; minimum withdrawals start the year after conversion. Default preserves older scenarios: minimums and RRIF eligibility start at 71. Choose Already converted for an existing RRIF. This does not optimize conversion timing or model partial conversions." />
+      </span>
+      <select value={value ?? ""} onChange={(event) => onChange(event.target.value === "" ? undefined : Number(event.target.value))}>
+        <option value="">Default (existing rules)</option>
+        <option value={0}>Already converted</option>
+        {Array.from({ length: 71 }, (_, index) => index + 1).map((age) => <option key={age} value={age}>Age {age}</option>)}
+      </select>
+    </label>
+  );
+}
+
 function AgeSelect({
   label,
   value,
@@ -1944,6 +2093,8 @@ function IncomeStreamsEditor({
               >
                 <option value="employment">Employment</option>
                 <option value="pension">Pension</option>
+                <option value="rrspWithdrawal">RRSP withdrawal</option>
+                <option value="rrifWithdrawal">RRIF income</option>
                 <option value="eligibleDividend">Eligible dividend</option>
                 <option value="nonEligibleDividend">
                   Non-eligible dividend
@@ -1953,6 +2104,13 @@ function IncomeStreamsEditor({
               </select>
             </label>
           </div>
+          {stream.taxTreatment === "pension" && (
+            <label className="check-row">
+              <input type="checkbox" checked={stream.pensionEligibleForSplitting ?? true}
+                onChange={(event) => updateStream(stream.id, { pensionEligibleForSplitting: event.target.checked })} />
+              Eligible employer pension for splitting
+            </label>
+          )}
           <div className="field-grid three-up income-amount-fields">
             <NumberField
               label="Annual amount"
@@ -2383,6 +2541,8 @@ function LedgerView({
               );
               const phase = inputs.spendingPlan.phases[phaseIndex];
               const hasSubPeriods = (year.subPeriods?.length ?? 0) > 0;
+              const hasTaxAllocation = year.taxesByPerson.some((person) => person.pensionSplitTransfer !== undefined);
+              const canExpand = hasSubPeriods || hasTaxAllocation;
               const isExpanded = expandedAges.has(year.age);
               return (
                 <Fragment key={year.age}>
@@ -2394,7 +2554,7 @@ function LedgerView({
                   }
                 >
                   <td>
-                    {hasSubPeriods && (
+                    {canExpand && (
                       <button
                         type="button"
                         className="button button-quiet ledger-expand-toggle"
@@ -2464,11 +2624,19 @@ function LedgerView({
                   <td>{formatCurrency(year.netSpendableCash)}</td>
                   <td>{formatCurrency(year.estateValue)}</td>
                 </tr>
-                {hasSubPeriods && isExpanded && (
+                {canExpand && isExpanded && (
                   <tr className="ledger-subperiod-row">
                     <td colSpan={ledgerLeadColumns.length + ledgerIncomeColumns.length + ledgerTailColumns.length}>
                       <div className="ledger-subperiod-sticky">
-                        <SubPeriodTable subPeriods={year.subPeriods!} income={year.income} withdrawals={year.withdrawals} />
+                        {hasTaxAllocation && <table className="ledger-subperiod-table">
+                          <thead><tr><th>Person</th><th>RRSP/RRIF drawn</th><th>Pension allocation</th><th>OAS income basis</th><th>Income tax</th><th>OAS recovered</th></tr></thead>
+                          <tbody>{year.taxesByPerson.map((person) => <tr key={person.id}>
+                            <td>{person.label}</td><td>{formatCurrency(person.rrspWithdrawals ?? 0)}</td>
+                            <td>{formatCurrency(person.pensionSplitTransfer ?? 0)}</td><td>{formatCurrency(person.oasRecoveryIncome ?? 0)}</td><td>{formatCurrency(person.totalTax)}</td>
+                            <td>{formatCurrency(person.oasClawback ?? 0)}</td>
+                          </tr>)}</tbody>
+                        </table>}
+                        {hasSubPeriods && <SubPeriodTable subPeriods={year.subPeriods!} income={year.income} withdrawals={year.withdrawals} />}
                       </div>
                     </td>
                   </tr>
@@ -2546,19 +2714,35 @@ function SubPeriodTable({
 }
 function MonteCarloView({
   simulationOutput,
+  progress,
+  error,
 }: {
   simulationOutput: SimulationOutput | null;
+  progress: MonteCarloProgress | null;
+  error: string;
 }) {
-  if (!simulationOutput)
+  if (error) return <section className="ledger-panel"><h2>Simulation could not finish</h2><p role="alert">{error}</p></section>;
+  if (progress || !simulationOutput) {
+    const percent = progress ? Math.round(progress.completed / Math.max(1, progress.total) * 100) : 0;
+    const preparingResults = progress !== null && progress.completed >= progress.total;
     return (
-      <section className="ledger-panel">
-        <h2>No simulation results yet</h2>
-        <p>
-          Run the configured simulation to calculate success rate, percentile
-          bands, and the median path.
-        </p>
+      <section className="monte-carlo-progress" aria-busy="true">
+        <div className="monte-carlo-spinner" aria-hidden="true">
+          <span className="monte-carlo-spinner-arc" />
+          <span className="monte-carlo-spinner-arc" />
+          <span className="monte-carlo-spinner-arc" />
+          <strong>{progress ? `${percent}%` : "..."}</strong>
+        </div>
+        <div className="monte-carlo-progress-copy">
+          <h2>{preparingResults ? "Preparing results" : "Simulating your retirement"}</h2>
+          <p role="status">
+            {progress ? `${progress.completed.toLocaleString("en-CA")} of ${progress.total.toLocaleString("en-CA")} simulations complete` : "Starting simulation..."}
+          </p>
+        </div>
+        <progress className="monte-carlo-progress-accessible" max={100} value={progress ? percent : undefined} aria-label="Monte Carlo simulation progress" />
       </section>
     );
+  }
   return (
     <section className="ledger-panel">
       <div className="panel-heading">
@@ -2931,6 +3115,7 @@ function CompareView({
             <ComparisonRow label="Lifetime investment drawdowns" left={lifetimeDrawdowns(comparison.left)} right={lifetimeDrawdowns(comparison.right)} format={formatCurrency} />
             <ComparisonRow label="Lifetime CPP" left={lifetimeBenefit(comparison.left, "cpp")} right={lifetimeBenefit(comparison.right, "cpp")} format={formatCurrency} />
             <ComparisonRow label="Lifetime OAS" left={lifetimeBenefit(comparison.left, "oas")} right={lifetimeBenefit(comparison.right, "oas")} format={formatCurrency} />
+            <ComparisonRow label="Lifetime OAS recovered" left={comparison.left.years.reduce((sum, year) => sum + year.oasClawback, 0)} right={comparison.right.years.reduce((sum, year) => sum + year.oasClawback, 0)} format={formatCurrency} />
             <ComparisonRow label="Portfolio peak age" left={comparison.left.portfolioPeakAge} right={comparison.right.portfolioPeakAge} format={(value) => `${Math.round(value)}`} />
             <ComparisonTextRow label="First spending shortfall" left={firstShortfallLabel(comparison.left)} right={firstShortfallLabel(comparison.right)} />
           </div>
@@ -3238,6 +3423,17 @@ function GuideView() {
       ),
     },
     {
+      title: "Choosing a strategy",
+      body: (
+        <>
+          <p>Keep spending, lifespan, market assumptions, and the random seed unchanged when comparing withdrawal strategies. First check that spending is fully funded, then compare Monte Carlo success rates and downside outcomes. Once you are comfortable with the plan's resilience, use final estate to compare wealth preserved. No strategy is best under every possible future.</p>
+          <p><strong>Spending funded first:</strong> check for funding gaps and when they begin. A large final estate in one favorable return path does not compensate for being unable to fund the intended lifestyle in less favorable paths.</p>
+          <p><strong>Reliability before estate:</strong> compare Monte Carlo success rates, when failed runs run out of money, and the range of outcomes in poor markets. These are estimates under the chosen assumptions, not guarantees. Among plans with acceptable resilience, final estate is a useful secondary measure, especially when leaving an inheritance is a goal.</p>
+          <p><strong>Taxes and OAS explain the differences:</strong> do not choose solely on the lowest tax bill or highest OAS payment. Accepting some OAS recovery or paying more tax now can sometimes reduce later RRIF or estate taxes. Review spending, reliability, and estate together rather than minimizing any single tax figure.</p>
+        </>
+      ),
+    },
+    {
       title: "People and dates",
       body: (
         <>
@@ -3262,10 +3458,11 @@ function GuideView() {
       title: "Accounts",
       body: (
         <>
-          <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. Once you turn 71, a mandatory minimum withdrawal kicks in automatically each year (the CRA's prescribed percentage of the RRIF's value at the start of that year) - see the "RRIF withdrawal rate" chart to compare it against what's actually withdrawn.</p>
+          <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. An explicit RRIF conversion age applies to the whole registered holding; minimum withdrawals begin the following year and eligible RRIF income can be pension-split from age 65. The default preserves the older model's minimum withdrawals and RRIF eligibility from 71. Conversion timing, partial conversions, and the spouse-age election for minimums are not optimized.</p>
           <p><strong>TFSA</strong>: withdrawals are always tax-free and never counted as income anywhere.</p>
           <p><strong>Non-registered</strong> + <strong>Adjusted cost base (ACB)</strong>: only the gain above your ACB is taxable, and only that portion is a capital gain (taxed at the capital gains inclusion rate on the Assumptions tab, currently 50% or 66.67% included). If ACB equals the account balance there's no gain and changing it further won't do anything; the same applies at death, where any remaining unrealized gain is deemed realized.</p>
-          <p><strong>GIC / interest income</strong>: modeled separately from market-return accounts because it earns its own guaranteed rate and is principal-protected. The rate you enter is the total return for the whole term (e.g. 5% for a 2-year GIC means 5% over those 2 years), compounded tax-deferred until the term matures, when the accumulated growth is taxed as ordinary income all at once. An early withdrawal realizes a proportional share of deferred growth.</p>
+          <p><strong>GIC / interest income</strong>: modeled separately from market-return accounts because it earns its own assumed rate rather than a simulated market return. The rate you enter is the total return for the whole term (e.g. 5% for a 2-year GIC means 5% over those 2 years), compounded tax-deferred until the term matures, when the accumulated growth is taxed as ordinary income all at once. An early withdrawal realizes a proportional share of deferred growth.</p>
+          <p><strong>High Interest Savings Accounts (HISAs)</strong> can be included in the GIC / interest-bearing holdings using a 1-year term, an assumed annual interest rate, and Auto-renew. This models annual interest taxation for a non-registered HISA and includes it in the GIC / HISA buffer strategy. The rate stays constant in projections, even though actual HISA rates can change.</p>
         </>
       ),
     },
@@ -3297,6 +3494,8 @@ function GuideView() {
           <p><strong>Withdrawal frequency</strong> controls when the waterfall runs: annual, semi-annual, quarterly, or monthly. More frequent schedules expose the portfolio to more realistic within-year timing and make the Ledger expandable by period.</p>
           <p>Employment income end ages and months define when each person stops working; household spending and withdrawals begin when the last employment income stream in the household ends. With monthly withdrawals, that first retirement year is prorated from the selected month through December. Income streams also support independent start and end months for partial first or final years.</p>
           <p><strong>CPP/OAS start age</strong> changes the modeled benefit amount: starting early reduces it and delaying increases it. The strategy age determines when the benefit begins.</p>
+          <p><strong>Tax-aware household withdrawals</strong> follows your account order and chooses the more efficient person within the first available account type. It can supplement RRSP withdrawals from the next non-registered account only when that reduces OAS recovery and improves after-tax cash. TFSA stays in its chosen position, without a separate preservation setting. Mandatory RRIF withdrawals and the GIC buffer rule still apply. This is a local current-cash-flow heuristic, not a guaranteed lifetime optimum. It can be combined with aggressive RRSP meltdown: spending is funded first, then extra registered withdrawals are made and the final pension allocation, income tax, and OAS recovery are recalculated. Meltdown can increase current tax or OAS recovery.</p>
+          <p><strong>Eligible pension income splitting</strong> assumes the primary and first additional person are eligible spouses/common-law partners. The annual search compares both directions of one election, up to 50% of the donor's eligible income. Marked employer pensions can qualify before 65 without RRSP conversion; registered-account withdrawals generally require conversion to a RRIF and a donor aged at least 65. Ordinary RRSP withdrawals, CPP, and OAS are excluded. CPP pension sharing is separate and is not modeled. Splitting reallocates taxable income, not cash ownership or monthly withholding. OAS recovery uses individual net income for tax purposes, not half of household after-tax spending. CRA relationship and residency requirements are assumed; pension and age credits, GIS, provincial benefit differences, and special survivor rules are not modeled.</p>
           <p><strong>Aggressive RRSP meltdown</strong> withdraws additional RRSP/RRIF funds after retirement to fill the current federal bracket. It is a tax strategy approximation, and its annual decision is displayed in the sub-period table as smoothed period amounts when using a non-annual schedule.</p>
           <p><strong>GIC buffer strategy</strong>: a GIC only earns its keep as a sequence-of-returns buffer if it's still there when a real downturn hits - drawing it down on a fixed schedule regardless of market conditions defeats the purpose. Enabling this reserves the GIC while the market portfolio's own return (isolated from your contributions/withdrawals, since decumulation itself shouldn't look like a crash) is near its all-time high, then draws the GIC first once that return index is down more than the "draw trigger" from its peak - so a downturn is funded from the guaranteed GIC instead of selling depressed investments. Once the market recovers back within the "recovery threshold" of its old peak, the GIC reverts to being reserved (and refilled from leftover cash, e.g. RRIF minimums exceeding spending need, if enabled). A single down year is usually noise; 10-15% off the peak is a more meaningful signal that it's worth protecting the rest of the portfolio from selling low. There's deliberately no auto-optimizer here: fitting a trigger/recovery threshold to one guessed-at future return sequence is fitting noise, not a real edge - pick a threshold based on how much of a real correction you want to ride out, not by curve-fitting a simulation.</p>
         </>
@@ -3315,16 +3514,19 @@ function GuideView() {
     {
       title: "OAS clawback (recovery tax)",
       body: (
-        <p>Once your other taxable income (excluding your own OAS) exceeds the clawback threshold, 15 cents of every dollar above it is recovered from your OAS, up to a full clawback at the top threshold - both thresholds grow with simulated inflation. This is calculated last each year, after all withdrawals, so it reflects your actual final income for that year.</p>
+        <>
+          <p>OAS recovery uses modeled net income before the recovery deduction, including OAS, CPP, taxable capital gains, dividend gross-ups, and any pension-splitting allocation. Above the inflation-adjusted threshold, 15 cents per excess dollar is recovered, capped at the OAS paid. The projection reconciles the current year's liability; prior-year-based monthly withholding and later tax refunds are not modeled. OAS recovery is reported separately from income tax.</p>
+          <p><strong>OAS recovered</strong> on the Dashboard is the total OAS clawed back by the government across all people and projected years, not money received by the household. A value of $0 means no modeled clawback. <strong>Lifetime OAS</strong> is the benefit retained after that recovery. The recovery has already reduced the plan's OAS income and spendable cash; do not subtract it a second time.</p>
+        </>
       ),
     },
     {
       title: "Your data stays on this device",
       body: (
         <>
-          <p>All calculations run locally in your browser. This tool has no telemetry, does not send your scenario to a server, and does not store your financial information anywhere off this device.</p>
+          <p>All calculations run locally in your browser. We count page visits only, without cookies or click tracking. Scenario names, financial inputs, passwords, and file contents are not included in these counts. Scenarios stay in this browser unless you export or share them.</p>
           <p><strong>Save</strong> keeps a scenario in this browser on this device so you can return to it later. It is not an online account, and it will not automatically appear on another computer or phone.</p>
-          <p><strong>Export</strong> downloads a copy of your scenario as a file. Keep that file somewhere safe if you want a backup or need to move the scenario to another device. <strong>Import</strong> lets you choose that file and load the scenario into the app on the new device.</p>
+          <p><strong>Export</strong> downloads ordinary JSON or an optional password-protected file. Lost passwords cannot be recovered. <strong>Import</strong> accepts either format and asks for the password when needed. Password protection applies only to the exported file; scenarios saved in this browser remain unencrypted.</p>
           <p>Clearing browser data or using private browsing can remove locally saved scenarios. Export important scenarios before doing that.</p>
         </>
       ),
@@ -3334,7 +3536,9 @@ function GuideView() {
       body: (
         <>
           <p><strong>Save</strong> stores the current scenario in this browser. Saving again updates the selected scenario. <strong>New</strong> starts a fresh scenario without deleting saved ones, and <strong>Delete</strong> removes the selected saved scenario.</p>
-          <p><strong>Export</strong> makes a file you can keep as a backup. <strong>Import</strong> loads one of those files back into the app and creates a saved scenario from it. This is the way to move a scenario between devices.</p>
+          <p>When another saved scenario is available, <strong>Delete</strong> can also discard the unsaved <strong>New Scenario</strong> draft and switch to a saved scenario. The draft is removed from the dropdown until you click <strong>New</strong> or reload the page.</p>
+          <p><strong>Export</strong> makes a backup, optionally protected by a password. At least 12 characters are recommended, but no minimum length is enforced. <strong>Import</strong> opens JSON or encrypted backups and creates an unencrypted browser-saved scenario. Keep your password safe: there is no password recovery.</p>
+          <p>If an imported name matches a saved scenario, <strong>Keep both</strong> adds a uniquely named copy, <strong>Replace existing</strong> updates the saved scenario, and <strong>Cancel</strong> leaves everything unchanged. Names are compared without capitalization or surrounding whitespace. Encrypted files are checked after decryption.</p>
         </>
       ),
     },
@@ -3344,7 +3548,8 @@ function GuideView() {
         <>
           <p><strong>Dashboard</strong>: the main projection, KPIs, charts, and strategy comparison.</p>
           <p><strong>Ledger</strong>: the same projection in a year-by-year table. Edit annual returns and expand years to inspect monthly, quarterly, or semi-annual returns and withdrawals.</p>
-          <p><strong>Monte Carlo</strong>: randomized runs summarized as percentile bands, success rate, and failure analysis.</p>
+          <p><strong>Monte Carlo</strong>: randomized runs summarized as percentile bands, success rate, and failure analysis. To reduce runtime, pension splitting compares no split, 50% of eligible income in either direction, and an eligible income-balancing split. Dashboard, Ledger, and Compare keep the detailed allocation search. Tax rules, OAS recovery, withdrawal preferences, and simulation counts are unchanged, but individual outcomes can differ slightly. Simulations run in the background with an animated progress indicator, percentage, and completed-run count, followed by a Preparing results stage. Changing inputs restarts the simulation; leaving the tab cancels it.</p>
+          <p>Monte Carlo sizes withdrawals using bounded interpolation, with the existing bisection solver as a fallback if the faster method does not converge. This avoids repeated calculations without removing the selected withdrawal strategies. Dashboard, Ledger, and Compare retain the existing sizing solver.</p>
           <p><strong>Compare</strong>: run two saved scenarios side by side to see how changing inputs affects the result.</p>
           <p><strong>Tax Info</strong>: the editable tax brackets, credits, and rates used by the model.</p>
         </>
