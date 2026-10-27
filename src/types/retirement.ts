@@ -105,6 +105,7 @@ export interface ContributionSchedule {
 }
 
 export interface ExistingAssets {
+  accounts?: InvestmentAccount[];
   rrspBalance: number;
   tfsaBalance: number;
   nonRegisteredBalance: number;
@@ -118,10 +119,23 @@ export interface ExistingAssets {
 }
 
 // The tax status of the GIC holding. "external" is retained as a legacy alias for non-registered saved scenarios.
-export type GicFundingSource = "external" | "registered" | "nonRegistered";
+export type GicFundingSource = "external" | "registered" | "nonRegistered" | "tfsa";
 // What happens to a GIC's proceeds when its term matures: "renew" starts an identical new term immediately (a true
 // ladder, indefinitely), "cashOut" moves the proceeds into the non-registered account instead of continuing.
 export type GicMaturityAction = "renew" | "cashOut";
+
+export interface InvestmentAccount {
+  id: string;
+  name: string;
+  balance: number;
+  type: AccountType;
+  returnType: "market" | "gic" | "savings";
+  bookValue?: number;
+  annualRate?: number;
+  termYears?: number;
+  startAge?: number;
+  maturityAction?: GicMaturityAction;
+}
 
 export interface GicHolding {
   id: string;
@@ -200,6 +214,8 @@ export interface SimulationSettings {
 }
 
 export interface RetirementInputs {
+  planDate?: string;
+  actuals?: ActualsTracking;
   personalInfo: PersonalInfo;
   incomeStreams: IncomeStream[];
   contributionSchedules: ContributionSchedule[];
@@ -209,6 +225,63 @@ export interface RetirementInputs {
   taxSettings: TaxSettings;
   strategy: StrategySettings;
   simulation: SimulationSettings;
+}
+
+export interface TrackedAccount {
+  key: string;
+  ownerId: string;
+  accountId: string;
+  name: string;
+  type: AccountType;
+  returnType: InvestmentAccount["returnType"];
+  startingBalance: number;
+  activeDate: string;
+}
+
+export interface ActualsBaseline {
+  id: string;
+  name: string;
+  createdAt: string;
+  planDate: string;
+  inputs: Omit<RetirementInputs, "actuals">;
+  people: { id: string; label: string }[];
+  accounts: TrackedAccount[];
+  points: { date: string; portfolioByPerson: Record<string, number> }[];
+  returnPath?: { annualReturns: number[]; annualInflation: number[]; subPeriodReturns: number[][] };
+}
+
+export interface ProjectionBalanceOverride {
+  date: string;
+  people: Record<string, { rrsp: number; tfsa: number; nonRegistered: number; gics: Record<string, number> }>;
+}
+
+export interface BalanceObservation {
+  id: string;
+  baselineId: string;
+  date: string;
+  balances: Record<string, number | null>;
+  note: string;
+}
+
+export interface ActualsTracking {
+  baselines: ActualsBaseline[];
+  observations: BalanceObservation[];
+  activeBaselineId?: string;
+  workingBaselineId?: string | null;
+  forecastRevisions?: ForecastRevision[];
+  cadence?: "monthly" | "quarterly" | "annually";
+}
+
+export interface ForecastRevision {
+  id: string;
+  baselineId: string;
+  name: string;
+  effectiveDate: string;
+  createdAt: string;
+  observations?: BalanceObservation[];
+  settings: Pick<RetirementInputs, "incomeStreams" | "contributionSchedules" | "spendingPlan" | "assumptions" | "taxSettings" | "strategy" | "simulation">;
+  rrifConversionAges?: Record<string, number | undefined>;
+  returnPath: NonNullable<ActualsBaseline["returnPath"]>;
 }
 
 // Live simulation state for a single GIC ladder rung (distinct from the GicHolding config it was created from).
@@ -255,6 +328,7 @@ export interface IncomeBySource {
 }
 
 export interface TaxResult {
+  taxableIncome: number;
   federalTax: number;
   provincialTax: number;
   dividendTaxCredit: number;
@@ -267,6 +341,10 @@ export interface TaxResult {
 export interface PersonTaxBreakdown {
   id: string;
   label: string;
+  employmentIncome: number;
+  cppIncome: number;
+  oasIncome: number;
+  taxableIncome: number;
   federalTax: number;
   provincialTax: number;
   totalTax: number;
@@ -274,11 +352,19 @@ export interface PersonTaxBreakdown {
   oasClawback?: number;
   oasRecoveryIncome?: number;
   rrspWithdrawals?: number;
+  tfsaWithdrawals: number;
+  nonRegisteredWithdrawals: number;
+  interestBearingWithdrawals: number;
+  totalFunding: number;
+  contributions: number;
+  netCash: number;
 }
 
 export interface YearProjection {
   age: number;
   calendarYear: number;
+  portfolioByPerson: Record<string, number>;
+  periodReturns: number[];
   openingBalances: AccountBalances;
   closingBalances: AccountBalances;
   income: IncomeBySource;
@@ -316,6 +402,7 @@ export interface SubPeriodProjection {
 
 export interface DeterministicProjection {
   years: YearProjection[];
+  balanceCheckpoints?: { date: string; portfolioByPerson: Record<string, number> }[];
   finalEstateValue: number;
   lifetimeTax: number;
   portfolioPeakAge: number;

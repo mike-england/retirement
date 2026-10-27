@@ -5,7 +5,7 @@ const BENEFIT_REFERENCE_AGE = 65;
 export const cppAnnualMaximum = CPP.MAX_PENSION.RETIREMENT;
 export const oasAnnualMaximum = OAS.MONTHLY_PAYMENT_MAX * 12;
 export const oasClawbackThreshold = OAS.REPAYMENT.MIN;
-export const rrifMinimumWithdrawalAge = 71;
+export const rrifMinimumWithdrawalAge = 72;
 export const tfsaAnnualContributionLimit = TFSA.MAX_CONTRIBUTION;
 
 export function calculateCppAnnualBenefit(annualAmountAt65: number, startAge: number) {
@@ -33,8 +33,8 @@ export function calculateOasClawback(grossOasAmount: number, netIncome: number, 
 }
 
 // RRIFs must be converted from an RRSP by the end of the year the holder turns 71, then carry a mandatory minimum withdrawal each year based on the fund's value at the start of that year.
-export function calculateRrifMinimumWithdrawal(openingRrspBalance: number, age: number, conversionAge?: number) {
-  if ((conversionAge === undefined ? age < rrifMinimumWithdrawalAge : age <= conversionAge) || openingRrspBalance <= 0) return 0;
+export function calculateRrifMinimumWithdrawal(openingRrspBalance: number, age: number, conversionAge = rrifMinimumWithdrawalAge - 1) {
+  if (age <= conversionAge || openingRrspBalance <= 0) return 0;
   // The prescribed factor table tops out at 95; CRA holds the rate flat at the age-95 factor beyond that.
   return openingRrspBalance * getMinimumWithdrawalPercentage(Math.min(age, 95));
 }

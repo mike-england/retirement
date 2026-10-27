@@ -1,6 +1,9 @@
 "use client";
 
-import { BadgeDollarSign, BriefcaseBusiness, Check, Landmark, SlidersHorizontal, UsersRound, WalletCards } from "lucide-react";
+import { BadgeDollarSign, BriefcaseBusiness, Check, ChevronDown, Landmark, Menu, Plus, RefreshCw, SlidersHorizontal, Trash2, UsersRound, WalletCards } from "lucide-react";
+import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
 import { createPortal } from "react-dom";
@@ -17,26 +20,31 @@ import {
 import { defaultRetirementInputs } from "@/lib/default-inputs";
 import packageJson from "../../package.json";
 import type { MonteCarloWorkerMessage } from "@/lib/monteCarlo.worker";
-import { sampleAnnualReturn } from "@/lib/simulationEngine";
-import { projectWithVariableReturns } from "@/lib/projectionPath";
+import { forecastInputsForYear, sampleAnnualReturn } from "@/lib/simulationEngine";
+import { hasCompleteFundingSummary, isReturnOverrideUpdate, projectWithVariableReturns } from "@/lib/projectionPath";
+import { accountEntriesFor, accountTotal, assetsWithAccounts } from "@/lib/accounts";
+import { isActualsTracking } from "@/lib/actuals";
 import {
   availableTaxYears,
   defaultTaxSettings,
   provinceNames,
 } from "@/lib/taxRules";
-import { ageYearLabel, maxHouseholdAge, monthYearLabel } from "@/lib/planDates";
+import { ageYearLabel, maxHouseholdAge, monthYearLabel, parsePlanDate, planDateFor, withPlanDate } from "@/lib/planDates";
 import { calculateCppAnnualBenefit, cppAnnualMaximum } from "@/lib/governmentBenefits";
 import { SimulationCharts } from "@/components/SimulationCharts";
+import { ActualsView } from "@/components/ActualsView";
+import { WorkingForecastBar } from "@/components/WorkingForecastBar";
+import { projectWorkingForecast, workingForecastContext } from "@/lib/workingForecast";
 import { ScenarioFileDialog, ScenarioImportConflictDialog } from "@/components/ScenarioFileDialog";
 import { decryptScenario, encryptScenario, isEncryptedScenario } from "@/lib/scenarioEncryption";
 import type {
+  ActualsTracking,
   DeterministicProjection,
   ContributionSchedule,
   ExistingAssets,
   GicBufferSettings,
-  GicFundingSource,
-  GicHolding,
   GicMaturityAction,
+  InvestmentAccount,
   IncomeStream,
   ProvinceCode,
   RetirementInputs,
@@ -97,13 +105,32 @@ type SavedScenario = {
 
 type MonteCarloProgress = { completed: number; total: number };
 
+type ProjectionSnapshot = {
+  inputs: RetirementInputs;
+  calculator: typeof projectWithVariableReturns;
+  result: DeterministicProjection | null;
+  error?: string;
+};
+
 export default function Home() {
   const [inputs, setInputs] = useState(defaultRetirementInputs);
+  const planYear = planDateFor(inputs).getFullYear();
   const [activeView, setActiveView] = useState("Dashboard");
   const [activeInputTab, setActiveInputTab] = useState("People");
-  const [projection, setProjection] = useState<DeterministicProjection | null>(
+  const [projectionSnapshot, setProjectionSnapshot] = useState<ProjectionSnapshot | null>(
     null,
   );
+  const projectionCalculator = projectWorkingForecast;
+  const workingContext = workingForecastContext(inputs);
+  const snapshotIsCurrent = Boolean(projectionSnapshot && projectionSnapshot.calculator === projectionCalculator
+    && (projectionSnapshot.inputs === inputs || (workingContext && projectionSnapshot.inputs.actuals === inputs.actuals)));
+  const dashboardInputs = useMemo(() => workingContext ? { ...workingContext.baseline.inputs, actuals: inputs.actuals } : inputs,
+    [workingContext?.baseline, inputs.actuals, workingContext ? null : inputs]);
+  const projection = snapshotIsCurrent && hasCompleteFundingSummary(projectionSnapshot?.result) ? projectionSnapshot?.result ?? null : null;
+  const projectionError = snapshotIsCurrent ? projectionSnapshot?.error ?? "" : "";
+  const ledgerUpdating = !snapshotIsCurrent && projectionSnapshot?.calculator === projectionCalculator
+    && isReturnOverrideUpdate(projectionSnapshot.inputs, inputs) && hasCompleteFundingSummary(projectionSnapshot.result);
+  const ledgerProjection = projection ?? (ledgerUpdating ? projectionSnapshot?.result ?? null : null);
   const [monteCarloOutput, setMonteCarloOutput] =
     useState<SimulationOutput | null>(null);
   const [monteCarloProgress, setMonteCarloProgress] = useState<MonteCarloProgress | null>(null);
@@ -127,8 +154,10 @@ export default function Home() {
       ...current,
       strategy: { ...current.strategy, gicBuffer: { ...(current.strategy.gicBuffer ?? defaultGicBuffer), ...patch } },
     }));
-  const startingGicBalance = deriveGicList(inputs.existingAssets, inputs.personalInfo.currentAge).reduce((sum, gic) => sum + gic.balance, 0)
-    + (inputs.personalInfo.additionalPeople ?? []).reduce((sum, person) => sum + deriveGicList(person.existingAssets, person.currentAge).reduce((gicSum, gic) => gicSum + gic.balance, 0), 0);
+  const startingGicBalance = accountEntriesFor(inputs.existingAssets, inputs.personalInfo.currentAge, inputs.assumptions.returnMean)
+    .filter((account) => account.returnType !== "market").reduce((sum, account) => sum + account.balance, 0)
+    + (inputs.personalInfo.additionalPeople ?? []).reduce((sum, person) => sum + accountEntriesFor(person.existingAssets, person.currentAge, inputs.assumptions.returnMean)
+      .filter((account) => account.returnType !== "market").reduce((total, account) => total + account.balance, 0), 0);
   const averageInvestmentReturn = projection
     ? projection.years.reduce((sum, year) => sum + year.portfolioReturn, 0) /
       projection.years.length
@@ -209,7 +238,8 @@ export default function Home() {
     setInputs((current) => {
       const next = structuredClone(current);
       const [section, field] = path.split(".") as [keyof typeof next, string];
-      Object.assign(next[section], { [field]: numberValue });
+      const target = next[section];
+      if (target && typeof target === "object") Object.assign(target, { [field]: numberValue });
       if (path === "personalInfo.currentAge") {
         next.incomeStreams = next.incomeStreams.map((stream) => ({
           ...stream,
@@ -249,18 +279,18 @@ export default function Home() {
   }
 
   function persistScenarios(nextScenarios: SavedScenario[]) {
-    setScenarios(nextScenarios);
     window.localStorage.setItem(
       scenarioStorageKey,
       JSON.stringify(nextScenarios),
     );
+    setScenarios(nextScenarios);
   }
 
   function createNewScenario() {
     setIsDraftDismissed(false);
     setActiveScenarioId("draft");
     setScenarioName("New Scenario");
-    setInputs(structuredClone(defaultRetirementInputs));
+    setInputs(withPlanDate(structuredClone(defaultRetirementInputs)));
   }
 
   function saveScenario() {
@@ -274,7 +304,7 @@ export default function Home() {
         scenarioName.trim() ||
         existingScenario?.name ||
         `Scenario ${scenarios.length + 1}`,
-      inputs: structuredClone(inputs),
+      inputs: withPlanDate(structuredClone(inputs)),
       updatedAt: new Date().toISOString(),
     };
     persistScenarios(
@@ -283,6 +313,23 @@ export default function Home() {
         : [...scenarios, scenario],
     );
     setActiveScenarioId(id);
+    setScenarioName(scenario.name);
+    setJustSaved(true);
+    window.setTimeout(() => setJustSaved(false), 1800);
+  }
+
+  function saveActuals(actuals: ActualsTracking) {
+    const nextInputs = { ...inputs, actuals };
+    const existing = scenarios.find((scenario) => scenario.id === activeScenarioId);
+    const scenario: SavedScenario = {
+      id: existing?.id ?? `scenario-${crypto.randomUUID()}`,
+      name: scenarioName.trim() || existing?.name || "New Scenario",
+      inputs: structuredClone(nextInputs),
+      updatedAt: new Date().toISOString(),
+    };
+    persistScenarios(existing ? scenarios.map((entry) => entry.id === scenario.id ? scenario : entry) : [...scenarios, scenario]);
+    setInputs(nextInputs);
+    setActiveScenarioId(scenario.id);
     setScenarioName(scenario.name);
     setJustSaved(true);
     window.setTimeout(() => setJustSaved(false), 1800);
@@ -310,7 +357,7 @@ export default function Home() {
     const scenario = scenarios.find((current) => current.id === id);
     if (scenario && isRetirementInputs(scenario.inputs)) {
       setScenarioName(scenario.name);
-      setInputs(structuredClone(scenario.inputs));
+      setInputs(withPlanDate(structuredClone(scenario.inputs), new Date(scenario.updatedAt)));
     } else if (scenario) {
       window.alert(
         `"${scenario.name}" uses an older data format and cannot be loaded. Delete it and create a new scenario.`,
@@ -368,7 +415,7 @@ export default function Home() {
       id: `scenario-${Date.now()}`,
       name: "name" in parsed && typeof parsed.name === "string" && parsed.name.trim()
         ? parsed.name.trim() : fileName.replace(/\.(encrypted\.)?json$/i, "").trim() || "Imported Scenario",
-      inputs: importedInputs,
+      inputs: withPlanDate(importedInputs, "updatedAt" in parsed && typeof parsed.updatedAt === "string" ? new Date(parsed.updatedAt) : new Date()),
       updatedAt: new Date().toISOString(),
     };
     const existingScenario = scenarios.find((scenario) => scenario.name.trim().toLowerCase() === importedScenario.name.toLowerCase());
@@ -440,12 +487,20 @@ export default function Home() {
   }
 
   useEffect(() => {
+    setInputs((current) => withPlanDate(current));
     try {
       const savedScenarios = JSON.parse(
         window.localStorage.getItem(scenarioStorageKey) ?? "[]",
       ) as SavedScenario[];
-      if (Array.isArray(savedScenarios))
-        setScenarios(savedScenarios);
+      if (Array.isArray(savedScenarios)) {
+        const datedScenarios = savedScenarios.map((scenario) => isRetirementInputs(scenario.inputs)
+          ? { ...scenario, inputs: withPlanDate(scenario.inputs, new Date(scenario.updatedAt)) }
+          : scenario);
+        setScenarios(datedScenarios);
+        if (datedScenarios.some((scenario, index) => scenario.inputs !== savedScenarios[index].inputs)) {
+          window.localStorage.setItem(scenarioStorageKey, JSON.stringify(datedScenarios));
+        }
+      }
     } catch {
       setScenarios([]);
     }
@@ -474,18 +529,24 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    setProjection(null);
+    if (snapshotIsCurrent) return;
+    setIsRunning(true);
     const debounceTimer = window.setTimeout(() => {
-      setIsRunning(true);
-      const nextProjection = projectWithVariableReturns(inputs);
-      startTransition(() => {
-        setProjection(nextProjection);
+      try {
+        const nextProjection = projectionCalculator(inputs);
+        if (!hasCompleteFundingSummary(nextProjection)) throw new Error("Incomplete funding summary");
+        startTransition(() => {
+          setProjectionSnapshot({ inputs, calculator: projectionCalculator, result: nextProjection });
+          setIsRunning(false);
+        });
+      } catch (failure) {
+        setProjectionSnapshot({ inputs, calculator: projectionCalculator, result: null, error: `${failure instanceof Error ? failure.message : "Unable to calculate a complete funding breakdown."} Your inputs have been kept. Recalculate to try again.` });
         setIsRunning(false);
-      });
+      }
     }, 400);
 
     return () => window.clearTimeout(debounceTimer);
-  }, [inputs]);
+  }, [inputs, projectionCalculator, snapshotIsCurrent]);
 
   useEffect(() => {
     if (activeView !== "Monte Carlo") return;
@@ -534,7 +595,7 @@ export default function Home() {
   }, [activeView, inputs]);
 
   return (
-    <main className="planner-shell">
+    <main className={`planner-shell${activeView === "Accounts" ? " planner-shell--accounts" : ""}${activeView === "Actuals" ? " planner-shell--actuals" : ""}`}>
       {fileDialog && <ScenarioFileDialog mode={fileDialog.mode} onSubmit={submitScenarioFile} onClose={() => setFileDialog(null)} />}
       {pendingImport && <ScenarioImportConflictDialog name={pendingImport.scenario.name} onResolve={resolveImportConflict} onClose={() => setPendingImport(null)} />}
       <header className="topbar">
@@ -604,7 +665,7 @@ export default function Home() {
           />
         </div>
       </header>
-      <div className="planner-layout">
+      <div className={`planner-layout${activeView === "Accounts" ? " planner-layout--accounts" : ""}`}>
         <aside className="sidebar" aria-label="Planning inputs">
           <div className="sidebar-heading">
             <div>
@@ -619,7 +680,6 @@ export default function Home() {
                 ["People", UsersRound],
                 ["Income", BriefcaseBusiness],
                 ["Contributions", WalletCards],
-                ["Accounts", WalletCards],
                 ["Spending", BadgeDollarSign],
                 ["Assumptions", SlidersHorizontal],
                 ["Strategy", Landmark],
@@ -659,6 +719,18 @@ export default function Home() {
                 Add person
               </button>
             </div>
+            <label className="field-label">
+              Plan date
+              <input
+                type="date"
+                value={inputs.planDate ?? ""}
+                title="Reference date for all starting ages and account balances. Saved with the scenario and never advanced automatically."
+                onChange={(event) => {
+                  const planDate = event.target.value;
+                  if (parsePlanDate(planDate)) setInputs((current) => ({ ...current, planDate }));
+                }}
+              />
+            </label>
             <div className="person-card person-card--primary">
               {(inputs.personalInfo.additionalPeople ?? []).length > 0 && (
                 <div className="person-actions">
@@ -705,7 +777,7 @@ export default function Home() {
               </label>
               <div className="field-grid two-up">
                 <NumberField
-                  label="Current age"
+                  label="Age at plan date"
                   value={inputs.personalInfo.currentAge}
                   onChange={(value) =>
                     setNumber("personalInfo.currentAge", value)
@@ -714,7 +786,7 @@ export default function Home() {
                 <NumberField
                   label="Death age"
                   value={inputs.personalInfo.targetDeathAge}
-                  tooltip={`Dies ${monthYearLabel(inputs.personalInfo, inputs.personalInfo.targetDeathAge)}`}
+                  tooltip={`Dies ${monthYearLabel(inputs.personalInfo, inputs.personalInfo.targetDeathAge, planYear)}`}
                   onChange={(value) =>
                     setNumber("personalInfo.targetDeathAge", value)
                   }
@@ -844,7 +916,7 @@ export default function Home() {
                 </label>
                 <div className="field-grid two-up">
                   <NumberField
-                    label="Current age"
+                    label="Age at plan date"
                     value={person.currentAge}
                     onChange={(value) =>
                       setInputs((current) => ({
@@ -865,7 +937,7 @@ export default function Home() {
                   <NumberField
                     label="Death age"
                     value={person.targetDeathAge}
-                    tooltip={`Dies ${monthYearLabel(person, person.targetDeathAge)}`}
+                    tooltip={`Dies ${monthYearLabel(person, person.targetDeathAge, planYear)}`}
                     onChange={(value) =>
                       setInputs((current) => ({
                         ...current,
@@ -982,6 +1054,7 @@ export default function Home() {
           </div>
           <div hidden={activeInputTab !== "Income"}>
           <IncomeStreamsEditor
+            planYear={planYear}
             streams={inputs.incomeStreams}
             minimumAge={inputs.personalInfo.currentAge}
             targetDeathAge={inputs.personalInfo.targetDeathAge}
@@ -1001,6 +1074,7 @@ export default function Home() {
           </div>
           <div hidden={activeInputTab !== "Contributions"}>
           <ContributionSchedulesEditor
+            planYear={planYear}
             schedules={inputs.contributionSchedules}
             people={[
               { id: "primary", label: inputs.personalInfo.label ?? "Primary person", currentAge: inputs.personalInfo.currentAge },
@@ -1009,145 +1083,9 @@ export default function Home() {
             onChange={(contributionSchedules) => setInputs((current) => ({ ...current, contributionSchedules }))}
           />
           </div>
-          <div hidden={activeInputTab !== "Accounts"}>
-          <section className="input-section">
-            <h2>
-              {(inputs.personalInfo.additionalPeople ?? []).length > 0
-                ? `${inputs.personalInfo.label || "Primary person"}'s accounts`
-                : "Existing assets"}
-            </h2>
-            <div className="field-grid two-up">
-              <NumberField
-                label="RRSP / RRIF"
-                prefix="$"
-                value={inputs.existingAssets.rrspBalance}
-                onChange={(value) =>
-                  setNumber("existingAssets.rrspBalance", value)
-                }
-              />
-              <NumberField
-                label="TFSA"
-                prefix="$"
-                value={inputs.existingAssets.tfsaBalance}
-                onChange={(value) =>
-                  setNumber("existingAssets.tfsaBalance", value)
-                }
-              />
-              <NumberField
-                label="Non-registered"
-                prefix="$"
-                value={inputs.existingAssets.nonRegisteredBalance}
-                onChange={(value) =>
-                  setNumber("existingAssets.nonRegisteredBalance", value)
-                }
-              />
-              <NumberField
-                label={
-                  <span title="Adjusted cost base is what you originally paid for the non-registered investments, including eligible purchase costs. The amount above it is the unrealized capital gain.">
-                    Adjusted cost base
-                  </span>
-                }
-                prefix="$"
-                value={inputs.existingAssets.nonRegisteredBookValue}
-                onChange={(value) =>
-                  setNumber("existingAssets.nonRegisteredBookValue", value)
-                }
-              />
-            </div>
-            <div className="field-label-text gic-section-heading">
-              <span>GICs / interest-bearing holdings</span>
-              <FieldHint text="Guaranteed Investment Certificates (GICs), Principal Protected Notes (PPNs), High Interest Savings Accounts (HISAs), and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior. For a HISA, use a 1-year term, its assumed annual interest rate, and Auto-renew. The model holds that rate constant; actual HISA rates can change." />
-            </div>
-            <RrifConversionSelect value={inputs.personalInfo.rrifConversionAge} onChange={(rrifConversionAge) =>
-              setInputs((current) => ({ ...current, personalInfo: { ...current.personalInfo, rrifConversionAge } }))} />
-            <GicListEditor
-              gics={deriveGicList(inputs.existingAssets, inputs.personalInfo.currentAge)}
-              currentAge={inputs.personalInfo.currentAge}
-              onChange={(gics) =>
-                setInputs((current) => ({
-                  ...current,
-                  existingAssets: { ...current.existingAssets, gics },
-                }))
-              }
-            />
-          </section>
-          {(inputs.personalInfo.additionalPeople ?? []).map((person) => {
-            const assets = person.existingAssets ?? {
-              rrspBalance: 0,
-              tfsaBalance: 0,
-              nonRegisteredBalance: 0,
-              nonRegisteredBookValue: 0,
-              interestBearingBalance: 0,
-              interestBearingTermYears: 1,
-              interestBearingRate: inputs.assumptions.returnMean,
-            };
-            const updateAssets = (changes: Partial<typeof assets>) =>
-              setInputs((current) => ({
-                ...current,
-                personalInfo: {
-                  ...current.personalInfo,
-                  additionalPeople: (
-                    current.personalInfo.additionalPeople ?? []
-                  ).map((candidate) =>
-                    candidate.id === person.id
-                      ? { ...candidate, existingAssets: { ...assets, ...changes } }
-                      : candidate,
-                  ),
-                },
-              }));
-            return (
-              <section className="input-section" key={person.id}>
-                <h2>{person.label || "Person"}&apos;s accounts</h2>
-                <div className="field-grid two-up">
-                  <NumberField
-                    label="RRSP / RRIF"
-                    prefix="$"
-                    value={assets.rrspBalance}
-                    onChange={(value) => updateAssets({ rrspBalance: Number(value) })}
-                  />
-                  <NumberField
-                    label="TFSA"
-                    prefix="$"
-                    value={assets.tfsaBalance}
-                    onChange={(value) => updateAssets({ tfsaBalance: Number(value) })}
-                  />
-                  <NumberField
-                    label="Non-registered"
-                    prefix="$"
-                    value={assets.nonRegisteredBalance}
-                    onChange={(value) => updateAssets({ nonRegisteredBalance: Number(value) })}
-                  />
-                  <NumberField
-                    label={
-                      <span title="Adjusted cost base is what this person originally paid for their non-registered investments, including eligible purchase costs. The amount above it is the unrealized capital gain.">
-                        Adjusted cost base
-                      </span>
-                    }
-                    prefix="$"
-                    value={assets.nonRegisteredBookValue}
-                    onChange={(value) => updateAssets({ nonRegisteredBookValue: Number(value) })}
-                  />
-                </div>
-                <div className="field-label-text gic-section-heading">
-                  <span>GICs / interest-bearing holdings</span>
-                  <FieldHint text="Guaranteed Investment Certificates (GICs), Principal Protected Notes (PPNs), High Interest Savings Accounts (HISAs), and similar interest-bearing holdings. Add as many as you like, each with its own start age, term, rate, funding source, and maturity behavior. For a HISA, use a 1-year term, its assumed annual interest rate, and Auto-renew. The model holds that rate constant; actual HISA rates can change." />
-                </div>
-                <RrifConversionSelect value={person.rrifConversionAge} onChange={(rrifConversionAge) => setInputs((current) => ({
-                  ...current,
-                  personalInfo: { ...current.personalInfo, additionalPeople: (current.personalInfo.additionalPeople ?? []).map((candidate) =>
-                    candidate.id === person.id ? { ...candidate, rrifConversionAge } : candidate) },
-                }))} />
-                <GicListEditor
-                  gics={deriveGicList(assets, person.currentAge)}
-                  currentAge={person.currentAge}
-                  onChange={(gics) => updateAssets({ gics })}
-                />
-              </section>
-            );
-          })}
-          </div>
           <div hidden={activeInputTab !== "Spending"}>
           <SpendingPlanEditor
+            planYear={planYear}
             spendingPlan={inputs.spendingPlan}
             minimumAge={inputs.personalInfo.currentAge}
             personalInfo={inputs.personalInfo}
@@ -1279,7 +1217,7 @@ export default function Home() {
               <AgeSelect
                 label="CPP start age"
                 value={inputs.strategy.cppStartAge}
-                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.cppStartAge)} for the primary person.`}
+                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.cppStartAge, planYear)} for the primary person.`}
                 onChange={(value) =>
                   setInputs((current) => ({
                     ...current,
@@ -1290,7 +1228,7 @@ export default function Home() {
               <AgeSelect
                 label="OAS start age"
                 value={inputs.strategy.oasStartAge}
-                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.oasStartAge)} for the primary person.`}
+                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.oasStartAge, planYear)} for the primary person.`}
                 onChange={(value) =>
                   setInputs((current) => ({
                     ...current,
@@ -1403,7 +1341,7 @@ export default function Home() {
           <section className="input-section">
             <div className="field-label-text strategy-section-heading">
               <h2>GIC / HISA buffer strategy</h2>
-              <FieldHint text="Applies to all GIC / interest-bearing holdings, including PPNs and HISAs. Instead of always drawing these holdings in a fixed order position, hold them in reserve while the market's own return (isolated from your withdrawals) is near its peak, and draw them first once the market is down significantly from that peak - so you're not selling depressed investments to fund spending. Once the market recovers, the buffer is reserved again and (optionally) topped up from leftover cash. Model a HISA with a 1-year term and Auto-renew at an assumed constant annual rate." />
+              <FieldHint text="Applies to all GIC / interest-bearing holdings, including PPNs and HISAs. Instead of always drawing these holdings in a fixed order position, hold them in reserve while the market's own return (isolated from your withdrawals) is near its peak, and draw them first once the market is down significantly from that peak - so you're not selling depressed investments to fund spending. Once the market recovers, the buffer is reserved again and (optionally) topped up from leftover cash. HISAs use the Interest-bearing savings return treatment and an assumed constant annual rate." />
             </div>
             <label className="check-row emphasis">
               <input
@@ -1457,7 +1395,7 @@ export default function Home() {
         </aside>
         <section className="workspace">
           <nav className="view-tabs" aria-label="Workspace views">
-            {["Dashboard", "Ledger", "Monte Carlo", "Compare", "Tax Info", "Guide"].map(
+            {["Dashboard", "Accounts", "Actuals", "Ledger", "Monte Carlo", "Compare", "Tax Info", "Guide"].map(
               (view) => (
                 <button
                   key={view}
@@ -1475,6 +1413,10 @@ export default function Home() {
               <h2>
                 {activeView === "Dashboard"
                   ? "Plan overview"
+                  : activeView === "Accounts"
+                    ? "Accounts & holdings"
+                  : activeView === "Actuals"
+                    ? "Plan vs. actuals"
                   : activeView === "Ledger"
                     ? "Year-by-year ledger"
                     : activeView === "Monte Carlo"
@@ -1488,6 +1430,10 @@ export default function Home() {
               <p>
                 {activeView === "Tax Info"
                   ? `Editable ${inputs.taxSettings.taxYear} tax rules from ${inputs.taxSettings.source}.`
+                  : activeView === "Accounts"
+                    ? `As of ${inputs.planDate ?? planYear}`
+                  : activeView === "Actuals"
+                    ? `${inputs.actuals?.baselines.length ?? 0} frozen ${inputs.actuals?.baselines.length === 1 ? "baseline" : "baselines"} · ${inputs.actuals?.observations.length ?? 0} balance ${inputs.actuals?.observations.length === 1 ? "entry" : "entries"}`
                   : activeView === "Guide"
                     ? "Plain-language notes on every input and assumption in the planner."
                     : activeView === "Monte Carlo"
@@ -1500,17 +1446,23 @@ export default function Home() {
               </p>
             </div>
           </div>
+          {workingContext && ["Dashboard", "Ledger", "Actuals", "Compare", "Monte Carlo"].includes(activeView) && <WorkingForecastBar key={`${workingContext.baseline.id}:${workingContext.asOf}`} inputs={inputs} onChange={saveActuals} />}
+          {activeView === "Accounts" && <AccountsView inputs={inputs} onChange={setInputs} />}
+          {activeView === "Actuals" && <ActualsView key={activeScenarioId} inputs={inputs} projection={projection} onChange={saveActuals} onOpenAccounts={() => setActiveView("Accounts")} />}
           {activeView === "Dashboard" && (
             <DashboardView
               kpis={kpis}
-              inputs={inputs}
+              inputs={dashboardInputs}
               projection={projection}
             />
           )}
           {activeView === "Ledger" && (
             <LedgerView
               inputs={inputs}
-              projection={projection}
+              projection={ledgerProjection}
+              updating={ledgerUpdating}
+              error={projectionError}
+              onRecalculate={() => setInputs((current) => structuredClone(current))}
               onGenerateReturns={generateReturns}
               onReturnChange={(age, rate) =>
                 setInputs((current) => ({
@@ -1527,7 +1479,7 @@ export default function Home() {
             />
           )}
           {activeView === "Monte Carlo" && (
-            <MonteCarloView simulationOutput={monteCarloOutput} progress={monteCarloProgress} error={monteCarloError} />
+            <><p className="monte-carlo-working-note">{workingContext ? `Uses applied actuals and saved revisions. Returns through ${workingContext.asOf.slice(0, 4)} remain fixed; subsequent full calendar years are randomized and used for success-rate estimates.` : "Uses the editable plan's balances and assumptions."}</p><MonteCarloView simulationOutput={monteCarloOutput} progress={monteCarloProgress} error={monteCarloError} /></>
           )}
           {activeView === "Compare" && (
             <CompareView
@@ -1558,148 +1510,117 @@ export default function Home() {
   );
 }
 
-const gicFundingSourceLabels: Record<GicFundingSource, string> = {
-  external: "Legacy existing holding",
-  registered: "Registered (RRSP/RRIF)",
-  nonRegistered: "Non-registered",
-};
-const gicMaturityActionLabels: Record<GicMaturityAction, string> = {
-  renew: "Auto-renew (ladder)",
-  cashOut: "Cash out to non-registered",
-};
-
-// Existing scenarios only have the legacy single-GIC fields; this presents that as one editable list entry until the
-// user actually saves a `gics` array, at which point it takes over.
-function deriveGicList(assets: ExistingAssets | undefined, currentAge: number): GicHolding[] {
-  if (assets?.gics && assets.gics.length > 0) {
-    return assets.gics.map((gic) =>
-      gic.fundingSource === "external"
-        ? { ...gic, fundingSource: "nonRegistered" }
-        : gic,
-    );
-  }
-  const legacyBalance = assets?.interestBearingBalance ?? 0;
-  if (legacyBalance <= 0) return [];
-  return [{
-    id: "legacy",
-    label: "GIC",
-    balance: legacyBalance,
-    rate: assets?.interestBearingRate ?? 0.05,
-    termYears: assets?.interestBearingTermYears ?? 1,
-    startAge: currentAge,
-    fundingSource: "external",
-    maturityAction: "renew",
-  }];
+function SortableAccountRows({ id, children }: {
+  id: string;
+  children: (handle: Pick<ReturnType<typeof useSortable>, "attributes" | "listeners" | "setActivatorNodeRef">) => ReactNode;
+}) {
+  const { attributes, listeners, setActivatorNodeRef, setNodeRef, transform, transition, isDragging } = useSortable({ id });
+  return (
+    <tbody ref={setNodeRef} className={isDragging ? "accounts-dragging" : undefined} style={{ transform: CSS.Transform.toString(transform ? { ...transform, x: 0 } : null), transition }}>
+      {children({ attributes, listeners, setActivatorNodeRef })}
+    </tbody>
+  );
 }
 
-function GicListEditor({
-  gics,
-  currentAge,
-  onChange,
-}: {
-  gics: GicHolding[];
-  currentAge: number;
-  onChange: (gics: GicHolding[]) => void;
-}) {
-  const updateGic = (id: string, patch: Partial<GicHolding>) =>
-    onChange(gics.map((gic) => (gic.id === id ? { ...gic, ...patch } : gic)));
-  const removeGic = (id: string) => onChange(gics.filter((gic) => gic.id !== id));
-  const addGic = () =>
-    onChange([
-      ...gics,
-      {
-        id: `gic-${Date.now()}`,
-        label: `GIC ${gics.length + 1}`,
-        balance: 0,
-        rate: 0.05,
-        termYears: 1,
-        startAge: currentAge,
-        fundingSource: "nonRegistered",
-        maturityAction: "renew",
-      },
-    ]);
-
+function AccountsView({ inputs, onChange }: { inputs: RetirementInputs; onChange: (inputs: RetirementInputs) => void }) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const people = [
+    { ...inputs.personalInfo, id: "primary", existingAssets: inputs.existingAssets },
+    ...(inputs.personalInfo.additionalPeople ?? []),
+  ].map((person) => ({ ...person, accounts: accountEntriesFor(person.existingAssets, person.currentAge, inputs.assumptions.returnMean) }));
+  const householdTotal = people.reduce((total, person) => total + accountTotal(person.accounts), 0);
+  const updatePerson = (id: string, assets: ExistingAssets | undefined, rrifConversionAge: number | undefined) => onChange(id === "primary"
+    ? { ...inputs, existingAssets: assets ?? inputs.existingAssets, personalInfo: { ...inputs.personalInfo, rrifConversionAge } }
+    : { ...inputs, personalInfo: { ...inputs.personalInfo, additionalPeople: inputs.personalInfo.additionalPeople.map((person) => person.id === id
+      ? { ...person, existingAssets: assets, rrifConversionAge } : person) } });
+  const toggleDetails = (key: string) => setExpanded((current) => {
+    const next = new Set(current);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    return next;
+  });
   return (
-    <div className="gic-list">
-      {gics.map((gic) => (
-        <div className="gic-card" key={gic.id}>
-          <div className="gic-card-heading">
-            <input
-              className="gic-label-input"
-              type="text"
-              value={gic.label ?? ""}
-              placeholder="GIC label"
-              onChange={(event) => updateGic(gic.id, { label: event.target.value })}
-            />
-            <button type="button" className="button button-quiet" onClick={() => removeGic(gic.id)}>
-              Remove
-            </button>
-          </div>
-          <div className="field-grid two-up">
-            <NumberField
-              label="Balance"
-              prefix="$"
-              value={gic.balance}
-              onChange={(value) => updateGic(gic.id, { balance: Number(value) })}
-            />
-            <NumberField
-              label="Rate"
-              suffix="%"
-              step={0.1}
-              tooltip="The assumed TOTAL return for the whole term (e.g. '5% for a 2-year GIC' means 5% over those 2 years, not per year). For a HISA, use a 1-year term and its assumed annual interest rate. Converted into an equivalent annual rate internally and never randomized in Monte Carlo; actual HISA rates can change."
-              value={oneDecimalPercent(gic.rate)}
-              onChange={(value) => updateGic(gic.id, { rate: Number(value) / 100 })}
-            />
-            <NumberField
-              label="Term (years)"
-              min={1}
-              step={1}
-              tooltip="How many years this GIC compounds before it matures. Withdrawing early still realizes a proportional share of the deferred growth for tax purposes that year."
-              value={gic.termYears}
-              onChange={(value) => updateGic(gic.id, { termYears: Math.max(1, Math.round(Number(value))) })}
-            />
-            <NumberField
-              label="Start age"
-              min={currentAge}
-              step={1}
-              tooltip="Age at which this GIC's balance becomes active. Set to the current age for a GIC already held today; set it later to model a GIC starting partway through retirement."
-              value={gic.startAge}
-              onChange={(value) => updateGic(gic.id, { startAge: Math.round(Number(value)) })}
-            />
-            <label className="field-label">
-              <span className="field-label-text">
-                Account type
-                <FieldHint text="The account type determines whether GIC interest is taxable. The balance is entered separately and is not deducted from the RRSP, RRIF, or non-registered balance." />
-              </span>
-              <select
-                value={gic.fundingSource}
-                onChange={(event) => updateGic(gic.id, { fundingSource: event.target.value as GicFundingSource })}
-              >
-                {(Object.keys(gicFundingSourceLabels) as GicFundingSource[]).filter((source) => source !== "external").map((source) => (
-                  <option key={source} value={source}>{gicFundingSourceLabels[source]}</option>
-                ))}
-              </select>
-            </label>
-            <label className="field-label">
-              <span className="field-label-text">
-                At maturity
-                <FieldHint text="'Auto-renew' starts an identical new term immediately, indefinitely (a true ladder). 'Cash out' moves the matured proceeds into the non-registered account instead of continuing." />
-              </span>
-              <select
-                value={gic.maturityAction}
-                onChange={(event) => updateGic(gic.id, { maturityAction: event.target.value as GicMaturityAction })}
-              >
-                {(Object.keys(gicMaturityActionLabels) as GicMaturityAction[]).map((action) => (
-                  <option key={action} value={action}>{gicMaturityActionLabels[action]}</option>
-                ))}
-              </select>
-            </label>
-          </div>
-        </div>
-      ))}
-      <button type="button" className="button button-quiet" onClick={addGic}>
-        + Add GIC
-      </button>
+    <div className="accounts-view">
+      <div className="accounts-total-band">
+        <div><span>Household total</span><output aria-label="Household account total">{formatCurrency(householdTotal)}</output></div>
+        <span>{people.length} {people.length === 1 ? "person" : "people"} · {people.reduce((count, person) => count + person.accounts.length, 0)} accounts</span>
+      </div>
+      {people.map((person) => {
+        const saveAccounts = (accounts: InvestmentAccount[]) => updatePerson(person.id, assetsWithAccounts(person.existingAssets, accounts, person.currentAge), person.rrifConversionAge);
+        const updateAccount = (id: string, patch: Partial<InvestmentAccount>) => saveAccounts(person.accounts.map((account) => account.id === id ? { ...account, ...patch } : account));
+        return (
+          <section className="accounts-person" key={person.id} aria-label={`${person.label || "Person"} accounts`}>
+            <div className="accounts-person-heading">
+              <div><h2>{person.label || "Person"}</h2><span>{person.accounts.length} {person.accounts.length === 1 ? "account" : "accounts"}</span></div>
+              <output aria-label={`${person.label || "Person"} account subtotal`}>{formatCurrency(accountTotal(person.accounts))}</output>
+              <button type="button" className="button button-quiet accounts-add" onClick={() => saveAccounts([...person.accounts, {
+                id: `account-${crypto.randomUUID()}`, name: "New account", balance: 0, type: "rrsp", returnType: "market",
+              }])}><Plus size={15} />Add account</button>
+            </div>
+            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={({ active, over }) => {
+              if (!over || active.id === over.id) return;
+              const fromIndex = person.accounts.findIndex((account) => account.id === active.id);
+              const toIndex = person.accounts.findIndex((account) => account.id === over.id);
+              if (fromIndex >= 0 && toIndex >= 0) saveAccounts(arrayMove(person.accounts, fromIndex, toIndex));
+            }}>
+            <SortableContext items={person.accounts.map((account) => account.id)} strategy={verticalListSortingStrategy}>
+            <div className="accounts-table-wrap">
+              <table className="accounts-table">
+                <thead><tr><th scope="col">Account name</th><th scope="col">Balance</th><th scope="col">Account type</th><th scope="col">Return treatment</th><th scope="col"><span className="accounts-sr-only">Actions</span></th></tr></thead>
+                  {person.accounts.length === 0 && <tbody><tr><td colSpan={5} className="accounts-empty">No accounts</td></tr></tbody>}
+                  {person.accounts.map((account) => {
+                    const key = `${person.id}-${account.id}`;
+                    const hasDetails = account.returnType !== "market" || account.type === "nonRegistered";
+                    const isExpanded = hasDetails && expanded.has(key);
+                    return (
+                      <SortableAccountRows key={account.id} id={account.id}>
+                        {({ attributes, listeners, setActivatorNodeRef }) => <Fragment>
+                        <tr>
+                          <td><div className="accounts-name-cell">
+                            <button ref={setActivatorNodeRef} type="button" className="accounts-drag-handle" {...attributes} {...listeners} title="Drag to reorder account" aria-label={`Reorder ${account.name}`}><Menu size={17} /></button>
+                            <input aria-label="Account name" value={account.name} onChange={(event) => updateAccount(account.id, { name: event.target.value })} />
+                          </div></td>
+                          <td><NumberField label={<span className="accounts-sr-only">{account.name} balance</span>} prefix="$" min={0} value={account.balance} onChange={(value) => updateAccount(account.id, { balance: Math.max(0, Number(value)) })} /></td>
+                          <td><select aria-label={`${account.name} account type`} value={account.type} onChange={(event) => {
+                            updateAccount(account.id, { type: event.target.value as InvestmentAccount["type"] });
+                            if (event.target.value === "nonRegistered") setExpanded((current) => new Set(current).add(key));
+                          }}><option value="rrsp">RRSP / RRIF</option><option value="tfsa">TFSA</option><option value="nonRegistered">Non-registered</option></select></td>
+                          <td><select aria-label={`${account.name} return treatment`} value={account.returnType} onChange={(event) => {
+                            const returnType = event.target.value as InvestmentAccount["returnType"];
+                            updateAccount(account.id, { returnType, ...(returnType === "savings" ? { startAge: person.currentAge } : {}) });
+                            if (returnType !== "market") setExpanded((current) => new Set(current).add(key));
+                          }}><option value="market">Market-linked</option><option value="gic">Fixed-rate GIC / PPN</option><option value="savings">Interest-bearing savings</option></select></td>
+                          <td><div className="accounts-row-actions">
+                            <button type="button" className="button button-quiet accounts-icon" disabled={!hasDetails} title={isExpanded ? "Hide account details" : "Account details"} aria-label={`${isExpanded ? "Hide" : "Show"} ${account.name} details`} aria-expanded={isExpanded} aria-controls={`${key}-details`} onClick={() => toggleDetails(key)}><ChevronDown size={16} className={isExpanded ? "accounts-chevron-open" : ""} /></button>
+                            <button type="button" className="button button-quiet accounts-icon" title="Delete account" aria-label={`Delete ${account.name}`} onClick={() => saveAccounts(person.accounts.filter((candidate) => candidate.id !== account.id))}><Trash2 size={15} /></button>
+                          </div></td>
+                        </tr>
+                        {isExpanded && <tr id={`${key}-details`} className="accounts-details-row"><td colSpan={5}><div className="accounts-details">
+                          {account.returnType === "market" && account.type === "nonRegistered" && <NumberField label="Adjusted cost base" prefix="$" min={0} value={account.bookValue ?? account.balance} tooltip="Original cost of these investments, including eligible purchase costs. Only the gain above this amount is taxable." onChange={(value) => updateAccount(account.id, { bookValue: Math.max(0, Number(value)) })} />}
+                          {account.returnType !== "market" && <NumberField label="Annual interest rate" suffix="%" min={0} step={0.1} value={roundedPercent(account.annualRate ?? 0.05)} tooltip="Effective annual rate, compounded annually. This fixed assumption is not randomized with market returns." onChange={(value) => updateAccount(account.id, { annualRate: Math.max(0, Number(value)) / 100 })} />}
+                          {account.returnType === "gic" && <>
+                            <NumberField label="Term (years)" min={1} step={1} value={account.termYears ?? 1} onChange={(value) => updateAccount(account.id, { termYears: Math.max(1, Math.round(Number(value))) })} />
+                            <NumberField label="Start age" min={person.currentAge} step={1} value={account.startAge ?? person.currentAge} onChange={(value) => updateAccount(account.id, { startAge: Math.max(person.currentAge, Math.round(Number(value))) })} />
+                            <label className="field-label">At maturity<select value={account.maturityAction ?? "renew"} onChange={(event) => updateAccount(account.id, { maturityAction: event.target.value as GicMaturityAction })}><option value="renew">Auto-renew</option><option value="cashOut">Move to market-linked balance</option></select></label>
+                          </>}
+                        </div></td></tr>}
+                        </Fragment>}
+                      </SortableAccountRows>
+                    );
+                  })}
+                <tfoot><tr><th scope="row" colSpan={5}><div className="accounts-person-total"><span>{person.label || "Person"} total</span><output>{formatCurrency(accountTotal(person.accounts))}</output></div></th></tr></tfoot>
+              </table>
+            </div>
+            </SortableContext>
+            </DndContext>
+            <div className="accounts-person-settings"><RrifConversionSelect currentAge={person.currentAge} value={person.rrifConversionAge} onChange={(rrifConversionAge) => updatePerson(person.id, person.existingAssets, rrifConversionAge)} /></div>
+          </section>
+        );
+      })}
     </div>
   );
 }
@@ -1820,16 +1741,18 @@ function FieldHint({ text }: { text: string }) {
     </span>
   );
 }
-function RrifConversionSelect({ value, onChange }: { value: number | undefined; onChange: (value: number | undefined) => void }) {
+function RrifConversionSelect({ currentAge, value, onChange }: { currentAge: number; value: number | undefined; onChange: (value: number | undefined) => void }) {
+  const firstAge = Math.max(1, Math.ceil(currentAge));
+  const conversionAge = value ?? 71;
+  const selectedValue = conversionAge < firstAge ? 0 : conversionAge;
   return (
     <label className="field-label">
       <span className="field-label-text">RRIF conversion age
-        <FieldHint text="Optional whole-account conversion of the RRSP/RRIF balance and registered GIC holdings. RRIF withdrawals become eligible for pension splitting from age 65; minimum withdrawals start the year after conversion. Default preserves older scenarios: minimums and RRIF eligibility start at 71. Choose Already converted for an existing RRIF. This does not optimize conversion timing or model partial conversions." />
+        <FieldHint text="Whole-account conversion of the RRSP/RRIF balance and registered GIC holdings, no later than age 71. Plans without a saved conversion age use 71, with minimum withdrawals starting at 72. RRIF withdrawals become eligible for pension splitting from age 65; minimum withdrawals start the year after conversion. Choose Already converted for an existing RRIF. This does not optimize conversion timing or model partial conversions." />
       </span>
-      <select value={value ?? ""} onChange={(event) => onChange(event.target.value === "" ? undefined : Number(event.target.value))}>
-        <option value="">Default (existing rules)</option>
+      <select value={selectedValue} onChange={(event) => onChange(Number(event.target.value))}>
         <option value={0}>Already converted</option>
-        {Array.from({ length: 71 }, (_, index) => index + 1).map((age) => <option key={age} value={age}>Age {age}</option>)}
+        {Array.from({ length: Math.max(0, 72 - firstAge) }, (_, index) => firstAge + index).map((age) => <option key={age} value={age}>Age {age}</option>)}
       </select>
     </label>
   );
@@ -1931,10 +1854,12 @@ function ChartPlaceholder({
 }
 function ContributionSchedulesEditor({
   schedules,
+  planYear,
   people,
   onChange,
 }: {
   schedules: ContributionSchedule[];
+  planYear: number;
   people: Array<{ id: string; label: string; currentAge: number }>;
   onChange: (schedules: ContributionSchedule[]) => void;
 }) {
@@ -1944,8 +1869,8 @@ function ContributionSchedulesEditor({
     id: `contribution-${Date.now()}`,
     ownerId: "primary",
     label: "New contribution plan",
-    year: new Date().getFullYear(),
-    endYear: new Date().getFullYear() + Math.max(0, 65 - (people.find((person) => person.id === "primary")?.currentAge ?? 0)),
+    year: planYear,
+    endYear: planYear + Math.max(0, 65 - (people.find((person) => person.id === "primary")?.currentAge ?? 0)),
     frequency: "annual",
     annualRrspContribution: 0,
     annualTfsaContribution: 0,
@@ -1962,16 +1887,16 @@ function ContributionSchedulesEditor({
       {schedules.map((schedule) => (
         <article className="income-stream-card" key={schedule.id}>
           {(() => {
-            const startYear = Number.isFinite(schedule.year) ? schedule.year : new Date().getFullYear();
+            const startYear = Number.isFinite(schedule.year) ? schedule.year : planYear;
             const endYear = Number.isFinite(schedule.endYear) ? schedule.endYear : startYear;
             return (
               <>
           <div className="field-grid three-up">
-            <label className="field-label">Owner<select value={schedule.ownerId} onChange={(event) => { const owner = people.find((person) => person.id === event.target.value) ?? people[0]; updateSchedule(schedule.id, { ownerId: event.target.value, endYear: Math.max(startYear, new Date().getFullYear() + Math.max(0, 65 - owner.currentAge)) }); }}>{people.map((person) => <option key={person.id} value={person.id}>{person.label}</option>)}</select></label>
+            <label className="field-label">Owner<select value={schedule.ownerId} onChange={(event) => { const owner = people.find((person) => person.id === event.target.value) ?? people[0]; updateSchedule(schedule.id, { ownerId: event.target.value, endYear: Math.max(startYear, planYear + Math.max(0, 65 - owner.currentAge)) }); }}>{people.map((person) => <option key={person.id} value={person.id}>{person.label}</option>)}</select></label>
             <label className="field-label">Label<input value={schedule.label} onChange={(event) => updateSchedule(schedule.id, { label: event.target.value })} /></label>
           </div>
           <div className="field-grid two-up income-amount-fields">
-            <NumberField label="Start year" min={new Date().getFullYear()} value={startYear} tooltip="First calendar year when this contribution applies." onChange={(value) => updateSchedule(schedule.id, { year: Math.min(endYear, Math.round(Number(value))) })} />
+            <NumberField label="Start year" min={planYear} value={startYear} tooltip="First calendar year when this contribution applies." onChange={(value) => updateSchedule(schedule.id, { year: Math.min(endYear, Math.round(Number(value))) })} />
             <NumberField label="End year" min={startYear} value={endYear} tooltip="Last calendar year when this contribution applies." onChange={(value) => updateSchedule(schedule.id, { endYear: Math.max(startYear, Math.round(Number(value))) })} />
             <label className="field-label">Frequency<select value={schedule.frequency} onChange={(event) => updateSchedule(schedule.id, { frequency: event.target.value as ContributionSchedule["frequency"] })}><option value="annual">Annual</option><option value="monthly">Monthly</option></select></label>
           </div>
@@ -1993,6 +1918,7 @@ function ContributionSchedulesEditor({
 
 function IncomeStreamsEditor({
   streams,
+  planYear,
   minimumAge,
   targetDeathAge,
   personalInfo,
@@ -2000,6 +1926,7 @@ function IncomeStreamsEditor({
   onChange,
 }: {
   streams: IncomeStream[];
+  planYear: number;
   minimumAge: number;
   targetDeathAge: number;
   personalInfo: RetirementInputs["personalInfo"];
@@ -2125,7 +2052,7 @@ function IncomeStreamsEditor({
               min={minimumAge}
               max={stream.endAge}
               value={stream.startAge}
-              tooltip={`Starts ${monthYearLabel(owner, stream.startAge, undefined, stream.startMonth ?? 1)}`}
+              tooltip={`Starts ${monthYearLabel(owner, stream.startAge, planYear, stream.startMonth ?? 1)}`}
               onChange={(value) =>
                 updateStream(stream.id, {
                   startAge: Math.min(stream.endAge, Math.max(minimumAge, Number(value))),
@@ -2137,7 +2064,7 @@ function IncomeStreamsEditor({
               min={stream.startAge}
               max={maxAge}
               value={stream.endAge}
-              tooltip={`Ends ${monthYearLabel(owner, stream.endAge, undefined, stream.endMonth ?? 12)}`}
+              tooltip={`Ends ${monthYearLabel(owner, stream.endAge, planYear, stream.endMonth ?? 12)}`}
               onChange={(value) =>
                 updateStream(stream.id, {
                   endAge: Math.min(maxAge, Math.max(stream.startAge, Number(value))),
@@ -2199,11 +2126,13 @@ function IncomeStreamsEditor({
 }
 function SpendingPlanEditor({
   spendingPlan,
+  planYear,
   minimumAge,
   personalInfo,
   onChange,
 }: {
   spendingPlan: SpendingPlan;
+  planYear: number;
   minimumAge: number;
   personalInfo: RetirementInputs["personalInfo"];
   onChange: (spendingPlan: SpendingPlan) => void;
@@ -2267,7 +2196,7 @@ function SpendingPlanEditor({
               min={minimumAge}
               max={phase.endAge}
               value={phase.startAge}
-              tooltip={`Applies for the full calendar year ${ageYearLabel(personalInfo, phase.startAge)}.`}
+              tooltip={`Applies for the full calendar year ${ageYearLabel(personalInfo, phase.startAge, planYear)}.`}
               onChange={(value) =>
                 updatePhase(phase.id, {
                   startAge: Math.min(phase.endAge, Math.max(minimumAge, Number(value))),
@@ -2279,7 +2208,7 @@ function SpendingPlanEditor({
               min={phase.startAge}
               max={maxAge}
               value={phase.endAge}
-              tooltip={`Applies through the full calendar year ${ageYearLabel(personalInfo, phase.endAge)}.`}
+              tooltip={`Applies through the full calendar year ${ageYearLabel(personalInfo, phase.endAge, planYear)}.`}
               onChange={(value) =>
                 updatePhase(phase.id, {
                   endAge: Math.min(maxAge, Math.max(phase.startAge, Number(value))),
@@ -2357,8 +2286,8 @@ function portfolioTotal(year: YearProjection) {
 }
 function MeltdownImpactView({ inputs }: { inputs: typeof defaultRetirementInputs }) {
   const { withMeltdown, withoutMeltdown } = useMemo(() => {
-    const on = projectWithVariableReturns({ ...inputs, strategy: { ...inputs.strategy, aggressiveRrspMeltdown: true } });
-    const off = projectWithVariableReturns({ ...inputs, strategy: { ...inputs.strategy, aggressiveRrspMeltdown: false } });
+    const on = projectWorkingForecast(inputs, { aggressiveRrspMeltdown: true });
+    const off = projectWorkingForecast(inputs, { aggressiveRrspMeltdown: false });
     return { withMeltdown: on, withoutMeltdown: off };
   }, [inputs]);
 
@@ -2446,16 +2375,24 @@ function MeltdownImpactView({ inputs }: { inputs: typeof defaultRetirementInputs
 function LedgerView({
   inputs,
   projection,
+  updating,
+  error,
+  onRecalculate,
   onGenerateReturns,
   onReturnChange,
 }: {
   inputs: typeof defaultRetirementInputs;
   projection: DeterministicProjection | null;
+  updating: boolean;
+  error: string;
+  onRecalculate: () => void;
   onGenerateReturns: () => void;
   onReturnChange: (age: number, rate: number) => void;
 }) {
   const [expandedAges, setExpandedAges] = useState<Set<number>>(new Set());
-  if (!projection)
+  const working = workingForecastContext(inputs);
+  const firstEditableYear = working ? Number(working.asOf.slice(0, 4)) + 1 : -Infinity;
+  if (!projection || !hasCompleteFundingSummary(projection))
     return (
       <section className="ledger-panel ledger-panel--dense">
         <div className="panel-heading">
@@ -2464,7 +2401,10 @@ function LedgerView({
             <p>Annual balances, tax, and spendable cash</p>
           </div>
         </div>
-        <div className="ledger-empty">Updating variable-return projection.</div>
+        <div className="ledger-empty" role={error ? "alert" : "status"}>
+          {error || "Updating variable-return projection."}
+          {error && <button type="button" className="button button-quiet ledger-recalculate" onClick={onRecalculate}><RefreshCw size={14} />Recalculate</button>}
+        </div>
       </section>
     );
   const years = projection.years;
@@ -2475,7 +2415,7 @@ function LedgerView({
   const averageInvestmentReturn =
     years.reduce((sum, year) => sum + year.portfolioReturn, 0) / years.length;
   return (
-    <section className="ledger-panel ledger-panel--dense">
+    <section className="ledger-panel ledger-panel--dense" aria-busy={updating}>
       <div className="ledger-summary">
         <div>
           <span>Planned spending</span>
@@ -2501,8 +2441,10 @@ function LedgerView({
       <div className="panel-heading ledger-heading">
         <div>
           <h2>Variable-return projection</h2>
-          <p>Edit a yearly return to override the seeded path for that age.</p>
+          <p role="status">{updating ? "Updating amounts for the edited returns..." : "Edit a yearly return to override the seeded path for that age."}</p>
         </div>
+        <div className="ledger-actions">
+        <button type="button" className="button button-quiet ledger-recalculate" onClick={onRecalculate}><RefreshCw size={14} />Recalculate</button>
         <button
           className="button button-primary"
           type="button"
@@ -2510,6 +2452,7 @@ function LedgerView({
         >
           Generate returns
         </button>
+        </div>
       </div>
       <div className="table-wrap ledger-table-wrap">
         <table className="ledger-table">
@@ -2535,13 +2478,14 @@ function LedgerView({
           </thead>
           <tbody>
             {years.map((year) => {
-              const phaseIndex = inputs.spendingPlan.phases.findIndex(
+              const yearInputs = working ? forecastInputsForYear(working.baseline.inputs, working.revisions, year.calendarYear) : inputs;
+              const phaseIndex = yearInputs.spendingPlan.phases.findIndex(
                 (phase) =>
                   year.age >= phase.startAge && year.age <= phase.endAge,
               );
-              const phase = inputs.spendingPlan.phases[phaseIndex];
+              const phase = yearInputs.spendingPlan.phases[phaseIndex];
               const hasSubPeriods = (year.subPeriods?.length ?? 0) > 0;
-              const hasTaxAllocation = year.taxesByPerson.some((person) => person.pensionSplitTransfer !== undefined);
+              const hasTaxAllocation = year.taxesByPerson.length > 0;
               const canExpand = hasSubPeriods || hasTaxAllocation;
               const isExpanded = expandedAges.has(year.age);
               return (
@@ -2584,7 +2528,9 @@ function LedgerView({
                       <input
                         type="number"
                         step="0.1"
-                        value={oneDecimalPercent(year.portfolioReturn)}
+                        disabled={year.calendarYear < firstEditableYear}
+                        title={working ? year.calendarYear < firstEditableYear ? "Recorded/past return path is fixed in the working forecast." : `Future return edits are drafts until saved as a forecast revision. Currently modeled: ${oneDecimalPercent(year.portfolioReturn)}%.` : "Annualized return. First-year growth applies only from the saved plan date; earlier sub-periods have zero modeled growth."}
+                        value={oneDecimalPercent(year.calendarYear < firstEditableYear ? year.portfolioReturn : inputs.assumptions.annualReturnOverrides[year.age] ?? year.portfolioReturn)}
                         onChange={(event) =>
                           onReturnChange(
                             year.age,
@@ -2628,13 +2574,20 @@ function LedgerView({
                   <tr className="ledger-subperiod-row">
                     <td colSpan={ledgerLeadColumns.length + ledgerIncomeColumns.length + ledgerTailColumns.length}>
                       <div className="ledger-subperiod-sticky">
-                        {hasTaxAllocation && <table className="ledger-subperiod-table">
-                          <thead><tr><th>Person</th><th>RRSP/RRIF drawn</th><th>Pension allocation</th><th>OAS income basis</th><th>Income tax</th><th>OAS recovered</th></tr></thead>
+                        {hasTaxAllocation && <table className="ledger-subperiod-table ledger-funding-table">
+                          <thead>
+                            <tr><th rowSpan={2}>Person</th><th colSpan={8}>Funding sources</th><th colSpan={3}>Cash flow</th><th>Tax calculation</th></tr>
+                            <tr><th>Employment / pension</th><th>RRSP/RRIF drawn</th><th>TFSA drawn</th><th>Non-registered</th><th title="Cash drawn from GICs and interest-bearing savings. Interest retained in the holding is not cash funding.">GIC / savings drawn</th><th title="OAS retained after modeled clawback.">OAS amount</th><th>CPP amount</th><th>Total funding</th><th>Less contributions</th><th>Less income tax</th><th>Net cash</th><th title="Income used to calculate tax, not a cash-flow total. Pension splitting, tax-free withdrawals, cost basis, and other modeled deductions can make this differ from funding received.">Taxable income</th></tr>
+                          </thead>
                           <tbody>{year.taxesByPerson.map((person) => <tr key={person.id}>
-                            <td>{person.label}</td><td>{formatCurrency(person.rrspWithdrawals ?? 0)}</td>
-                            <td>{formatCurrency(person.pensionSplitTransfer ?? 0)}</td><td>{formatCurrency(person.oasRecoveryIncome ?? 0)}</td><td>{formatCurrency(person.totalTax)}</td>
-                            <td>{formatCurrency(person.oasClawback ?? 0)}</td>
+                            <td>{person.label}</td><td>{formatCurrency(person.employmentIncome, 2)}</td><td>{formatCurrency(person.rrspWithdrawals ?? 0, 2)}</td>
+                            <td>{formatCurrency(person.tfsaWithdrawals, 2)}</td><td>{formatCurrency(person.nonRegisteredWithdrawals, 2)}</td><td>{formatCurrency(person.interestBearingWithdrawals, 2)}</td>
+                            <td>{formatCurrency(person.oasIncome, 2)}</td><td>{formatCurrency(person.cppIncome, 2)}</td><td><strong>{formatCurrency(person.totalFunding, 2)}</strong></td>
+                            <td>{formatCurrency(person.contributions, 2)}</td><td>{formatCurrency(person.totalTax, 2)}</td><td><strong>{formatCurrency(person.netCash, 2)}</strong></td><td>{formatCurrency(person.taxableIncome, 2)}</td>
                           </tr>)}</tbody>
+                          <tfoot><tr><th>Household total</th>{([
+                            "employmentIncome", "rrspWithdrawals", "tfsaWithdrawals", "nonRegisteredWithdrawals", "interestBearingWithdrawals", "oasIncome", "cppIncome", "totalFunding", "contributions", "totalTax", "netCash", "taxableIncome",
+                          ] as const).map((field) => <td key={field}>{formatCurrency(year.taxesByPerson.reduce((total, person) => total + (person[field] ?? 0), 0), 2)}</td>)}</tr></tfoot>
                         </table>}
                         {hasSubPeriods && <SubPeriodTable subPeriods={year.subPeriods!} income={year.income} withdrawals={year.withdrawals} />}
                       </div>
@@ -3042,11 +2995,11 @@ function CompareView({
       const leftOutput =
         left.id === "draft" && draftProjection
           ? draftProjection
-          : projectWithVariableReturns(left.inputs);
+          : projectWorkingForecast(left.inputs);
       const rightOutput =
         right.id === "draft" && draftProjection
           ? draftProjection
-          : projectWithVariableReturns(right.inputs);
+          : projectWorkingForecast(right.inputs);
       startTransition(() => {
         setComparison({ left: leftOutput, right: rightOutput });
         setIsComparing(false);
@@ -3418,7 +3371,7 @@ function GuideView() {
         <>
           <p>This is a scenario-based planning model. It predicts possible household cash flow, taxes, account balances, and estate values from the assumptions you enter, but it cannot predict which future scenario will occur.</p>
           <p>The Dashboard and Ledger show one seeded variable-return path. Monte Carlo runs the same plan many times with different return and inflation paths, then summarizes the range of outcomes. A high success rate means the modeled portfolio stayed funded; it does not guarantee that result in real life.</p>
-          <p>Each simulated year adds income, applies the selected withdrawal schedule, calculates annual tax and OAS recovery tax, reinvests eligible surplus cash, and updates the accounts. With monthly, quarterly, or semi-annual withdrawals, the market return is also split into matching sub-period returns that compound back to the year's return.</p>
+          <p>Each simulated year adds income, applies the selected withdrawal schedule, calculates annual tax and OAS recovery tax, reinvests eligible surplus cash, and updates the accounts. With monthly, quarterly, or semi-annual withdrawals, the annualized market return is split into matching sub-period returns. First-year growth applies only from the saved plan date; earlier sub-periods have zero modeled growth.</p>
         </>
       ),
     },
@@ -3437,7 +3390,7 @@ function GuideView() {
       title: "People and dates",
       body: (
         <>
-          <p><strong>Current age</strong> anchors the simulation. <strong>Death age</strong> is the person's birthday cutoff for age-based income and benefits; the estate is settled in the final simulated year. Birth month, when provided, controls within-year proration.</p>
+          <p><strong>Plan date</strong> is the saved reference date for starting ages and account balances. Reopening a scenario does not advance this date or anyone's age. Change it explicitly when rebasing a plan, and update ages and balances to match. <strong>Death age</strong> is the person's birthday cutoff for age-based income and benefits; the estate is settled in the final simulated year. Birth month, when provided, controls within-year proration.</p>
           <p>Each additional person has their own age, birth month, benefits, accounts, and tax return. Household projections use the longest household lifespan; age-based income belongs to the person who owns that stream.</p>
           <p><strong>Province</strong> selects the provincial tax rules. <strong>CPP/OAS payout %</strong> lets you model less than the maximum benefit.</p>
         </>
@@ -3458,11 +3411,12 @@ function GuideView() {
       title: "Accounts",
       body: (
         <>
-          <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. An explicit RRIF conversion age applies to the whole registered holding; minimum withdrawals begin the following year and eligible RRIF income can be pension-split from age 65. The default preserves the older model's minimum withdrawals and RRIF eligibility from 71. Conversion timing, partial conversions, and the spouse-age election for minimums are not optimized.</p>
+          <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. The RRIF conversion age applies to the whole registered holding; minimum withdrawals begin the following year and eligible RRIF income can be pension-split from age 65. Plans without a saved conversion age use 71, with minimums starting at 72. Choose Already converted for an existing RRIF. Conversion timing, partial conversions, and the spouse-age election for minimums are not optimized.</p>
+          <p>Accounts are entered separately by owner in the main Accounts view, with a subtotal for each person and a household total. Each row has its own tax type and return treatment; include each balance only once, including GICs held inside an RRSP or TFSA. The simulation pools market-linked balances by owner and tax type when funding withdrawals.</p>
           <p><strong>TFSA</strong>: withdrawals are always tax-free and never counted as income anywhere.</p>
           <p><strong>Non-registered</strong> + <strong>Adjusted cost base (ACB)</strong>: only the gain above your ACB is taxable, and only that portion is a capital gain (taxed at the capital gains inclusion rate on the Assumptions tab, currently 50% or 66.67% included). If ACB equals the account balance there's no gain and changing it further won't do anything; the same applies at death, where any remaining unrealized gain is deemed realized.</p>
-          <p><strong>GIC / interest income</strong>: modeled separately from market-return accounts because it earns its own assumed rate rather than a simulated market return. The rate you enter is the total return for the whole term (e.g. 5% for a 2-year GIC means 5% over those 2 years), compounded tax-deferred until the term matures, when the accumulated growth is taxed as ordinary income all at once. An early withdrawal realizes a proportional share of deferred growth.</p>
-          <p><strong>High Interest Savings Accounts (HISAs)</strong> can be included in the GIC / interest-bearing holdings using a 1-year term, an assumed annual interest rate, and Auto-renew. This models annual interest taxation for a non-registered HISA and includes it in the GIC / HISA buffer strategy. The rate stays constant in projections, even though actual HISA rates can change.</p>
+          <p><strong>Fixed-rate GIC / PPN</strong>: earns its own annual rate rather than the simulated market return. For example, 5% annually over two years compounds to 10.25%. A non-registered holding realizes deferred growth at maturity or proportionally on early withdrawal; RRSP/RRIF growth remains sheltered until withdrawn and TFSA growth is tax-free. At maturity, proceeds can renew or move to the market-linked balance within the same tax wrapper. Existing saved total-term rates are converted to equivalent annual rates.</p>
+          <p><strong>Interest-bearing savings</strong>: enter an assumed annual rate without a GIC term. Non-registered interest is modeled as taxable annually; registered and TFSA holdings retain their tax treatment. These balances participate in the GIC / HISA buffer strategy. The assumed rate stays constant in projections even though actual savings rates can change.</p>
         </>
       ),
     },
@@ -3570,6 +3524,8 @@ function GuideView() {
 function isRetirementInputs(value: unknown): value is RetirementInputs {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<RetirementInputs>;
+  if (candidate.actuals !== undefined && !isActualsTracking(candidate.actuals)) return false;
+  if (candidate.planDate !== undefined && (typeof candidate.planDate !== "string" || !parsePlanDate(candidate.planDate))) return false;
   return Boolean(
     candidate.personalInfo &&
       candidate.existingAssets &&
@@ -3593,14 +3549,17 @@ function formatWithCommas(rawValue: string) {
   return numericValue.toLocaleString("en-CA");
 }
 
-function formatCurrency(value: number) {
+function formatCurrency(value: number | null | undefined, fractionDigits = 0) {
+  const amount = typeof value === "number" && Number.isFinite(value) ? value : 0;
   return new Intl.NumberFormat("en-CA", {
     style: "currency",
     currency: "CAD",
-    maximumFractionDigits: 0,
-  }).format(value);
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  }).format(amount);
 }
 function shortCurrency(value: number) {
+  if (!Number.isFinite(value)) return "$0";
   if (Math.abs(value) >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}M`;
   if (Math.abs(value) >= 1_000) return `$${Math.round(value / 1_000)}K`;
   return `$${Math.round(value)}`;

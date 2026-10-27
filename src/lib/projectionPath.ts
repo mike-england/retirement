@@ -1,6 +1,27 @@
 import { decomposeAnnualReturn, projectRetirementPlan, sampleAnnualReturn, subPeriodsPerYear } from "@/lib/simulationEngine";
 import type { DeterministicProjection, RetirementInputs } from "@/types/retirement";
 
+export function isReturnOverrideUpdate(previous: RetirementInputs, current: RetirementInputs): boolean {
+  const sections = Object.keys({ ...previous, ...current }) as (keyof RetirementInputs)[];
+  const assumptions = Object.keys({ ...previous.assumptions, ...current.assumptions }) as (keyof RetirementInputs["assumptions"])[];
+  return sections.every((section) => section === "assumptions" || previous[section] === current[section])
+    && assumptions.every((assumption) => assumption === "annualReturnOverrides" || previous.assumptions[assumption] === current.assumptions[assumption]);
+}
+
+export function hasCompleteFundingSummary(projection: DeterministicProjection | null | undefined): boolean {
+  if (!projection || !Array.isArray(projection.years) || projection.years.length === 0) return false;
+  return projection.years.every((year) => Array.isArray(year.taxesByPerson) && year.taxesByPerson.length > 0
+    && year.taxesByPerson.every((person) => {
+      const sources = [person.employmentIncome, person.rrspWithdrawals, person.tfsaWithdrawals, person.nonRegisteredWithdrawals,
+        person.interestBearingWithdrawals, person.oasIncome, person.cppIncome];
+      const values = [...sources, person.totalFunding, person.contributions, person.totalTax, person.netCash, person.taxableIncome];
+      if (!values.every((value) => typeof value === "number" && Number.isFinite(value))) return false;
+      const sourceTotal = sources.reduce<number>((total, value) => total + (value ?? 0), 0);
+      return Math.abs(sourceTotal - person.totalFunding) < 0.01
+        && Math.abs(person.totalFunding - person.contributions - person.totalTax - person.netCash) < 0.01;
+    }));
+}
+
 export function projectWithVariableReturns(inputs: RetirementInputs): DeterministicProjection {
   const annualReturns = generateAnnualReturns(inputs).map((generatedReturn, index) =>
     inputs.assumptions.annualReturnOverrides[inputs.personalInfo.currentAge + index] ?? generatedReturn,

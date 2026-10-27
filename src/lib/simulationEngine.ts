@@ -3,6 +3,7 @@ import type {
   AccountWithdrawals,
   ContributionSchedule,
   DeterministicProjection,
+  ForecastRevision,
   GicBufferSettings,
   GicFundingSource,
   GicHolding,
@@ -11,6 +12,7 @@ import type {
   IncomeBySource,
   IncomeStream,
   ProvinceCode,
+  ProjectionBalanceOverride,
   RetirementInputs,
   SubPeriodProjection,
   TaxJurisdictionSettings,
@@ -22,6 +24,8 @@ import type {
   YearProjection,
 } from "@/types/retirement";
 import { defaultTaxSettings } from "@/lib/taxRules";
+import { parsePlanDate, planDateFor } from "@/lib/planDates";
+import { withAccountBalances } from "@/lib/accounts";
 import {
   calculateCppAnnualBenefit,
   calculateOasAnnualBenefit,
@@ -98,7 +102,7 @@ function withdrawFromState(state: PersonYearState, account: WithdrawalAccount, a
   const registeredBalance = balances.gicPositions.filter((position) => position.fundingSource === "registered").reduce((sum, position) => sum + position.balance, 0);
   const registeredRatio = registeredOnly ? 1 : balances.interestBearing > 0 ? registeredBalance / balances.interestBearing : 0;
   const interestRatio = !registeredOnly && balances.interestBearing > 0
-    ? balances.gicPositions.filter((position) => position.fundingSource !== "registered").reduce((sum, position) => sum + position.accrued, 0) / balances.interestBearing : 0;
+    ? balances.gicPositions.filter((position) => position.fundingSource !== "registered" && position.fundingSource !== "tfsa").reduce((sum, position) => sum + position.accrued, 0) / balances.interestBearing : 0;
   const nextBalances = removeWithdrawal(balances, account, amount);
   if (registeredOnly && account === "interestBearing") {
     nextBalances.gicPositions = balances.gicPositions.map((position) => position.fundingSource === "registered" ? {
@@ -221,13 +225,86 @@ function assessHousehold(states: PersonYearState[], inputs: RetirementInputs, in
 
 export type ProjectionOptions = {
   calendarYear?: number;
+  valuationDate?: Date;
   pensionSplittingPolicy?: PensionSplittingPolicy;
   fastWithdrawalSizing?: boolean;
   annualReturns?: number[];
   annualInflation?: number[];
+  balanceOverrides?: ProjectionBalanceOverride[];
+  checkpointDates?: string[];
+  forecastRevisions?: ForecastRevision[];
   // Per year index, the realized return for each sub-period (month/quarter/half) when withdrawalFrequency isn't "annual". Falls back to an internally generated split if omitted.
   subPeriodReturns?: number[][];
 };
+
+export function forecastInputsForYear(inputs: RetirementInputs, revisions: ForecastRevision[], calendarYear: number): RetirementInputs {
+  const revision = revisions.filter((entry) => entry.effectiveDate <= `${calendarYear}-01-01`)
+    .sort((first, second) => first.effectiveDate.localeCompare(second.effectiveDate) || first.createdAt.localeCompare(second.createdAt)).at(-1);
+  if (!revision) return inputs;
+  return {
+    ...inputs, ...revision.settings,
+    personalInfo: {
+      ...inputs.personalInfo,
+      rrifConversionAge: revision.rrifConversionAges ? revision.rrifConversionAges.primary : inputs.personalInfo.rrifConversionAge,
+      additionalPeople: inputs.personalInfo.additionalPeople.map((person) => ({ ...person, rrifConversionAge: revision.rrifConversionAges ? revision.rrifConversionAges[person.id] : person.rrifConversionAge })),
+    },
+  };
+}
+
+type DatedBalanceOverride = { override: ProjectionBalanceOverride; date: Date; fraction: number };
+type BalanceCheckpoint = { fraction: number; capture: (balances: Record<string, AccountBalances>) => void };
+
+function applyBalanceOverride(balancesByPerson: Record<string, AccountBalances>, override: ProjectionBalanceOverride, roster: PersonRoster[]) {
+  const next = { ...balancesByPerson };
+  for (const [personId, observed] of Object.entries(override.people)) {
+    const balances = balancesByPerson[personId];
+    const person = roster.find((person) => person.id === personId);
+    if (!balances || !person) throw new Error("Actual balances refer to an unknown person.");
+    if ([observed.rrsp, observed.tfsa, observed.nonRegistered, ...Object.values(observed.gics)].some((value) => !Number.isFinite(value) || value < 0)) throw new Error("Actual balances must be finite and non-negative.");
+    const positions = balances.gicPositions.filter((position) => !(position.id in observed.gics)).map((position) => ({ ...position }));
+    for (const [holdingId, balance] of Object.entries(observed.gics)) {
+      const current = balances.gicPositions.find((position) => position.id === holdingId);
+      const config = person.gicConfigs.find((config) => config.id === holdingId);
+      if (!current && !config) throw new Error("Actual balances refer to an unknown fixed-rate holding.");
+      if (!current && balance === 0) continue;
+      positions.push({
+        ...(current ?? { id: holdingId, balance: 0, accrued: 0, termElapsed: 0, termYears: config!.termYears, annualRate: config!.annualRate, fundingSource: config!.fundingSource, maturityAction: config!.maturityAction }),
+        balance,
+        accrued: current && current.balance > 0 ? current.accrued * balance / current.balance : 0,
+      });
+    }
+    next[personId] = {
+      ...cloneBalances(balances), rrsp: observed.rrsp, tfsa: observed.tfsa, nonRegistered: observed.nonRegistered,
+      gicPositions: positions, interestBearing: positions.reduce((total, position) => total + position.balance, 0),
+      interestBearingAccrued: positions.reduce((total, position) => total + position.accrued, 0),
+      taxableInterestBearingAccrued: positions.reduce((total, position) => total + (position.fundingSource === "registered" || position.fundingSource === "tfsa" ? 0 : position.accrued), 0),
+    };
+  }
+  return next;
+}
+
+function growWithBalanceOverrides(balances: Record<string, AccountBalances>, portfolioReturn: number, start: number, end: number, overrides: DatedBalanceOverride[], roster: PersonRoster[], checkpoints: BalanceCheckpoint[] = []) {
+  let next = balances;
+  let cursor = start;
+  const duration = end - start;
+  const growTo = (target: number) => {
+    for (const checkpoint of checkpoints.filter((checkpoint) => checkpoint.fraction >= cursor && checkpoint.fraction <= target)) {
+      const elapsed = Math.max(0, checkpoint.fraction - cursor);
+      const growth = elapsed === 0 ? 0 : elapsed === duration ? portfolioReturn : Math.max(0, 1 + portfolioReturn) ** (elapsed / duration) - 1;
+      checkpoint.capture(Object.fromEntries(Object.entries(next).map(([personId, balances]) => [personId, applyAnnualReturn(balances, growth, elapsed)])));
+    }
+    const fraction = Math.max(0, target - cursor);
+    const growth = fraction === 0 ? 0 : fraction === duration ? portfolioReturn : Math.max(0, 1 + portfolioReturn) ** (fraction / duration) - 1;
+    next = Object.fromEntries(Object.entries(next).map(([personId, balances]) => [personId, applyAnnualReturn(balances, growth, fraction)]));
+    cursor = target;
+  };
+  for (const event of overrides) {
+    growTo(event.fraction);
+    next = applyBalanceOverride(next, event.override, roster);
+  }
+  growTo(end);
+  return next;
+}
 
 export function subPeriodsPerYear(frequency: WithdrawalFrequency | undefined): number {
   switch (frequency) {
@@ -397,10 +474,31 @@ export function projectRetirementPlan(
   inputs: RetirementInputs,
   options: ProjectionOptions = {},
 ): DeterministicProjection {
-  const baseYear = options.calendarYear ?? new Date().getFullYear();
+  inputs = withAccountBalances(inputs);
+  const baseInputs = inputs;
+  const valuationDate = options.valuationDate ?? (options.calendarYear === undefined ? planDateFor(inputs) : new Date(options.calendarYear, 0, 1));
+  const baseYear = valuationDate.getFullYear();
+  const daysInMonth = new Date(baseYear, valuationDate.getMonth() + 1, 0).getDate();
+  const elapsedMonths = valuationDate.getMonth() + (valuationDate.getDate() - 1) / daysInMonth;
   const years: YearProjection[] = [];
   const roster = buildRoster(inputs);
   let balancesByPerson = initialBalancesByPerson(inputs, roster);
+  const balanceEvents: DatedBalanceOverride[] = (options.balanceOverrides ?? []).map((override) => {
+    const date = parsePlanDate(override.date);
+    if (!date || date < valuationDate) throw new Error("Actual balance dates must be on or after the plan date.");
+    const days = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+    return { override, date, fraction: (date.getMonth() + date.getDate() / days) / 12 };
+  }).sort((first, second) => first.date.getTime() - second.date.getTime());
+  for (const event of balanceEvents.filter((event) => event.date.getTime() === valuationDate.getTime())) balancesByPerson = applyBalanceOverride(balancesByPerson, event.override, roster);
+  const capturedBalances = new Map<string, Record<string, number>>();
+  const checkpoints = [...new Set(options.checkpointDates ?? [])].map((value) => {
+    const date = parsePlanDate(value);
+    if (!date || date < valuationDate) throw new Error("Forecast checkpoints must be on or after the plan date.");
+    const days = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+    return { date, fraction: (date.getMonth() + date.getDate() / days) / 12,
+      capture: (balances: Record<string, AccountBalances>) => capturedBalances.set(value, Object.fromEntries(Object.entries(balances).map(([personId, balance]) => [personId, totalPortfolio(balance)]))) };
+  });
+  for (const checkpoint of checkpoints.filter((checkpoint) => checkpoint.date.getTime() === valuationDate.getTime())) checkpoint.capture(balancesByPerson);
   const startedGicIds = startedGicIdsSeed(roster);
   let cumulativeInflation = 1;
   // Streams with "partialInflation"/"fixedRate" indexing compound independently of the shared inflation multiplier.
@@ -411,7 +509,6 @@ export function projectRetirementPlan(
   let peakValue = totalPortfolioAcross(balancesByPerson);
   let portfolioPeakAge = inputs.personalInfo.currentAge;
   let portfolioDepleted = false;
-  const gicBufferSettings: GicBufferSettings | undefined = inputs.strategy.gicBuffer;
   // Tracks the market's own performance, isolated from contributions/withdrawals (like a fund's NAV), so decumulation itself
   // is never mistaken for a market drawdown - only actual negative returns move this index down from its peak.
   let marketIndex = 1;
@@ -422,14 +519,6 @@ export function projectRetirementPlan(
   const maxLifespanIndex = Math.max(...roster.map((person) => person.targetDeathAge - person.currentAge));
   const finalAge = inputs.personalInfo.currentAge + maxLifespanIndex;
   const livingIds = new Set(roster.map((person) => person.id));
-  const fallbackRetirementAge = Math.min(
-    ...inputs.spendingPlan.phases.map((phase) => phase.startAge),
-    finalAge + 1,
-  );
-  const householdRetirement = householdRetirementDate(inputs, roster, fallbackRetirementAge);
-  const retirementStartAge = householdRetirement.age;
-  const retirementStartMonth = householdRetirement.month;
-  const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
   // Used only when the caller doesn't supply pre-generated subPeriodReturns, so a bare projectRetirementPlan(inputs) call is still deterministic per seed.
   const fallbackRandom = createFallbackRandom(inputs.simulation.randomSeed);
 
@@ -438,6 +527,16 @@ export function projectRetirementPlan(
     index <= maxLifespanIndex;
     age += 1, index += 1
   ) {
+    inputs = forecastInputsForYear(baseInputs, options.forecastRevisions ?? [], baseYear + index);
+    const gicBufferSettings: GicBufferSettings | undefined = inputs.strategy.gicBuffer;
+    const fallbackRetirementAge = Math.min(...inputs.spendingPlan.phases.map((phase) => phase.startAge), finalAge + 1);
+    const householdRetirement = householdRetirementDate(inputs, roster, fallbackRetirementAge);
+    const retirementStartAge = householdRetirement.age;
+    const retirementStartMonth = householdRetirement.month;
+    const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
+    for (const stream of inputs.incomeStreams) streamIndexMultipliers[stream.id] ??= 1;
+    const yearBalanceEvents = balanceEvents.filter((event) => event.date.getFullYear() === baseYear + index && event.date.getTime() !== valuationDate.getTime());
+    const yearCheckpoints = checkpoints.filter((checkpoint) => checkpoint.date.getFullYear() === baseYear + index && checkpoint.date.getTime() !== valuationDate.getTime());
     const openingBalancesByPerson = mapValues(balancesByPerson, cloneBalances);
     const inflationRate = options.annualInflation?.[index] ?? inputs.assumptions.inflationMean;
     const portfolioReturn = options.annualReturns?.[index] ?? inputs.assumptions.returnMean;
@@ -445,6 +544,17 @@ export function projectRetirementPlan(
       ? [portfolioReturn]
       : options.subPeriodReturns?.[index]
         ?? decomposeAnnualReturn(fallbackRandom, portfolioReturn, subPeriodCount, inputs.assumptions.returnStdDev);
+    const periodGrowthFractions = periodReturns.map((_, period) => {
+      if (index > 0) return 1 / periodReturns.length;
+      const periodEnd = (period + 1) / periodReturns.length;
+      return Math.max(0, periodEnd - Math.max(period / periodReturns.length, elapsedMonths / 12));
+    });
+    const appliedPeriodReturns = periodReturns.map((periodReturn, period) => {
+      const fraction = periodGrowthFractions[period] * periodReturns.length;
+      return fraction === 0 ? 0 : fraction === 1 ? periodReturn : Math.max(0, 1 + periodReturn) ** fraction - 1;
+    });
+    const appliedPortfolioReturn = appliedPeriodReturns.length === 1 ? appliedPeriodReturns[0]
+      : appliedPeriodReturns.reduce((multiplier, periodReturn) => multiplier * (1 + periodReturn), 1) - 1;
     const activePhase = inputs.spendingPlan.phases.find(
       (phase) => age >= phase.startAge && age <= phase.endAge,
     );
@@ -471,7 +581,7 @@ export function projectRetirementPlan(
         gicRefillCap = Math.max(0, target - currentGicTotal);
       }
     }
-    marketIndex *= 1 + portfolioReturn;
+    marketIndex *= 1 + appliedPortfolioReturn;
     marketIndexPeak = Math.max(marketIndexPeak, marketIndex);
 
     const result = fundHousehold(
@@ -486,7 +596,10 @@ export function projectRetirementPlan(
       age,
       baseYear + index,
       portfolioReturn,
-      periodReturns,
+      appliedPeriodReturns,
+      periodGrowthFractions,
+      yearBalanceEvents,
+      yearCheckpoints,
       withdrawalOrderForYear,
       gicRefillCap,
       startedGicIds,
@@ -500,12 +613,8 @@ export function projectRetirementPlan(
     // With sub-annual withdrawals, growth was already applied period-by-period inside fundHousehold; annual mode still grows once, after the single withdrawal pass.
     balancesByPerson = result.growthAlreadyApplied
       ? result.balancesByPerson
-      : Object.fromEntries(
-        Object.entries(result.balancesByPerson).map(([personId, balances]) => [
-          personId,
-          applyAnnualReturn(balances, portfolioReturn, 1),
-        ]),
-      );
+      : growWithBalanceOverrides(result.balancesByPerson, appliedPortfolioReturn, 1 - periodGrowthFractions[0], 1, yearBalanceEvents.filter((event) => event.fraction < 1), roster, yearCheckpoints.filter((checkpoint) => checkpoint.fraction < 1));
+    for (const event of yearBalanceEvents.filter((event) => event.fraction === 1)) balancesByPerson = applyBalanceOverride(balancesByPerson, event.override, roster);
     let estateValue = totalPortfolioAcross(balancesByPerson);
     const yearTax = result.tax.totalTax;
     let yearEstateTax = 0;
@@ -525,7 +634,8 @@ export function projectRetirementPlan(
         yearEstateTax = dyingThisYear.reduce((sum, person) => sum + calculateTax(
           {
             // Any deferred (not-yet-matured) GIC/PPN growth is deemed realized at death, same as the RRSP.
-            ordinaryIncome: balancesByPerson[person.id].rrsp + balancesByPerson[person.id].interestBearingAccrued,
+            ordinaryIncome: balancesByPerson[person.id].rrsp + balancesByPerson[person.id].gicPositions.reduce((total, position) => total
+              + (position.fundingSource === "registered" ? position.balance : position.fundingSource === "tfsa" ? 0 : position.accrued), 0),
             capitalGains: Math.max(0, balancesByPerson[person.id].nonRegistered - balancesByPerson[person.id].nonRegisteredBookValue),
             eligibleDividends: 0,
             nonEligibleDividends: 0,
@@ -541,6 +651,7 @@ export function projectRetirementPlan(
 
     lifetimeTax += yearTax + yearEstateTax;
     const closingBalancesByPerson = mapValues(balancesByPerson, cloneBalances);
+    for (const checkpoint of yearCheckpoints.filter((checkpoint) => checkpoint.fraction === 1)) checkpoint.capture(closingBalancesByPerson);
     const currentPortfolio = totalPortfolioAcross(closingBalancesByPerson);
     if (currentPortfolio > peakValue) {
       peakValue = currentPortfolio;
@@ -552,6 +663,8 @@ export function projectRetirementPlan(
     years.push({
       age,
       calendarYear: baseYear + index,
+      portfolioByPerson: Object.fromEntries(Object.entries(closingBalancesByPerson).map(([personId, balances]) => [personId, totalPortfolio(balances)])),
+      periodReturns: [...periodReturns],
       openingBalances: sumBalances(openingBalancesByPerson),
       closingBalances: sumBalances(closingBalancesByPerson),
       income: result.income,
@@ -585,6 +698,7 @@ export function projectRetirementPlan(
 
   return {
     years,
+    ...(options.checkpointDates ? { balanceCheckpoints: [...capturedBalances].sort(([first], [second]) => first.localeCompare(second)).map(([date, portfolioByPerson]) => ({ date, portfolioByPerson })) } : {}),
     finalEstateValue: years.at(-1)?.estateValue ?? 0,
     lifetimeTax,
     portfolioPeakAge,
@@ -734,6 +848,9 @@ function fundHousehold(
   calendarYear: number,
   portfolioReturn: number,
   periodReturns: number[],
+  periodGrowthFractions: number[],
+  balanceEvents: DatedBalanceOverride[],
+  checkpoints: BalanceCheckpoint[],
   withdrawalOrder: WithdrawalAccount[],
   gicRefillCap: number,
   startedGicIds: Set<string>,
@@ -743,7 +860,7 @@ function fundHousehold(
   fastWithdrawalSizing: boolean,
 ) {
   const useHouseholdTax = Boolean(inputs.strategy.taxAwareWithdrawals || inputs.strategy.pensionIncomeSplitting?.enabled
-    || inputs.personalInfo.rrifConversionAge !== undefined || inputs.personalInfo.additionalPeople?.some((person) => person.rrifConversionAge !== undefined));
+    || roster.some((person) => person.currentAge + yearIndex >= rrifConversionAgeFor(inputs, person.id)));
   const states: PersonYearState[] = roster.map((person) => {
     const fixed = personFixedIncome(inputs, person, yearIndex, calendarYear, inflationMultiplier, streamIndexMultipliers);
     const opening = balancesByPerson[person.id];
@@ -751,9 +868,12 @@ function fundHousehold(
     // Only non-registered GIC growth is taxable; registered GIC growth remains tax-sheltered.
     let totalInterestIncome = 0;
     let cashedOutTotal = 0;
+    let cashedOutRegistered = 0;
+    let cashedOutTfsa = 0;
+    const growthFraction = periodGrowthFractions.reduce((sum, fraction) => sum + fraction, 0);
     const grownPositions: GicPositionState[] = [];
     for (const position of opening.gicPositions) {
-      const growth = position.balance * Math.max(0, position.annualRate);
+      const growth = position.balance * ((1 + Math.max(0, position.annualRate)) ** growthFraction - 1);
       const accruedAfterGrowth = position.accrued + growth;
       const termElapsed = position.termElapsed + 1;
       const maturityReached = termElapsed >= position.termYears;
@@ -761,9 +881,11 @@ function fundHousehold(
         grownPositions.push({ ...position, accrued: accruedAfterGrowth, termElapsed });
         continue;
       }
-      if (position.fundingSource !== "registered") totalInterestIncome += accruedAfterGrowth;
+      if (position.fundingSource !== "registered" && position.fundingSource !== "tfsa") totalInterestIncome += accruedAfterGrowth;
       if (position.maturityAction === "cashOut") {
-        cashedOutTotal += position.balance;
+        if (position.fundingSource === "registered") cashedOutRegistered += position.balance;
+        else if (position.fundingSource === "tfsa") cashedOutTfsa += position.balance;
+        else cashedOutTotal += position.balance;
       } else {
         grownPositions.push({ ...position, accrued: 0, termElapsed: 0 });
       }
@@ -777,10 +899,10 @@ function fundHousehold(
         gicPositions: grownPositions,
         interestBearing: grownPositions.reduce((sum, position) => sum + position.balance, 0),
         interestBearingAccrued: grownPositions.reduce((sum, position) => sum + position.accrued, 0),
-        taxableInterestBearingAccrued: grownPositions.reduce((sum, position) => sum + (position.fundingSource === "registered" ? 0 : position.accrued), 0),
+        taxableInterestBearingAccrued: grownPositions.reduce((sum, position) => sum + (position.fundingSource === "registered" || position.fundingSource === "tfsa" ? 0 : position.accrued), 0),
         // Contributions from income streams (e.g. salary deductions) land directly in the relevant account.
-        rrsp: opening.rrsp + fixed.rrspContribution + (periodReturns.length <= 1 ? fixed.monthlyRrspContribution * 12 : 0),
-        tfsa: opening.tfsa + fixed.tfsaContribution + (periodReturns.length <= 1 ? fixed.monthlyTfsaContribution * 12 : 0),
+        rrsp: opening.rrsp + fixed.rrspContribution + (periodReturns.length <= 1 ? fixed.monthlyRrspContribution * 12 : 0) + cashedOutRegistered,
+        tfsa: opening.tfsa + fixed.tfsaContribution + (periodReturns.length <= 1 ? fixed.monthlyTfsaContribution * 12 : 0) + cashedOutTfsa,
         nonRegistered: opening.nonRegistered + fixed.nonRegisteredContribution + (periodReturns.length <= 1 ? fixed.monthlyNonRegisteredContribution * 12 : 0) + cashedOutTotal,
         nonRegisteredBookValue: opening.nonRegisteredBookValue + fixed.nonRegisteredContribution + (periodReturns.length <= 1 ? fixed.monthlyNonRegisteredContribution * 12 : 0) + cashedOutTotal,
       },
@@ -793,7 +915,7 @@ function fundHousehold(
       monthlyNonRegisteredContribution: fixed.monthlyNonRegisteredContribution,
       eligiblePensionIncome: fixed.eligiblePensionIncome,
       eligibleRrifWithdrawals: person.currentAge + yearIndex >= 65
-        && person.currentAge + yearIndex >= (rrifConversionAgeFor(inputs, person.id) ?? 71),
+        && person.currentAge + yearIndex >= rrifConversionAgeFor(inputs, person.id),
       withdrawalTaxable: useHouseholdTax ? { ordinaryIncome: 0, capitalGains: 0 } : undefined,
       tax: calculateTax(fixedTaxable, inputs.personalInfo.province, inputs.simulation.capitalGainsInclusionRate, inputs.taxSettings),
     };
@@ -954,8 +1076,13 @@ function fundHousehold(
         state.balances.tfsa += state.monthlyTfsaContribution * periodContributionFactor;
         state.balances.nonRegistered += state.monthlyNonRegisteredContribution * periodContributionFactor;
         state.balances.nonRegisteredBookValue += state.monthlyNonRegisteredContribution * periodContributionFactor;
-        state.balances = applyAnnualReturn(state.balances, periodReturns[period], 1 / subPeriodCount);
       }
+      const periodEnd = (period + 1) / subPeriodCount;
+      const periodStart = periodEnd - periodGrowthFractions[period];
+      const withinPeriod = balanceEvents.filter((event) => event.fraction > periodStart && event.fraction < periodEnd);
+      const periodCheckpoints = checkpoints.filter((checkpoint) => checkpoint.fraction > periodStart && checkpoint.fraction < periodEnd);
+      const grown = growWithBalanceOverrides(Object.fromEntries(states.map((state) => [state.id, state.balances])), periodReturns[period], periodStart, periodEnd, withinPeriod, roster, periodCheckpoints);
+      for (const state of states) state.balances = grown[state.id];
       const withdrawalsBefore = new Map(states.map((state) => [state.id, { ...state.withdrawals }]));
       // Mandatory RRIF minimum installments are spread evenly across periods (matches how real RRIF minimums are usually paid out) instead of vanishing from the monthly breakdown as one hidden annual lump.
       for (const state of states) withdrawRrifMinimum(state, (rrifMinimumByState.get(state.id) ?? 0) / subPeriodCount);
@@ -991,6 +1118,11 @@ function fundHousehold(
           );
         }
       }
+      for (const event of balanceEvents.filter((event) => event.fraction === periodEnd && event.fraction < 1)) {
+        const observed = applyBalanceOverride(Object.fromEntries(states.map((state) => [state.id, state.balances])), event.override, roster);
+        for (const state of states) state.balances = observed[state.id];
+      }
+      for (const checkpoint of checkpoints.filter((checkpoint) => checkpoint.fraction === periodEnd && checkpoint.fraction < 1)) checkpoint.capture(Object.fromEntries(states.map((state) => [state.id, state.balances])));
       const periodWithdrawals = states.reduce((total, state) => {
         const before = withdrawalsBefore.get(state.id)!;
         return {
@@ -1186,13 +1318,23 @@ function fundHousehold(
   const taxesByPerson = states.map((state, index) => ({
     id: state.id,
     label: roster.find((person) => person.id === state.id)?.label ?? state.id,
+    employmentIncome: state.income.employment,
+    cppIncome: state.income.cpp,
+    oasIncome: state.income.oas,
+    taxableIncome: state.tax.taxableIncome,
     federalTax: state.tax.federalTax,
     provincialTax: state.tax.provincialTax,
     totalTax: state.tax.totalTax,
     pensionSplitTransfer: finalAssessment?.people[index].transfer,
     oasClawback: finalAssessment?.people[index].oasClawback,
     oasRecoveryIncome: finalAssessment?.people[index].oasRecoveryIncome,
-    rrspWithdrawals: state.withdrawals.rrsp,
+    rrspWithdrawals: state.income.rrspWithdrawal + state.withdrawals.rrsp,
+    tfsaWithdrawals: state.income.tfsaWithdrawal + state.withdrawals.tfsa,
+    nonRegisteredWithdrawals: state.income.nonRegisteredWithdrawal + state.withdrawals.nonRegistered,
+    interestBearingWithdrawals: state.income.interestBearingWithdrawal + state.withdrawals.interestBearing,
+    totalFunding: cashFromIncome(state.income) + sumWithdrawals(state.withdrawals),
+    contributions: state.cashContribution,
+    netCash: cashFromIncome(state.income) + sumWithdrawals(state.withdrawals) - state.cashContribution - state.tax.totalTax,
   }));
 
   return {
@@ -1262,7 +1404,7 @@ function combineTax(results: TaxResult[]): TaxResult {
   const dividendTaxCredit = results.reduce((sum, result) => sum + result.dividendTaxCredit, 0);
   const capitalGainsTaxableAmount = results.reduce((sum, result) => sum + result.capitalGainsTaxableAmount, 0);
   const marginalRate = results.reduce((max, result) => Math.max(max, result.marginalRate), 0);
-  const totalTaxableIncome = results.reduce((sum, result) => sum + (result.averageRate === 0 ? 0 : result.totalTax / result.averageRate), 0);
+  const totalTaxableIncome = results.reduce((sum, result) => sum + result.taxableIncome, 0);
   return {
     federalTax,
     provincialTax,
@@ -1270,6 +1412,7 @@ function combineTax(results: TaxResult[]): TaxResult {
     capitalGainsTaxableAmount,
     totalTax,
     marginalRate,
+    taxableIncome: totalTaxableIncome,
     averageRate: totalTaxableIncome === 0 ? 0 : totalTax / totalTaxableIncome,
   };
 }
@@ -1394,10 +1537,10 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
   return { income, taxableIncome, rrspContribution, tfsaContribution, nonRegisteredContribution, cashContribution, monthlyRrspContribution, monthlyTfsaContribution, monthlyNonRegisteredContribution, eligiblePensionIncome };
 }
 
-function rrifConversionAgeFor(inputs: RetirementInputs, personId: string): number | undefined {
+function rrifConversionAgeFor(inputs: RetirementInputs, personId: string): number {
   const value = personId === "primary" ? inputs.personalInfo.rrifConversionAge
     : inputs.personalInfo.additionalPeople?.find((person) => person.id === personId)?.rrifConversionAge;
-  return value === undefined ? undefined : Math.max(0, Math.min(71, Math.round(value)));
+  return value === undefined ? 71 : Math.max(0, Math.min(71, Math.round(value)));
 }
 
 function incomeProrationFraction(
@@ -1501,6 +1644,7 @@ export function calculateTax(
     capitalGainsTaxableAmount,
     totalTax,
     marginalRate,
+    taxableIncome: totalTaxableIncome,
     averageRate: totalTaxableIncome === 0 ? 0 : totalTax / totalTaxableIncome,
   };
 }
@@ -1548,7 +1692,8 @@ function taxableIncomeForYear(
   // Cashing out early crystallizes a proportional share of the still-deferred (untaxed) growth for that term.
   const interestBearingAccruedRatio = startingBalances.interestBearing <= 0
     ? 0
-    : startingBalances.taxableInterestBearingAccrued / startingBalances.interestBearing;
+    : (startingBalances.taxableInterestBearingAccrued + startingBalances.gicPositions.filter((position) => position.fundingSource === "registered")
+      .reduce((total, position) => total + position.balance, 0)) / startingBalances.interestBearing;
   return {
     ...fixedTaxable,
     ordinaryIncome: fixedTaxable.ordinaryIncome + withdrawals.rrsp + withdrawals.interestBearing * interestBearingAccruedRatio,

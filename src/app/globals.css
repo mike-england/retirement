@@ -129,3 +129,160 @@ button, input, select { font: inherit; } button { cursor: pointer; }
 .monte-carlo-progress-accessible { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 @keyframes monte-carlo-orbit { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .monte-carlo-spinner-arc { animation: none; } .monte-carlo-spinner-arc:nth-child(2) { transform: rotate(120deg); } .monte-carlo-spinner-arc:nth-child(3) { transform: rotate(240deg); } }
+
+.planner-shell--accounts { overflow-x: clip; }
+.planner-layout--accounts .view-tabs { min-width: 0; overflow-x: auto; }
+.planner-layout--accounts .view-tabs button { flex-shrink: 0; white-space: nowrap; }
+.accounts-view { min-width: 0; font-family: Arial, sans-serif; }
+.accounts-total-band { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0 14px; border-bottom: 2px solid var(--ink); }
+.accounts-total-band > div { display: grid; gap: 6px; }
+.accounts-total-band span, .accounts-person-heading span { color: var(--muted); font-size: 12px; }
+.accounts-total-band output { color: var(--green); font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.accounts-person { padding: 16px 0; border-bottom: 1px solid var(--line); }
+.accounts-person-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 8px; }
+.accounts-person-heading > div { flex: 1; min-width: 120px; overflow-wrap: anywhere; }
+.accounts-person-heading h2 { font-size: 16px; line-height: 1.4; }
+.accounts-person-heading output { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.accounts-add { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 28px; }
+.accounts-table-wrap { width: 100%; overflow-x: auto; }
+.accounts-table { width: 800px; min-width: 800px; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
+.accounts-table th { padding: 6px 8px; color: var(--muted); background: #edf3f8; text-align: left; font-size: 11px; font-weight: 700; }
+.accounts-table thead th:first-child { width: 230px; }
+.accounts-table thead th:nth-child(2) { width: 130px; }
+.accounts-table thead th:nth-child(3) { width: 160px; }
+.accounts-table thead th:nth-child(4) { width: 200px; }
+.accounts-table thead th:last-child { width: 80px; }
+.accounts-table td { padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.accounts-table input, .accounts-table select { width: 100%; min-width: 0; height: 28px; padding: 0 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); color: var(--ink); font-size: 12px; }
+.accounts-table .number-input { height: 28px; }
+.accounts-table .number-input input { height: 26px; border: 0; }
+.accounts-table .field-label { gap: 0; }
+.accounts-table tfoot th, .accounts-table tfoot td { border-bottom: 0; background: transparent; padding-top: 8px; color: var(--ink); font-size: 12px; font-weight: 700; }
+.accounts-table tfoot td { font-variant-numeric: tabular-nums; }
+.accounts-person-total { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; text-transform: none; }
+.accounts-person-total output { font-variant-numeric: tabular-nums; }
+.accounts-row-actions { display: flex; gap: 5px; }
+.accounts-icon { display: grid; flex: 0 0 28px; width: 28px; height: 28px; place-items: center; padding: 0; }
+.accounts-icon:disabled { visibility: hidden; }
+.accounts-name-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.accounts-drag-handle { display: grid; flex: 0 0 24px; width: 24px; height: 28px; place-items: center; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: grab; touch-action: none; user-select: none; }
+.accounts-drag-handle:hover, .accounts-drag-handle:focus-visible { background: var(--line); color: var(--ink); }
+.accounts-drag-handle:active { cursor: grabbing; }
+.accounts-dragging { position: relative; z-index: 1; background: var(--paper); opacity: .7; }
+.accounts-chevron-open { transform: rotate(180deg); }
+.accounts-table .accounts-empty { padding: 14px 8px; color: var(--muted); }
+.accounts-details-row > td { background: #f7f9fc; padding: 10px 8px; }
+.accounts-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 220px)); gap: 10px; }
+.accounts-details .field-label { gap: 4px; }
+.accounts-person-settings { max-width: 260px; margin-top: 10px; }
+.accounts-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.ledger-funding-table thead tr:first-child th:not(:first-child) { text-align: center; }
+.ledger-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.ledger-recalculate { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.ledger-funding-table td:nth-child(9), .ledger-funding-table td:nth-child(12) { background: #edf3f8; }
+.ledger-funding-table td:last-child, .ledger-funding-table th:last-child { border-left: 1px solid var(--line); }
+.ledger-funding-table tfoot th, .ledger-funding-table tfoot td { padding-top: 9px; border-top: 1px solid var(--line); font-weight: 700; }
+.actuals-view { min-width: 0; font-family: Arial, sans-serif; }
+.working-forecast-bar { position: relative; display: grid; gap: 10px; padding: 12px 0 16px; margin-bottom: 16px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); font-family: Arial, sans-serif; }
+.working-forecast-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; padding-right: 110px; }
+.working-forecast-status strong { color: var(--green); font-size: 13px; }
+.working-forecast-status span, .working-forecast-status small { color: var(--muted); font-size: 11px; }
+.working-forecast-status small { flex-basis: 100%; }
+.working-forecast-revision summary, .working-forecast-history summary { width: fit-content; color: var(--blue); cursor: pointer; font-size: 12px; }
+.working-forecast-fields { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; padding-top: 12px; }
+.working-forecast-fields .field-label { width: 180px; }
+.working-forecast-fields input, .working-forecast-fields select { min-width: 0; height: 30px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); color: var(--ink); padding: 0 8px; font-size: 12px; }
+.working-forecast-command { display: inline-flex; align-items: center; gap: 6px; }
+.working-forecast-command:disabled { opacity: .5; cursor: default; }
+.working-forecast-revision p { max-width: 760px; margin: 10px 0 0; font-size: 11px; line-height: 1.5; }
+.working-forecast-history summary { display: flex; align-items: center; gap: 6px; }
+.working-forecast-history ul { display: grid; gap: 6px; margin: 10px 0 0; padding: 0; list-style: none; }
+.working-forecast-history li { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 11px; color: var(--muted); }
+.working-forecast-history li strong { color: var(--ink); }
+.working-forecast-source { position: absolute; top: 12px; right: 0; font-size: 10px; }
+.view-tabs { min-width: 0; max-width: 100%; overflow-x: auto; }
+.view-tabs button { flex-shrink: 0; white-space: nowrap; }
+.planner-shell--actuals { overflow-x: clip; }
+.actuals-baseline-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; padding: 0 0 18px; border-bottom: 1px solid var(--line); }
+.actuals-baseline-bar > .field-label { width: 200px; }
+.actuals-baseline-bar > .field-label:first-child { width: 240px; }
+.actuals-view .field-label, .actuals-scope { min-width: 0; color: var(--muted); font-size: 11px; font-weight: 600; }
+.actuals-view input, .actuals-view select { min-width: 0; height: 32px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); color: var(--ink); font-size: 12px; padding: 0 8px; }
+.actuals-command { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; }
+.actuals-command:disabled { opacity: .5; cursor: default; }
+.actuals-baseline-stamp { display: flex; align-items: center; gap: 8px; margin-left: auto; padding-bottom: 3px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.actuals-baseline-stamp small { display: block; font-size: 10px; }
+.actuals-empty-state { display: grid; justify-items: start; align-content: start; gap: 10px; min-height: 260px; padding: 44px 0; color: var(--muted); }
+.actuals-empty-state h2 { margin: 0; color: var(--ink); font-size: 18px; }
+.actuals-empty-state p { margin: 0; }
+.actuals-overview-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 0 12px; }
+.actuals-overview-heading h2 { font-size: 15px; }
+.actuals-scope { display: flex; align-items: center; gap: 8px; }
+.actuals-scope select { width: 160px; }
+.actuals-range { margin-left: auto; }
+.actuals-range select { width: 100px; }
+.actuals-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 0 0 16px; border-bottom: 1px solid var(--line); }
+.actuals-metrics > div { min-width: 0; padding: 0 18px; border-right: 1px solid var(--line); }
+.actuals-metrics > div:first-child { padding-left: 0; }
+.actuals-metrics > div:last-child { padding-right: 0; border-right: 0; }
+.actuals-metrics span { display: block; margin-bottom: 6px; color: var(--muted); font-size: 11px; }
+.actuals-metrics strong { display: block; font-size: 23px; font-weight: 600; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.actuals-metrics small { display: block; margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.actuals-chart { min-width: 0; margin-top: 16px; }
+.actuals-chart-status { display: flex; flex-wrap: wrap; gap: 6px 16px; min-height: 24px; padding: 0 0 8px; color: var(--muted); font-size: 11px; }
+.actuals-section-tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--line); }
+.actuals-section-tabs button { padding: 11px 0; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 12px; font-weight: 700; }
+.actuals-section-tabs button[aria-selected="true"] { color: var(--blue); border-bottom-color: var(--blue); }
+.actuals-section-tabs span { display: inline-block; margin-left: 4px; font-size: 10px; color: var(--muted); }
+.actuals-entry-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; padding: 16px 0; }
+.actuals-entry-toolbar > .field-label { width: 155px; }
+.actuals-table-wrap { width: 100%; overflow-x: auto; }
+.actuals-balance-table, .actuals-history-table { width: 100%; min-width: 620px; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.actuals-balance-table th, .actuals-history-table th { padding: 9px 10px; background: #edf3f8; color: var(--muted); text-align: left; font-size: 10px; }
+.actuals-balance-table td, .actuals-history-table td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+.actuals-balance-table td:last-child, .actuals-balance-table th:last-child { width: 180px; text-align: right; }
+.actuals-person-row th { background: #f7f9fc; color: var(--ink); font-size: 12px; font-weight: 600; }
+.actuals-person-row td { background: #f7f9fc; font-weight: 600; }
+.actuals-person-row span, .actuals-balance-table tfoot span { margin-left: 12px; color: var(--muted); font-size: 10px; font-weight: 400; }
+.actuals-amount-input { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.actuals-amount-input input { width: 145px; height: 28px; text-align: right; }
+.actuals-balance-table tfoot th, .actuals-balance-table tfoot td { padding: 12px 10px; background: transparent; border-top: 1px solid var(--line); color: var(--ink); font-weight: 700; }
+.actuals-save-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; padding: 16px 0; }
+.actuals-note { flex: 1; min-width: 160px; max-width: 420px; }
+.actuals-entry-status { margin-left: auto; padding-bottom: 8px; color: var(--muted); font-size: 11px; }
+.actuals-error { margin: 12px 0; color: #b91c1c; font-size: 12px; }
+.actuals-history-table { min-width: 800px; }
+.actuals-history-table :is(th, td):nth-child(n+2):nth-child(-n+5) { text-align: right; white-space: nowrap; }
+.actuals-history-table :is(th, td):first-child { white-space: nowrap; }
+.actuals-history-table :is(th, td):nth-child(6) { width: 72px; text-align: center; white-space: nowrap; }
+.actuals-history-table :is(th, td):last-child { width: 84px; }
+.actuals-history-note { max-width: 220px; overflow-wrap: anywhere; }
+.actuals-history-actions { display: flex; justify-content: flex-end; gap: 4px; }
+.actuals-history-actions button { display: grid; width: 28px; height: 28px; place-items: center; padding: 0; }
+.actuals-empty-cell { padding: 24px 10px !important; color: var(--muted); text-align: left !important; }
+@media (max-width: 760px) {
+	.working-forecast-fields .field-label { flex: 1; min-width: 140px; width: auto; }
+	.planner-shell--actuals .topbar { height: auto; min-height: 58px; flex-wrap: wrap; padding-top: 12px; padding-bottom: 12px; }
+	.planner-shell--actuals .scenario-actions { width: 100%; min-width: 0; flex-wrap: wrap; margin-left: 0; }
+	.planner-shell--actuals .scenario-name { flex: 1; width: auto; min-width: 100px; }
+	.actuals-overview-heading { flex-wrap: wrap; }
+	.actuals-overview-heading h2 { flex-basis: 100%; }
+	.actuals-range { margin-left: 0; }
+	.actuals-baseline-bar > .field-label, .actuals-baseline-bar > .field-label:first-child { flex: 1; width: auto; min-width: 140px; }
+	.actuals-baseline-stamp { flex-basis: 100%; margin-left: 0; }
+	.actuals-metrics { grid-template-columns: 1fr; gap: 12px; }
+	.actuals-metrics > div { padding: 0; border-right: 0; }
+	.actuals-metrics strong { font-size: 20px; }
+	.actuals-entry-toolbar > .field-label { flex: 1; width: auto; min-width: 140px; }
+	.actuals-entry-status { margin-left: 0; }
+}
+@media (max-width: 760px) {
+	.planner-shell--accounts .topbar { height: auto; min-height: 58px; flex-wrap: wrap; padding-top: 12px; padding-bottom: 12px; }
+	.planner-shell--accounts .scenario-actions { width: 100%; min-width: 0; flex-wrap: wrap; margin-left: 0; }
+	.planner-shell--accounts .scenario-name { flex: 1; width: auto; min-width: 100px; }
+	.accounts-total-band { padding-top: 8px; }
+	.accounts-total-band output { font-size: 24px; }
+	.accounts-person-heading > div { flex-basis: calc(100% - 150px); }
+	.accounts-person-heading output { font-size: 17px; }
+	.accounts-add { margin-left: auto; }
+}
