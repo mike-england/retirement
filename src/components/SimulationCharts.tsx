@@ -2,6 +2,7 @@
 
 import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
+import { workingForecastRebaseMarkers } from "@/lib/workingForecast";
 import type { DeterministicProjection, RetirementInputs } from "@/types/retirement";
 
 type ChartKind = "portfolio" | "spending" | "cashFlow" | "taxDollars" | "taxRates" | "withdrawalRate" | "income";
@@ -305,12 +306,17 @@ function phaseMarkLines(inputs: RetirementInputs, ages: number[]) {
     symbol: "none",
     lineStyle: { type: "dashed", color: "#94a3b8", width: 1 },
     label: { show: true, position: "insideEndTop", color: "#475569", fontSize: 9 },
-    data: inputs.spendingPlan.phases
+    data: [...inputs.spendingPlan.phases
       .filter((phase) => phase.startAge >= minAge && phase.startAge <= maxAge)
       .map((phase) => ({
         name: phase.label,
         xAxis: phase.startAge,
-      })),
+      })), ...workingForecastRebaseMarkers(inputs).filter((marker) => marker.age >= minAge && marker.age <= maxAge).map((marker) => ({
+        name: `Rebased ${marker.dates.join(", ")}`,
+        xAxis: String(marker.age),
+        lineStyle: { type: "dashed", color: "#059669", width: 1.5 },
+        label: { show: true, formatter: marker.dates.length === 1 ? `Rebased ${marker.dates[0]}` : `Rebased ${marker.calendarYear} (${marker.dates.length} dates)`, position: "insideEndTop", rotate: 90, color: "#047857", fontSize: 9 },
+      }))],
   };
 }
 

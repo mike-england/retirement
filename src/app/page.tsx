@@ -1,6 +1,6 @@
 "use client";
 
-import { BadgeDollarSign, BriefcaseBusiness, Check, ChevronDown, Landmark, Menu, Plus, RefreshCw, SlidersHorizontal, Trash2, UsersRound, WalletCards } from "lucide-react";
+import { BadgeDollarSign, BriefcaseBusiness, Check, ChevronDown, Landmark, Menu, Plus, SlidersHorizontal, Trash2, UsersRound, WalletCards } from "lucide-react";
 import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -23,7 +23,7 @@ import type { MonteCarloWorkerMessage } from "@/lib/monteCarlo.worker";
 import { forecastInputsForYear, sampleAnnualReturn } from "@/lib/simulationEngine";
 import { hasCompleteFundingSummary, isReturnOverrideUpdate, projectWithVariableReturns } from "@/lib/projectionPath";
 import { accountEntriesFor, accountTotal, assetsWithAccounts } from "@/lib/accounts";
-import { isActualsTracking } from "@/lib/actuals";
+import { isActualsTracking, selectedActualsAccounts } from "@/lib/actuals";
 import {
   availableTaxYears,
   defaultTaxSettings,
@@ -33,8 +33,7 @@ import { ageYearLabel, maxHouseholdAge, monthYearLabel, parsePlanDate, planDateF
 import { calculateCppAnnualBenefit, cppAnnualMaximum } from "@/lib/governmentBenefits";
 import { SimulationCharts } from "@/components/SimulationCharts";
 import { ActualsView } from "@/components/ActualsView";
-import { WorkingForecastBar } from "@/components/WorkingForecastBar";
-import { projectWorkingForecast, workingForecastContext } from "@/lib/workingForecast";
+import { projectWorkingForecast, workingForecastContext, workingForecastRebaseMarkers } from "@/lib/workingForecast";
 import { ScenarioFileDialog, ScenarioImportConflictDialog } from "@/components/ScenarioFileDialog";
 import { decryptScenario, encryptScenario, isEncryptedScenario } from "@/lib/scenarioEncryption";
 import type {
@@ -116,6 +115,8 @@ export default function Home() {
   const [inputs, setInputs] = useState(defaultRetirementInputs);
   const planYear = planDateFor(inputs).getFullYear();
   const [activeView, setActiveView] = useState("Dashboard");
+  const [accountsBalanceView, setAccountsBalanceView] = useState<"actuals" | "starting">("actuals");
+  const selectedAccounts = selectedActualsAccounts(inputs);
   const [activeInputTab, setActiveInputTab] = useState("People");
   const [projectionSnapshot, setProjectionSnapshot] = useState<ProjectionSnapshot | null>(
     null,
@@ -318,8 +319,8 @@ export default function Home() {
     window.setTimeout(() => setJustSaved(false), 1800);
   }
 
-  function saveActuals(actuals: ActualsTracking) {
-    const nextInputs = { ...inputs, actuals };
+  function saveActuals(actuals: ActualsTracking, rebasedInputs?: RetirementInputs) {
+    const nextInputs = { ...(rebasedInputs ?? inputs), actuals };
     const existing = scenarios.find((scenario) => scenario.id === activeScenarioId);
     const scenario: SavedScenario = {
       id: existing?.id ?? `scenario-${crypto.randomUUID()}`,
@@ -540,7 +541,7 @@ export default function Home() {
           setIsRunning(false);
         });
       } catch (failure) {
-        setProjectionSnapshot({ inputs, calculator: projectionCalculator, result: null, error: `${failure instanceof Error ? failure.message : "Unable to calculate a complete funding breakdown."} Your inputs have been kept. Recalculate to try again.` });
+        setProjectionSnapshot({ inputs, calculator: projectionCalculator, result: null, error: `${failure instanceof Error ? failure.message : "Unable to calculate a complete funding breakdown."} Your inputs have been kept.` });
         setIsRunning(false);
       }
     }, 400);
@@ -1395,7 +1396,7 @@ export default function Home() {
         </aside>
         <section className="workspace">
           <nav className="view-tabs" aria-label="Workspace views">
-            {["Dashboard", "Accounts", "Actuals", "Ledger", "Monte Carlo", "Compare", "Tax Info", "Guide"].map(
+            {["Dashboard", "Accounts", "Ledger", "Actuals", "Monte Carlo", "Compare", "Tax Info", "Guide"].map(
               (view) => (
                 <button
                   key={view}
@@ -1431,7 +1432,7 @@ export default function Home() {
                 {activeView === "Tax Info"
                   ? `Editable ${inputs.taxSettings.taxYear} tax rules from ${inputs.taxSettings.source}.`
                   : activeView === "Accounts"
-                    ? `As of ${inputs.planDate ?? planYear}`
+                    ? selectedAccounts && accountsBalanceView === "actuals" ? `As of ${selectedAccounts.date} · ${selectedAccounts.baseline.name}` : `Plan starting balances · ${inputs.planDate ?? planYear}`
                   : activeView === "Actuals"
                     ? `${inputs.actuals?.baselines.length ?? 0} frozen ${inputs.actuals?.baselines.length === 1 ? "baseline" : "baselines"} · ${inputs.actuals?.observations.length ?? 0} balance ${inputs.actuals?.observations.length === 1 ? "entry" : "entries"}`
                   : activeView === "Guide"
@@ -1446,8 +1447,7 @@ export default function Home() {
               </p>
             </div>
           </div>
-          {workingContext && ["Dashboard", "Ledger", "Actuals", "Compare", "Monte Carlo"].includes(activeView) && <WorkingForecastBar key={`${workingContext.baseline.id}:${workingContext.asOf}`} inputs={inputs} onChange={saveActuals} />}
-          {activeView === "Accounts" && <AccountsView inputs={inputs} onChange={setInputs} />}
+          {activeView === "Accounts" && <AccountsView inputs={inputs} onChange={setInputs} snapshot={selectedAccounts} balanceView={accountsBalanceView} onBalanceViewChange={setAccountsBalanceView} />}
           {activeView === "Actuals" && <ActualsView key={activeScenarioId} inputs={inputs} projection={projection} onChange={saveActuals} onOpenAccounts={() => setActiveView("Accounts")} />}
           {activeView === "Dashboard" && (
             <DashboardView
@@ -1462,7 +1462,6 @@ export default function Home() {
               projection={ledgerProjection}
               updating={ledgerUpdating}
               error={projectionError}
-              onRecalculate={() => setInputs((current) => structuredClone(current))}
               onGenerateReturns={generateReturns}
               onReturnChange={(age, rate) =>
                 setInputs((current) => ({
@@ -1479,7 +1478,7 @@ export default function Home() {
             />
           )}
           {activeView === "Monte Carlo" && (
-            <><p className="monte-carlo-working-note">{workingContext ? `Uses applied actuals and saved revisions. Returns through ${workingContext.asOf.slice(0, 4)} remain fixed; subsequent full calendar years are randomized and used for success-rate estimates.` : "Uses the editable plan's balances and assumptions."}</p><MonteCarloView simulationOutput={monteCarloOutput} progress={monteCarloProgress} error={monteCarloError} /></>
+            <MonteCarloView simulationOutput={monteCarloOutput} progress={monteCarloProgress} error={monteCarloError} />
           )}
           {activeView === "Compare" && (
             <CompareView
@@ -1522,7 +1521,13 @@ function SortableAccountRows({ id, children }: {
   );
 }
 
-function AccountsView({ inputs, onChange }: { inputs: RetirementInputs; onChange: (inputs: RetirementInputs) => void }) {
+function AccountsView({ inputs, onChange, snapshot, balanceView, onBalanceViewChange }: {
+  inputs: RetirementInputs;
+  onChange: (inputs: RetirementInputs) => void;
+  snapshot: ReturnType<typeof selectedActualsAccounts>;
+  balanceView: "actuals" | "starting";
+  onBalanceViewChange: (view: "actuals" | "starting") => void;
+}) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -1543,8 +1548,29 @@ function AccountsView({ inputs, onChange }: { inputs: RetirementInputs; onChange
     else next.add(key);
     return next;
   });
+  const balanceControls = snapshot && <div className="accounts-balance-modes" role="group" aria-label="Account balance view">
+    <button type="button" aria-pressed={balanceView === "actuals"} onClick={() => onBalanceViewChange("actuals")}>Selected baseline</button>
+    <button type="button" aria-pressed={balanceView === "starting"} onClick={() => onBalanceViewChange("starting")}>Plan starting balances</button>
+    <span>{balanceView === "actuals" ? `${snapshot.isActuals ? "Recorded balances" : "Baseline starting balances"} · ${snapshot.date}` : `Editable inputs · ${inputs.planDate ?? "Plan date"}`}</span>
+  </div>;
+  if (snapshot && balanceView === "actuals") return <div className="accounts-view">
+    {balanceControls}
+    <div className="accounts-total-band"><div><span>Household total</span><output aria-label="Household account total">{formatCurrency(snapshot.total)}</output></div><span>{snapshot.baseline.name} · {snapshot.accounts.length} {snapshot.accounts.length === 1 ? "account" : "accounts"} · Read-only</span></div>
+    {snapshot.baseline.people.map((person) => {
+      const accounts = snapshot.accounts.filter((account) => account.ownerId === person.id);
+      const total = accounts.reduce((sum, account) => sum + account.balance, 0);
+      return <section className="accounts-person" key={person.id} aria-label={`${person.label} accounts`}>
+        <div className="accounts-person-heading"><div><h2>{person.label}</h2><span>{accounts.length} {accounts.length === 1 ? "account" : "accounts"}</span></div><output aria-label={`${person.label} account subtotal`}>{formatCurrency(total)}</output></div>
+        <div className="accounts-table-wrap"><table className="accounts-table accounts-snapshot-table"><thead><tr><th scope="col">Account name</th><th scope="col">Balance</th><th scope="col">Account type</th><th scope="col">Return treatment</th></tr></thead><tbody>
+          {accounts.map((account) => <tr key={account.key}><th scope="row">{account.name}</th><td>{formatCurrency(account.balance)}</td><td>{account.type === "rrsp" ? "RRSP / RRIF" : account.type === "tfsa" ? "TFSA" : "Non-registered"}</td><td>{account.returnType === "market" ? "Market-linked" : account.returnType === "savings" ? "Interest-bearing savings" : "Fixed-rate GIC / PPN"}</td></tr>)}
+          {accounts.length === 0 && <tr><td colSpan={4} className="accounts-empty">No active accounts</td></tr>}
+        </tbody><tfoot><tr><th scope="row">{person.label} total</th><td>{formatCurrency(total)}</td><td colSpan={2} /></tr></tfoot></table></div>
+      </section>;
+    })}
+  </div>;
   return (
     <div className="accounts-view">
+      {balanceControls}
       <div className="accounts-total-band">
         <div><span>Household total</span><output aria-label="Household account total">{formatCurrency(householdTotal)}</output></div>
         <span>{people.length} {people.length === 1 ? "person" : "people"} · {people.reduce((count, person) => count + person.accounts.length, 0)} accounts</span>
@@ -2377,7 +2403,6 @@ function LedgerView({
   projection,
   updating,
   error,
-  onRecalculate,
   onGenerateReturns,
   onReturnChange,
 }: {
@@ -2385,12 +2410,12 @@ function LedgerView({
   projection: DeterministicProjection | null;
   updating: boolean;
   error: string;
-  onRecalculate: () => void;
   onGenerateReturns: () => void;
   onReturnChange: (age: number, rate: number) => void;
 }) {
   const [expandedAges, setExpandedAges] = useState<Set<number>>(new Set());
   const working = workingForecastContext(inputs);
+  const rebaseDatesByYear = new Map(workingForecastRebaseMarkers(inputs).map((marker) => [marker.calendarYear, marker.dates]));
   const firstEditableYear = working ? Number(working.asOf.slice(0, 4)) + 1 : -Infinity;
   if (!projection || !hasCompleteFundingSummary(projection))
     return (
@@ -2403,7 +2428,6 @@ function LedgerView({
         </div>
         <div className="ledger-empty" role={error ? "alert" : "status"}>
           {error || "Updating variable-return projection."}
-          {error && <button type="button" className="button button-quiet ledger-recalculate" onClick={onRecalculate}><RefreshCw size={14} />Recalculate</button>}
         </div>
       </section>
     );
@@ -2444,7 +2468,6 @@ function LedgerView({
           <p role="status">{updating ? "Updating amounts for the edited returns..." : "Edit a yearly return to override the seeded path for that age."}</p>
         </div>
         <div className="ledger-actions">
-        <button type="button" className="button button-quiet ledger-recalculate" onClick={onRecalculate}><RefreshCw size={14} />Recalculate</button>
         <button
           className="button button-primary"
           type="button"
@@ -2516,6 +2539,8 @@ function LedgerView({
                       </button>
                     )}
                     {year.calendarYear}
+                    {rebaseDatesByYear.get(year.calendarYear)?.map((date) => <span key={date} className="ledger-actuals-marker" title={`Rebased from balances recorded ${date}. Amounts remain full-year estimates.`}>Rebased {date}</span>)}
+                    {working && year.calendarYear === Number(working.asOf.slice(0, 4)) && !rebaseDatesByYear.get(year.calendarYear)?.includes(working.asOf) && <span className="ledger-actuals-marker" title="Dated actual balances are applied within this year; amounts remain full-year estimates.">Actuals {working.asOf}</span>}
                   </td>
                   <td>{year.age}</td>
                   <td>
@@ -2529,7 +2554,7 @@ function LedgerView({
                         type="number"
                         step="0.1"
                         disabled={year.calendarYear < firstEditableYear}
-                        title={working ? year.calendarYear < firstEditableYear ? "Recorded/past return path is fixed in the working forecast." : `Future return edits are drafts until saved as a forecast revision. Currently modeled: ${oneDecimalPercent(year.portfolioReturn)}%.` : "Annualized return. First-year growth applies only from the saved plan date; earlier sub-periods have zero modeled growth."}
+                        title={working ? year.calendarYear < firstEditableYear ? "Recorded/past return path is fixed in the working forecast." : `Future return edits are applied automatically when rebasing from Actuals. Currently modeled: ${oneDecimalPercent(year.portfolioReturn)}%.` : "Annualized return. First-year growth applies only from the saved plan date; earlier sub-periods have zero modeled growth."}
                         value={oneDecimalPercent(year.calendarYear < firstEditableYear ? year.portfolioReturn : inputs.assumptions.annualReturnOverrides[year.age] ?? year.portfolioReturn)}
                         onChange={(event) =>
                           onReturnChange(
@@ -3413,10 +3438,54 @@ function GuideView() {
         <>
           <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. The RRIF conversion age applies to the whole registered holding; minimum withdrawals begin the following year and eligible RRIF income can be pension-split from age 65. Plans without a saved conversion age use 71, with minimums starting at 72. Choose Already converted for an existing RRIF. Conversion timing, partial conversions, and the spouse-age election for minimums are not optimized.</p>
           <p>Accounts are entered separately by owner in the main Accounts view, with a subtotal for each person and a household total. Each row has its own tax type and return treatment; include each balance only once, including GICs held inside an RRSP or TFSA. The simulation pools market-linked balances by owner and tax type when funding withdrawals.</p>
+          <p>With saved Actuals baselines, Accounts defaults to <strong>Selected baseline</strong>: read-only holdings and totals from the baseline selected in Actuals, with its latest complete balance date. Incomplete entries do not replace the totals; a baseline without complete actuals shows its starting balances instead. Inactive future holdings are excluded from this dated view. Switching baselines changes the displayed snapshot, not the editable plan or working-forecast source. Choose <strong>Plan starting balances</strong> to add, edit, or reorder accounts and holding details. Without a baseline, this editor opens directly.</p>
           <p><strong>TFSA</strong>: withdrawals are always tax-free and never counted as income anywhere.</p>
           <p><strong>Non-registered</strong> + <strong>Adjusted cost base (ACB)</strong>: only the gain above your ACB is taxable, and only that portion is a capital gain (taxed at the capital gains inclusion rate on the Assumptions tab, currently 50% or 66.67% included). If ACB equals the account balance there's no gain and changing it further won't do anything; the same applies at death, where any remaining unrealized gain is deemed realized.</p>
           <p><strong>Fixed-rate GIC / PPN</strong>: earns its own annual rate rather than the simulated market return. For example, 5% annually over two years compounds to 10.25%. A non-registered holding realizes deferred growth at maturity or proportionally on early withdrawal; RRSP/RRIF growth remains sheltered until withdrawn and TFSA growth is tax-free. At maturity, proceeds can renew or move to the market-linked balance within the same tax wrapper. Existing saved total-term rates are converted to equivalent annual rates.</p>
           <p><strong>Interest-bearing savings</strong>: enter an assumed annual rate without a GIC term. Non-registered interest is modeled as taxable annually; registered and TFSA holdings retain their tax treatment. These balances participate in the GIC / HISA buffer strategy. The assumed rate stays constant in projections even though actual savings rates can change.</p>
+        </>
+      ),
+    },
+    {
+      title: "Actuals: getting started",
+      body: (
+        <>
+          <p>Actuals compares recorded account balances with your plan and projects forward from those balances. Before starting, check <strong>People: Plan date</strong>, ages, <strong>Accounts</strong> balances, and assumptions. Starting ages and balances must describe that same date. If you have no reliable older plan, start with today's date and current values; the app cannot reconstruct a missing historical forecast.</p>
+          <p>No initial freeze is required. With at least one account and a completed projection, Actuals shows the live <strong>Editable plan</strong>. Enter a balance date and recorded balances. Opening the view or typing in the form does not save anything.</p>
+          <p>Your first <strong>Apply actuals</strong> or <strong>Save incomplete entry</strong> automatically preserves the reference as <strong>Original plan</strong> and saves the scenario and entry together. The reference keeps the plan's starting balances, not the new actual balances. It stays fixed after saving; existing or imported baselines are not replaced automatically. Only complete applied entries activate the working forecast.</p>
+        </>
+      ),
+    },
+    {
+      title: "Actuals: recording balances",
+      body: (
+        <>
+          <p>At each review, choose one balance date and enter every tracked household account for that date. Enter <strong>0</strong> for an empty account; leave unknown balances blank. <strong>Copy last actuals</strong> copies the latest saved entry before that date. If there is no earlier entry, <strong>Use starting balances</strong> copies the baseline's starting balances. Review copied values against your statements. Selecting an existing date loads its entry for editing.</p>
+          <p><strong>Apply actuals</strong> saves a complete household entry and automatically recalculates future balances, withdrawals, taxes, and funding in Dashboard, Ledger, scenario comparisons, and Monte Carlo. Routine balance updates do not need a rebase or another save step. <strong>Save incomplete entry</strong> keeps partial work but does not apply it to the household forecast. Complete unsaved entries are previews only.</p>
+          <p>The chart always displays the full history and forecast, without zoom or pan. <strong>Compare</strong> selects the household or an individual person. The dashed blue reference is the editable plan until the first save, then the selected frozen baseline. The green <strong>Rolling reforecast</strong> includes applied balances and saved assumptions. Dots are recorded balances; future lines are estimates. A difference from plan includes deposits, withdrawals, and spending changes, not just investment returns.</p>
+          <p>Keep the Plan date, ages, and starting Accounts balances unchanged during routine entry. Review funding on Dashboard and expand Ledger years for withdrawals by person and account type. Market-linked accounts are pooled by person and tax type, not chosen individually by name. Current-year amounts are full-year estimates, not amounts still to withdraw: balance entries do not record actual year-to-date income, withdrawals, taxes, contributions, or cost bases.</p>
+        </>
+      ),
+    },
+    {
+      title: "Actuals: rebasing",
+      body: (
+        <>
+          <p>Rebase when you want a new dated reference from recorded balances, or want to apply edited future assumptions. Select the source baseline, then <strong>Rebase from actuals</strong>. In <strong>Review new baseline</strong>, name the new baseline and choose a complete saved household entry; the latest is selected initially. Check the date, before/after ages, account balances, and total, then <strong>Confirm rebase</strong>. Cancel makes no changes.</p>
+          <p>Confirmation updates the editable Plan date, Accounts balances, and calendar-year ages, saves the scenario, and makes the new baseline drive future projections automatically. Balances apply on the recorded date. The working calculation retains modeled tax-year history and holding state rather than starting another year's income or withdrawals. Earlier history and the separate blue/green lines are preserved; the new reference begins at the rebase date. New entries belong on or after that date.</p>
+          <p>Edited income, spending, contribution, return, tax, withdrawal, and RRIF-conversion assumptions are saved automatically and take effect the following <strong>January 1</strong>, shown in the review. No separate forecast-revision save is needed. Earlier calculations stay unchanged, later scheduled revisions keep their dates, and unchanged settings do not create extra revisions. If no full future year remains, rebasing cannot apply edited assumptions. Ordinary scenario Save retains edits but does not apply them to an active working forecast.</p>
+          <p>You can browse earlier baselines without changing the working source; applying a complete entry or confirming a rebase changes that source. Ledger labels every rebase date, and Plan overview charts show green dashed rebase lines, grouping dates in the same year. Under <strong>More baseline options</strong>, <strong>Freeze editable plan</strong> creates a separate reference for changed people or account structure; those structural edits are not included in a rebase. <strong>Use editable plan</strong> stops using actuals for the main projection without deleting history.</p>
+        </>
+      ),
+    },
+    {
+      title: "Actuals: history and backups",
+      body: (
+        <>
+          <p><strong>History</strong> shows saved balance dates, amounts, differences, entry completeness, and notes, with forecast revisions and their effective dates below. Entries recorded directly against the selected baseline can be edited. Earlier entries carried through a rebase are marked <strong>Archived</strong>; edit their originals under the source baseline. Successive rebases retain earlier history without duplicating transition dates.</p>
+          <p>Every saved entry, including an archived row, has a trash button. Deleting a middle entry keeps later recorded balances and saved assumptions, removes the deleted record from snapshots, and rebuilds affected forecasts. If it anchors a rebase, only that rebase is removed; its other records and settings move to the preceding valid baseline, and later rebases are reconnected and rebuilt. Their actual balances stay unchanged, though calculated amounts between entries may change. Confirmation names removed and rebuilt baselines. Conflicting same-date records stop deletion without changing anything. Current Accounts balances, Plan date, edited assumptions, and other scenarios are unchanged. Cancel makes no changes; confirmation saves immediately and cannot be undone. Export a backup first.</p>
+          <p>To remove a mistaken baseline, select it and click the trash button beside the baseline selector. Confirmation lists the entries and revisions being removed and any working-source change. Other baselines remain saved. A source baseline cannot be deleted while newer rebases depend on it; delete those first. Deleting the final baseline returns to the editable-plan preview. Deletion cannot be undone and does not reset editable Accounts balances or the Plan date.</p>
+          <p>Saving or applying actuals and confirming a rebase automatically save the scenario in this browser. Ordinary and password-protected exports include baselines, recorded entries and notes, archived history, forecast revisions, and the working-source choice; Import restores them. Unsaved form edits and preview markers are not included. Export after important reviews and before deleting history. Browser storage is not a separate backup.</p>
         </>
       ),
     },
@@ -3492,7 +3561,9 @@ function GuideView() {
           <p><strong>Save</strong> stores the current scenario in this browser. Saving again updates the selected scenario. <strong>New</strong> starts a fresh scenario without deleting saved ones, and <strong>Delete</strong> removes the selected saved scenario.</p>
           <p>When another saved scenario is available, <strong>Delete</strong> can also discard the unsaved <strong>New Scenario</strong> draft and switch to a saved scenario. The draft is removed from the dropdown until you click <strong>New</strong> or reload the page.</p>
           <p><strong>Export</strong> makes a backup, optionally protected by a password. At least 12 characters are recommended, but no minimum length is enforced. <strong>Import</strong> opens JSON or encrypted backups and creates an unencrypted browser-saved scenario. Keep your password safe: there is no password recovery.</p>
+          <p>Save and both export formats include every frozen baseline and return path, dated balance entries and notes (including incomplete entries), the selected comparison baseline, working-forecast source or editable-plan choice, and saved forecast revisions with their archived settings and balance snapshots. Import restores that tracking state. Files without actuals still load as editable plans without a baseline.</p>
           <p>If an imported name matches a saved scenario, <strong>Keep both</strong> adds a uniquely named copy, <strong>Replace existing</strong> updates the saved scenario, and <strong>Cancel</strong> leaves everything unchanged. Names are compared without capitalization or surrounding whitespace. Encrypted files are checked after decryption.</p>
+          <p><strong>Replace existing</strong> replaces that scenario's actuals history too; it does not merge entries or baselines. Choose <strong>Keep both</strong> when retaining both histories matters.</p>
         </>
       ),
     },

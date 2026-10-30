@@ -248,6 +248,13 @@ export interface ActualsBaseline {
   accounts: TrackedAccount[];
   points: { date: string; portfolioByPerson: Record<string, number> }[];
   returnPath?: { annualReturns: number[]; annualInflation: number[]; subPeriodReturns: number[][] };
+  rebase?: {
+    date: string;
+    sourceBaselineId: string;
+    editableInputs: Omit<RetirementInputs, "actuals">;
+    observations: BalanceObservation[];
+    revisions: ForecastRevision[];
+  };
 }
 
 export interface ProjectionBalanceOverride {
