@@ -1,4 +1,7 @@
-import { decomposeAnnualReturn, projectRetirementPlan, sampleAnnualReturn, subPeriodsPerYear } from "@/lib/simulationEngine";
+import { decomposeAnnualReturn, forecastInputsForYear, projectRetirementPlan, sampleAnnualReturn, subPeriodsPerYear } from "@/lib/simulationEngine";
+import { actualsProjectionOptions } from "@/lib/actuals";
+import { workingForecastContext } from "@/lib/workingForecast";
+import { planDateFor } from "@/lib/planDates";
 import type {
   DeterministicProjection,
   FailureAnalysis,
@@ -9,39 +12,41 @@ import type {
 } from "@/types/retirement";
 
 export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (completed: number, total: number) => void): SimulationOutput {
+  const working = workingForecastContext(inputs);
+  const simulationInputs = working?.baseline.inputs ?? inputs;
+  const workingOptions = working ? actualsProjectionOptions(working.baseline, working.observations, working.revisions) : {};
+  const baseYear = planDateFor(simulationInputs).getFullYear();
+  const fixedThroughYear = working ? Number(working.asOf.slice(0, 4)) : -Infinity;
   const random = createRandom(inputs.simulation.randomSeed);
   // The plan can run past the primary's own death if someone else in the household outlives them; targetDeathAge is in each person's own age scale, so compare lifespan lengths, not raw ages.
   const maxLifespanIndex = Math.max(
-    inputs.personalInfo.targetDeathAge - inputs.personalInfo.currentAge,
-    ...(inputs.personalInfo.additionalPeople ?? []).map((person) => person.targetDeathAge - person.currentAge),
+    simulationInputs.personalInfo.targetDeathAge - simulationInputs.personalInfo.currentAge,
+    ...(simulationInputs.personalInfo.additionalPeople ?? []).map((person) => person.targetDeathAge - person.currentAge),
   );
   const yearCount = maxLifespanIndex + 1;
+  if (working && fixedThroughYear >= baseYear + yearCount - 1) throw new Error("No full future calendar years remain for working-forecast Monte Carlo analysis.");
   const projections: DeterministicProjection[] = [];
   const averageAnnualReturns: number[] = [];
-  const returnFloor = inputs.assumptions.returnFloor ?? -0.08;
-  const returnCeiling = Math.max(returnFloor, inputs.assumptions.returnCeiling ?? 0.15);
-  const subPeriodCount = subPeriodsPerYear(inputs.strategy.withdrawalFrequency);
+  const yearlyInputs = Array.from({ length: yearCount }, (_, index) => forecastInputsForYear(simulationInputs, working?.revisions ?? [], baseYear + index));
   let lastProgressAt = Date.now();
   onProgress?.(0, inputs.simulation.iterations);
 
   for (let run = 0; run < inputs.simulation.iterations; run += 1) {
-    const annualReturns = Array.from({ length: yearCount }, () => sampleAnnualReturn(
-      random,
-      inputs.assumptions.returnMean,
-      inputs.assumptions.returnStdDev,
-      returnFloor,
-      returnCeiling,
-    ));
-    const annualInflation = Array.from({ length: yearCount }, () => Math.max(0, normalRandom(
-      random,
-      inputs.assumptions.inflationMean,
-      inputs.assumptions.inflationStdDev,
-    )));
-    const subPeriodReturns = subPeriodCount <= 1
-      ? undefined
-      : annualReturns.map((annualReturn) => decomposeAnnualReturn(random, annualReturn, subPeriodCount, inputs.assumptions.returnStdDev));
-    projections.push(projectRetirementPlan(inputs, { annualReturns, annualInflation, subPeriodReturns, pensionSplittingPolicy: "simple", fastWithdrawalSizing: true }));
-    averageAnnualReturns.push(average(annualReturns));
+    const annualReturns = yearlyInputs.map((plan, index) => {
+      if (baseYear + index <= fixedThroughYear) return workingOptions.annualReturns![index];
+      const floor = plan.assumptions.returnFloor ?? -0.08;
+      return sampleAnnualReturn(random, plan.assumptions.returnMean, plan.assumptions.returnStdDev, floor, Math.max(floor, plan.assumptions.returnCeiling ?? 0.15));
+    });
+    const annualInflation = yearlyInputs.map((plan, index) => baseYear + index <= fixedThroughYear ? workingOptions.annualInflation![index]
+      : Math.max(0, normalRandom(random, plan.assumptions.inflationMean, plan.assumptions.inflationStdDev)));
+    const subPeriodReturns = annualReturns.map((annualReturn, index) => {
+      if (baseYear + index <= fixedThroughYear) return workingOptions.subPeriodReturns![index];
+      return decomposeAnnualReturn(random, annualReturn, subPeriodsPerYear(yearlyInputs[index].strategy.withdrawalFrequency), yearlyInputs[index].assumptions.returnStdDev);
+    });
+    const result = projectRetirementPlan(simulationInputs, { ...workingOptions, annualReturns, annualInflation, subPeriodReturns, pensionSplittingPolicy: "simple", fastWithdrawalSizing: true });
+    if (working) result.portfolioDepleted = result.years.some((year) => year.calendarYear > fixedThroughYear && year.depleted);
+    projections.push(result);
+    averageAnnualReturns.push(average(annualReturns.filter((_, index) => baseYear + index > fixedThroughYear)));
     if (onProgress && Date.now() - lastProgressAt >= 100) {
       onProgress(run + 1, inputs.simulation.iterations);
       lastProgressAt = Date.now();
@@ -50,7 +55,7 @@ export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (
 
   onProgress?.(projections.length, inputs.simulation.iterations);
   const sortedByEstate = [...projections].sort((first, second) => first.finalEstateValue - second.finalEstateValue);
-  const medianRun = projectRetirementPlan(inputs, { pensionSplittingPolicy: "simple", fastWithdrawalSizing: true });
+  const medianRun = projectRetirementPlan(simulationInputs, { ...workingOptions, pensionSplittingPolicy: "simple", fastWithdrawalSizing: true });
   const successfulRuns = projections.filter((projection) => !projection.portfolioDepleted).length;
   const successRate = projections.length === 0 ? 0 : successfulRuns / projections.length;
   // The bottom (1 - successRate) share of runs run out of money, so that rank marks the worst run that still survives.
@@ -67,11 +72,11 @@ export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (
     percentileBands: createPercentileBands(projections, worstSurvivingPercentileRank),
     medianRun,
     runsCompleted: projections.length,
-    failureAnalysis: createFailureAnalysis(projections, averageAnnualReturns),
+    failureAnalysis: createFailureAnalysis(projections, averageAnnualReturns, fixedThroughYear),
   };
 }
 
-function createFailureAnalysis(projections: DeterministicProjection[], averageAnnualReturns: number[]): FailureAnalysis {
+function createFailureAnalysis(projections: DeterministicProjection[], averageAnnualReturns: number[], fixedThroughYear = -Infinity): FailureAnalysis {
   const failureAgeCounts = new Map<number, number>();
   const failedReturns: number[] = [];
   const successfulReturns: number[] = [];
@@ -80,7 +85,7 @@ function createFailureAnalysis(projections: DeterministicProjection[], averageAn
     if (projection.portfolioDepleted) {
       failedReturns.push(averageAnnualReturns[index]);
       // The first depleted year in a run marks the age it ran out of money.
-      const failureYear = projection.years.find((year) => year.depleted);
+      const failureYear = projection.years.find((year) => year.calendarYear > fixedThroughYear && year.depleted);
       if (failureYear) failureAgeCounts.set(failureYear.age, (failureAgeCounts.get(failureYear.age) ?? 0) + 1);
     } else {
       successfulReturns.push(averageAnnualReturns[index]);

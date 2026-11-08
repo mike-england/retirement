@@ -1,3 +1,11 @@
+# 1.4.0 (October 30, 2026)
+- Added Actuals tracking with dated account balances, frozen plan comparisons, and rolling forecasts that update Dashboard, Ledger, Compare, and Monte Carlo automatically.
+- Added rebasing from actuals, with automatic future-assumption revisions, preserved historical forecasts, and editable history that retains later balances and rebases when correcting an entry. Tracking history is included in scenario saves and exports/imports.
+- Added a dedicated Accounts workspace for named investments, GICs, and savings across RRSP/RRIF, TFSA, and non-registered accounts, with a selected-baseline balance view and a separate starting-balance editor.
+- Added a saved Plan date to anchor ages and starting balances, with first-year investment growth prorated from that date.
+- Expanded Ledger reporting with per-person income, withdrawals, contributions, taxes, and net cash, including funding reconciliation checks.
+- Corrected RRIF timing: default conversion is age 71, with minimum withdrawals beginning at 72, including registered GIC holdings.
+
 # 1.3.0 (October 25, 2026)
 - Added optional password-protected scenario exports using browser-local PBKDF2 and AES-256-GCM encryption, with password confirmation and automatic encrypted-file detection on import. Existing JSON imports and exports remain supported; browser-saved scenarios remain unencrypted.
 - Added a duplicate-name import prompt with Keep both (the default), Replace existing, and Cancel. Name matching ignores capitalization and surrounding whitespace; copies receive unique names and replacements preserve the saved scenario ID.
