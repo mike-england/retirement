@@ -1,3 +1,6 @@
+# 1.4.1 (November 7, 2026)
+- Fix a compile error
+
 # 1.4.0 (October 30, 2026)
 - Added Actuals tracking with dated account balances, frozen plan comparisons, and rolling forecasts that update Dashboard, Ledger, Compare, and Monte Carlo automatically.
 - Added rebasing from actuals, with automatic future-assumption revisions, preserved historical forecasts, and editable history that retains later balances and rebases when correcting an entry. Tracking history is included in scenario saves and exports/imports.

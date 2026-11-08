@@ -167,7 +167,7 @@ export function deleteActualsEntry(tracking: ActualsTracking, baselineId: string
     const archived = source.rebase.observations.find((entry) => entry.date === observation.date);
     if (!archived) break;
     observationIds.add(archived.id);
-    const sourceId = source.rebase.sourceBaselineId;
+    const sourceId: string = source.rebase.sourceBaselineId;
     source = tracking.baselines.find((entry) => entry.id === sourceId);
   }
   const dependsOnEntry = (entries: BalanceObservation[] | undefined) => entries?.some((entry) => observationIds.has(entry.id)) ?? false;
@@ -308,7 +308,7 @@ export function rebaseFromActuals(inputs: RetirementInputs, source: ActualsBasel
   const archived = new Map((source.rebase?.observations ?? []).map((observation) => [observation.date, observation]));
   for (const observation of tracking.observations.filter((observation) => observation.baselineId === source.id && observation.date <= date)) archived.set(observation.date, observation);
   const observations = [...archived.values()].map((observation) => ({ ...structuredClone(observation), baselineId: id }));
-  const revisions = [...(source.rebase?.revisions ?? []), ...(tracking.forecastRevisions ?? []).filter((revision) => revision.baselineId === source.id)]
+  const revisions: ForecastRevision[] = [...(source.rebase?.revisions ?? []), ...(tracking.forecastRevisions ?? []).filter((revision) => revision.baselineId === source.id)]
     .map((revision) => ({ ...structuredClone(revision), baselineId: id,
       observations: revision.observations?.map((observation) => ({ ...structuredClone(observation), baselineId: id })) }));
   const effective = forecastInputsForYear(source.inputs, revisions, Number(date.slice(0, 4)));

@@ -32,7 +32,7 @@ export function workingForecastRebaseMarkers(inputs: RetirementInputs) {
     const dates = datesByYear.get(year) ?? new Set<string>();
     dates.add(date);
     datesByYear.set(year, dates);
-    const sourceId = baseline.rebase.sourceBaselineId;
+    const sourceId: string = baseline.rebase.sourceBaselineId;
     baseline = inputs.actuals?.baselines.find((entry) => entry.id === sourceId);
   }
   return [...datesByYear].sort(([first], [second]) => first - second).map(([calendarYear, dates]) => ({
