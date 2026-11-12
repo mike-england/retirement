@@ -48,6 +48,14 @@ export interface TaxSettings {
   provinces: Record<ProvinceCode, TaxJurisdictionSettings>;
 }
 
+export interface OasResidencySettings {
+  yearsAt65: number;
+  livesInCanada: boolean;
+  continueResidence: boolean;
+  eligibilityOverride?: boolean;
+  annualEstimates?: Partial<Record<65 | 70, number>>;
+}
+
 export interface PersonalInfo {
   label: string;
   currentAge: number;
@@ -56,7 +64,10 @@ export interface PersonalInfo {
   province: ProvinceCode;
   receivesCpp: boolean;
   cppPayoutRate: number;
+  cppAnnualEstimates?: Partial<Record<60 | 65 | 70, number>>;
   receivesOas: boolean;
+  oasPayoutRate?: number;
+  oasResidency?: OasResidencySettings;
   additionalPeople: PlanPerson[];
   rrifConversionAge?: number;
 }
@@ -69,7 +80,10 @@ export interface PlanPerson {
   birthMonth?: number;
   receivesCpp: boolean;
   cppPayoutRate: number;
+  cppAnnualEstimates?: Partial<Record<60 | 65 | 70, number>>;
   receivesOas: boolean;
+  oasPayoutRate?: number;
+  oasResidency?: OasResidencySettings;
   existingAssets?: ExistingAssets;
   rrifConversionAge?: number;
 }
@@ -160,12 +174,12 @@ export interface SpendingPhase {
 export interface SpendingPlan {
   desiredAnnualSpending: number;
   indexedToInflation: boolean;
+  indexFromFirstPhase?: boolean;
   phases: SpendingPhase[];
 }
 
 export interface MarketAssumptions {
   returnMean: number;
-  returnStdDev: number;
   returnFloor: number;
   returnCeiling: number;
   annualReturnOverrides: Record<number, number>;
@@ -186,7 +200,7 @@ export interface StrategySettings {
   pensionIncomeSplitting?: { enabled: boolean };
   // Order accounts are drawn down to cover each year's spending shortfall, e.g. ["interestBearing", "nonRegistered", "tfsa", "rrsp"].
   withdrawalOrder: WithdrawalAccount[];
-  // Defaults to "annual" (a single year-end withdrawal) for scenarios saved before this was configurable.
+  // Defaults to monthly when no withdrawal frequency is saved.
   withdrawalFrequency?: WithdrawalFrequency;
   // Uses the GIC/PPN as a sequence-of-returns buffer instead of a fixed withdrawal-order position: reserved (and optionally
   // refilled) while markets are near their peak, then drawn preferentially once the market portfolio is in a real drawdown.
@@ -451,10 +465,26 @@ export interface FailureAnalysis {
   averageReturnSuccessfulRuns: number;
 }
 
+export interface ReturnDiagnostics {
+  annualDrawCount: number;
+  requestedMean: number;
+  requestedMinimum: number;
+  requestedMaximum: number;
+  realizedMean: number;
+  minimum: number;
+  maximum: number;
+  negativeShare: number;
+  belowMinus10Share: number;
+  belowMinus20Share: number;
+  histogram: { minimum: number; maximum: number; count: number }[];
+  earlySequence: { years: number; worst: number; p10: number; p50: number; p90: number; best: number };
+}
+
 export interface SimulationOutput {
   kpis: SimulationKpis;
   percentileBands: PercentileBand[];
   medianRun: DeterministicProjection;
   runsCompleted: number;
   failureAnalysis: FailureAnalysis;
+  returnDiagnostics: ReturnDiagnostics;
 }

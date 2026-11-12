@@ -1,11 +1,10 @@
-import { decomposeAnnualReturn, forecastInputsForYear, projectRetirementPlan, sampleAnnualReturn, subPeriodsPerYear } from "@/lib/simulationEngine";
+import { decomposeAnnualReturn, forecastInputsForYear, impliedReturnStdDev, projectRetirementPlan, sampleAnnualReturn, subPeriodsPerYear } from "@/lib/simulationEngine";
 import { actualsProjectionOptions } from "@/lib/actuals";
 import { workingForecastContext } from "@/lib/workingForecast";
 import { planDateFor } from "@/lib/planDates";
 import type {
   DeterministicProjection,
   FailureAnalysis,
-  MonteCarloRun,
   PercentileBand,
   RetirementInputs,
   SimulationOutput,
@@ -28,6 +27,28 @@ export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (
   const projections: DeterministicProjection[] = [];
   const averageAnnualReturns: number[] = [];
   const yearlyInputs = Array.from({ length: yearCount }, (_, index) => forecastInputsForYear(simulationInputs, working?.revisions ?? [], baseYear + index));
+  const futurePlans = yearlyInputs.filter((_, index) => baseYear + index > fixedThroughYear);
+  const futureBounds = futurePlans.map((plan) => {
+    const minimum = plan.assumptions.returnFloor ?? -0.08;
+    const maximum = Math.max(minimum, plan.assumptions.returnCeiling ?? 0.15);
+    return { minimum, maximum, mean: Math.min(maximum, Math.max(minimum, plan.assumptions.returnMean)) };
+  });
+  const requestedMinimum = Math.min(...futureBounds.map((bounds) => bounds.minimum));
+  const requestedMaximum = Math.max(...futureBounds.map((bounds) => bounds.maximum));
+  const bucketCount = requestedMaximum > requestedMinimum ? 20 : 1;
+  const histogram = Array.from({ length: bucketCount }, (_, index) => ({
+    minimum: requestedMinimum + (requestedMaximum - requestedMinimum) * index / bucketCount,
+    maximum: requestedMinimum + (requestedMaximum - requestedMinimum) * (index + 1) / bucketCount,
+    count: 0,
+  }));
+  const earlyReturns: number[] = [];
+  let annualDrawCount = 0;
+  let returnSum = 0;
+  let minimumReturn = Infinity;
+  let maximumReturn = -Infinity;
+  let negativeCount = 0;
+  let belowMinus10Count = 0;
+  let belowMinus20Count = 0;
   let lastProgressAt = Date.now();
   onProgress?.(0, inputs.simulation.iterations);
 
@@ -35,18 +56,31 @@ export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (
     const annualReturns = yearlyInputs.map((plan, index) => {
       if (baseYear + index <= fixedThroughYear) return workingOptions.annualReturns![index];
       const floor = plan.assumptions.returnFloor ?? -0.08;
-      return sampleAnnualReturn(random, plan.assumptions.returnMean, plan.assumptions.returnStdDev, floor, Math.max(floor, plan.assumptions.returnCeiling ?? 0.15));
+      return sampleAnnualReturn(random, plan.assumptions.returnMean, floor, Math.max(floor, plan.assumptions.returnCeiling ?? 0.15));
     });
     const annualInflation = yearlyInputs.map((plan, index) => baseYear + index <= fixedThroughYear ? workingOptions.annualInflation![index]
       : Math.max(0, normalRandom(random, plan.assumptions.inflationMean, plan.assumptions.inflationStdDev)));
     const subPeriodReturns = annualReturns.map((annualReturn, index) => {
       if (baseYear + index <= fixedThroughYear) return workingOptions.subPeriodReturns![index];
-      return decomposeAnnualReturn(random, annualReturn, subPeriodsPerYear(yearlyInputs[index].strategy.withdrawalFrequency), yearlyInputs[index].assumptions.returnStdDev);
+      return decomposeAnnualReturn(random, annualReturn, subPeriodsPerYear(yearlyInputs[index].strategy.withdrawalFrequency), impliedReturnStdDev(yearlyInputs[index].assumptions));
     });
     const result = projectRetirementPlan(simulationInputs, { ...workingOptions, annualReturns, annualInflation, subPeriodReturns, pensionSplittingPolicy: "simple", fastWithdrawalSizing: true });
     if (working) result.portfolioDepleted = result.years.some((year) => year.calendarYear > fixedThroughYear && year.depleted);
     projections.push(result);
-    averageAnnualReturns.push(average(annualReturns.filter((_, index) => baseYear + index > fixedThroughYear)));
+    const futureReturns = annualReturns.filter((_, index) => baseYear + index > fixedThroughYear);
+    averageAnnualReturns.push(average(futureReturns));
+    earlyReturns.push(futureReturns.slice(0, 5).reduce((growth, value) => growth * (1 + value), 1) - 1);
+    for (const value of futureReturns) {
+      annualDrawCount += 1;
+      returnSum += value;
+      minimumReturn = Math.min(minimumReturn, value);
+      maximumReturn = Math.max(maximumReturn, value);
+      if (value < 0) negativeCount += 1;
+      if (value < -0.1) belowMinus10Count += 1;
+      if (value < -0.2) belowMinus20Count += 1;
+      const position = requestedMaximum > requestedMinimum ? (value - requestedMinimum) / (requestedMaximum - requestedMinimum) : 0;
+      histogram[Math.min(histogram.length - 1, Math.max(0, Math.floor(position * histogram.length)))].count += 1;
+    }
     if (onProgress && Date.now() - lastProgressAt >= 100) {
       onProgress(run + 1, inputs.simulation.iterations);
       lastProgressAt = Date.now();
@@ -73,6 +107,27 @@ export function runMonteCarloSimulation(inputs: RetirementInputs, onProgress?: (
     medianRun,
     runsCompleted: projections.length,
     failureAnalysis: createFailureAnalysis(projections, averageAnnualReturns, fixedThroughYear),
+    returnDiagnostics: {
+      annualDrawCount,
+      requestedMean: average(futureBounds.map((bounds) => bounds.mean)),
+      requestedMinimum,
+      requestedMaximum,
+      realizedMean: annualDrawCount ? returnSum / annualDrawCount : 0,
+      minimum: annualDrawCount ? minimumReturn : 0,
+      maximum: annualDrawCount ? maximumReturn : 0,
+      negativeShare: annualDrawCount ? negativeCount / annualDrawCount : 0,
+      belowMinus10Share: annualDrawCount ? belowMinus10Count / annualDrawCount : 0,
+      belowMinus20Share: annualDrawCount ? belowMinus20Count / annualDrawCount : 0,
+      histogram,
+      earlySequence: {
+        years: Math.min(5, futurePlans.length),
+        worst: percentile(earlyReturns, 0),
+        p10: percentile(earlyReturns, 0.1),
+        p50: percentile(earlyReturns, 0.5),
+        p90: percentile(earlyReturns, 0.9),
+        best: percentile(earlyReturns, 1),
+      },
+    },
   };
 }
 

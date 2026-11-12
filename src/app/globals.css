@@ -36,6 +36,68 @@ button, input, select { font: inherit; } button { cursor: pointer; }
 .field-label-text { display: flex; align-items: flex-start; gap: 5px; min-height: 15px; }
 .strategy-inputs .strategy-field-label, .strategy-inputs .check-row { color: var(--muted); font-family: Arial, sans-serif; font-size: 10px; font-weight: 700; line-height: 1.5; }
 .strategy-inputs .check-row { align-items: flex-start; margin-top: 12px; }
+.maximum-spending-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.withdrawal-order-advisor .button { display: inline-flex; align-items: center; gap: 6px; }
+.maximum-spending-note { margin: 10px 0 0; font-size: 11px; line-height: 1.5; }
+.maximum-spending-table { min-width: 0; table-layout: fixed; font-variant-numeric: tabular-nums; }
+.maximum-spending-table th, .maximum-spending-table td { padding: 8px 5px; font-size: 10px; text-align: right; white-space: normal; overflow-wrap: anywhere; }
+.maximum-spending-table th:first-child { text-align: left; }
+.maximum-spending-table tbody th { background: var(--paper); font-weight: 400; }
+.maximum-spending-totals { margin: 12px 0; font-size: 11px; font-variant-numeric: tabular-nums; }
+.maximum-spending-totals div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.maximum-spending-totals dt { color: var(--muted); }
+.maximum-spending-totals dd { margin: 0; }
+.withdrawal-order-advisor { min-width: 0; margin: 12px 0 18px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.withdrawal-order-advisor p { margin: 10px 0 0; line-height: 1.5; }
+.withdrawal-order-result > .button { margin-top: 12px; }
+.withdrawal-suggested-order { display: grid; gap: 4px; margin: 8px 0 12px; padding-left: 18px; font-size: 11px; line-height: 1.4; }
+.view-tabs { overflow-x: auto; }
+.view-tabs button { flex: 0 0 auto; white-space: nowrap; }
+.strategy-workspace { display: grid; gap: 16px; min-width: 0; padding-bottom: 12px; }
+.strategy-workspace[hidden] { display: none; }
+.strategy-workspace h2 { font-size: 16px; }
+.strategy-workspace h3 { margin: 12px 0 8px; font-size: 14px; line-height: 1.4; }
+.strategy-workspace .withdrawal-order-advisor { margin: 0; padding: 8px 0 0; border: 0; }
+.strategy-comparison-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 20px; }
+.strategy-comparison-toolbar > .field-label { flex: 0 1 260px; min-width: 0; max-width: 100%; margin: 0; }
+.strategy-comparison-toolbar .maximum-spending-actions { margin: 0; }
+.withdrawal-order-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 10px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.withdrawal-order-options section { min-width: 0; }
+.withdrawal-order-options h4 { margin: 0 0 8px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.strategy-workspace .withdrawal-suggested-order { margin: 0; gap: 3px; font-size: 12px; overflow-wrap: anywhere; }
+.strategy-spending-preview { margin-top: 12px; padding-top: 4px; border-top: 1px solid var(--line); }
+.strategy-workspace .maximum-spending-table th, .strategy-workspace .maximum-spending-table td { padding: 8px 10px; font-size: 12px; }
+.strategy-workspace .maximum-spending-note { max-width: 760px; font-size: 12px; }
+.strategy-workspace .maximum-spending-totals { max-width: 560px; font-size: 12px; }
+.government-benefits-strategy { min-width: 0; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.benefit-settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 220px)); gap: 10px 14px; margin-top: 10px; }
+.benefit-primary-settings { grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); align-items: end; }
+.benefit-primary-settings .field-label-text { align-items: center; white-space: nowrap; }
+.benefit-primary-settings .field-hint { flex: 0 0 13px; }
+.government-benefits-strategy .field-label { font-size: 12px; line-height: 1.5; }
+.benefit-person-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; margin-top: 8px; }
+.benefit-person-settings .check-row { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+.benefit-person-settings > .field-label { width: min(100%, 260px); }
+.benefit-estimate-details { margin-top: 10px; }
+.benefit-estimate-details summary, .benefit-model-details summary, .benefit-payment-details summary { width: fit-content; color: var(--blue); cursor: pointer; font-size: 12px; font-weight: 600; }
+.benefit-model-details, .benefit-payment-details { margin-top: 10px; }
+.benefit-payment-details .table-wrap { margin-top: 8px; }
+.benefit-model-note, .benefit-estimate-details p { max-width: 960px; margin: 8px 0 0; font-size: 12px; line-height: 1.5; }
+.benefit-timing-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 12px; }
+.benefit-timing-chart { min-width: 0; border-top: 1px solid var(--line); }
+.benefit-comparison-table { min-width: 0; table-layout: fixed; font-variant-numeric: tabular-nums; }
+.benefit-comparison-table th, .benefit-comparison-table td { padding: 6px 8px; text-align: right; white-space: normal; overflow-wrap: anywhere; }
+.benefit-comparison-table th:first-child { width: 22%; text-align: left; }
+.benefit-comparison-table th:last-child, .benefit-comparison-table td:last-child { text-align: left; }
+.benefit-comparison-table tbody th { background: var(--paper); font-size: 11px; font-weight: 400; }
+.benefit-crossovers { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 8px 0 0; padding: 0; list-style: none; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.benefit-crossovers strong { color: var(--ink); font-weight: 600; }
+@media (max-width: 1050px) { .benefit-primary-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 1000px) and (min-width: 761px) { .benefit-timing-grid { grid-template-columns: 1fr; } }
+@media (max-width: 620px) { .benefit-timing-grid { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .benefit-settings-grid { grid-template-columns: 1fr; }.benefit-primary-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }.benefit-person-settings { align-items: flex-start; }.government-benefits-strategy .field-label { width: 100%; } }
+@media (max-width: 430px) { .benefit-primary-settings { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .withdrawal-order-options { grid-template-columns: 1fr; gap: 18px; }.strategy-comparison-toolbar > .field-label { flex-basis: 100%; }.strategy-workspace .maximum-spending-table th, .strategy-workspace .maximum-spending-table td { padding: 9px 8px; font-size: 11px; } }
 .strategy-inputs .check-row input { flex: 0 0 14px; margin: 0; }
 .strategy-inputs .field-hint { flex-shrink: 0; }
 .strategy-inputs .check-row .field-hint { margin-left: auto; }
@@ -91,6 +153,25 @@ button, input, select { font: inherit; } button { cursor: pointer; }
 .button-delete-all { min-width: 78px; white-space: nowrap; }
 .return-distribution-preview { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fafcff; }
 .return-distribution-stats { margin: 6px 0 0; font-size: 11px; }
+.monte-carlo-return-diagnostics { min-width: 0; margin: 20px 0; padding: 18px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.monte-carlo-return-diagnostics .panel-heading { flex-wrap: wrap; gap: 8px; }
+.monte-carlo-return-diagnostics .panel-heading span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.monte-carlo-return-diagnostics h3 { margin: 18px 0 10px; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+.monte-carlo-return-diagnostics .table-wrap { max-width: 100%; }
+.monte-carlo-loss-note { margin: 8px 0 0; max-width: 680px; line-height: 1.5; }
+.monte-carlo-return-diagnostics .monte-carlo-summary-table { min-width: 0; table-layout: fixed; font-variant-numeric: tabular-nums; }
+.monte-carlo-summary-table th, .monte-carlo-summary-table td { padding: 9px 12px; text-align: right; white-space: normal; overflow-wrap: anywhere; }
+.monte-carlo-summary-table th:first-child { text-align: left; }
+.monte-carlo-summary-table thead th:first-child { width: 44%; }
+.monte-carlo-summary-table tbody th { background: var(--paper); font-size: 11px; font-weight: 400; }
+.monte-carlo-summary-table .loss-group-heading { border-top: 1px solid var(--line); background: #f7f9fc; font-weight: 700; }
+.monte-carlo-results-table { min-width: 480px; table-layout: fixed; font-variant-numeric: tabular-nums; }
+.monte-carlo-results-table th, .monte-carlo-results-table td { padding: 9px 12px; text-align: right; white-space: normal; }
+.monte-carlo-results-table th:first-child { text-align: right; }
+.monte-carlo-portfolio-table th:first-child, .monte-carlo-portfolio-table td:first-child { width: 12%; text-align: left; }
+.monte-carlo-results-table.monte-carlo-sequence-table { min-width: 560px; }
+.monte-carlo-sequence-table strong { display: block; color: var(--ink); font-size: 12px; font-weight: 600; line-height: 1.5; }
+.monte-carlo-sequence-table td span { display: block; margin-top: 3px; font-size: 11px; line-height: 1.5; }
 .gic-list { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
 .gic-card { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fafcff; }
 .gic-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
@@ -188,7 +269,7 @@ button, input, select { font: inherit; } button { cursor: pointer; }
 .ledger-funding-table thead tr:first-child th:not(:first-child) { text-align: center; }
 .ledger-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .ledger-recalculate { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
-.ledger-funding-table td:nth-child(9), .ledger-funding-table td:nth-child(12) { background: #edf3f8; }
+.ledger-funding-table td:nth-child(9), .ledger-funding-table td:last-child { background: #edf3f8; }
 .ledger-funding-table td:last-child, .ledger-funding-table th:last-child { border-left: 1px solid var(--line); }
 .ledger-funding-table tfoot th, .ledger-funding-table tfoot td { padding-top: 9px; border-top: 1px solid var(--line); font-weight: 700; }
 .actuals-view { min-width: 0; font-family: Arial, sans-serif; }
