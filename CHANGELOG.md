@@ -1,3 +1,10 @@
+# 1.5.0 (November 12, 2026)
+- Added Strategy Lab to compare withdrawal orders and estimate maximum proportional spending, while retaining manual control.
+- Added CPP/OAS payment and crossover charts, optional per-age CPP estimates, and per-person OAS percentages.
+- Simplified return assumptions to average, minimum, and maximum, replacing return standard deviation with a broader bounded distribution.
+- Expanded Monte Carlo reporting with generated return ranges, loss frequencies, and five-year return comparisons.
+- Added inflation indexing from the first spending phase and made monthly withdrawals the default for new or unspecified settings.
+
 # 1.4.1 (November 7, 2026)
 - Fix a compile error
 

@@ -17,7 +17,7 @@ export default function RootLayout({
         <Script
           src="https://gc.zgo.at/count.js"
           strategy="afterInteractive"
-          data-goatcounter="https://retirement-planner.goatcounter.com/count"
+          data-goatcounter="https://mike-retirement.goatcounter.com/count"
           data-goatcounter-settings={JSON.stringify({ path: "/retirement/", title: "Retirement Planner", referrer: "", no_events: true })}
         />
       </body>

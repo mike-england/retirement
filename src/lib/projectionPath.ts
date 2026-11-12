@@ -1,4 +1,4 @@
-import { decomposeAnnualReturn, projectRetirementPlan, sampleAnnualReturn, subPeriodsPerYear } from "@/lib/simulationEngine";
+import { decomposeAnnualReturn, impliedReturnStdDev, projectRetirementPlan, sampleAnnualReturn, subPeriodsPerYear } from "@/lib/simulationEngine";
 import type { DeterministicProjection, RetirementInputs } from "@/types/retirement";
 
 export function isReturnOverrideUpdate(previous: RetirementInputs, current: RetirementInputs): boolean {
@@ -32,7 +32,7 @@ export function projectWithVariableReturns(inputs: RetirementInputs): Determinis
     : (() => {
       // Offset from the annual seed so the within-year noise isn't a repeat of the annual draw sequence.
       const random = createRandom((inputs.simulation.randomSeed ?? 0) + 1);
-      return annualReturns.map((annualReturn) => decomposeAnnualReturn(random, annualReturn, subPeriodCount, inputs.assumptions.returnStdDev));
+      return annualReturns.map((annualReturn) => decomposeAnnualReturn(random, annualReturn, subPeriodCount, impliedReturnStdDev(inputs.assumptions)));
     })();
   return projectRetirementPlan(inputs, { annualReturns, subPeriodReturns });
 }
@@ -49,7 +49,7 @@ export function generateAnnualReturns(inputs: RetirementInputs, seed = inputs.si
   const targetMean = Math.min(ceiling, Math.max(floor, inputs.assumptions.returnMean));
   return Array.from(
     { length: yearCount },
-    () => sampleAnnualReturn(random, targetMean, inputs.assumptions.returnStdDev, floor, ceiling),
+    () => sampleAnnualReturn(random, targetMean, floor, ceiling),
   );
 }
 

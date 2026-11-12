@@ -10,6 +10,7 @@ export const defaultRetirementInputs: RetirementInputs = {
     receivesCpp: true,
     cppPayoutRate: 0.6,
     receivesOas: true,
+    oasPayoutRate: 1,
     additionalPeople: [],
   },
   incomeStreams: [
@@ -36,6 +37,7 @@ export const defaultRetirementInputs: RetirementInputs = {
   spendingPlan: {
     desiredAnnualSpending: 80_000,
     indexedToInflation: true,
+    indexFromFirstPhase: false,
     phases: [
       { id: "go-go", label: "Go-Go", startAge: 65, endAge: 74, annualSpending: 80_000 },
       { id: "slow-go", label: "Slow-Go", startAge: 75, endAge: 84, annualSpending: 60_000 },
@@ -47,7 +49,6 @@ export const defaultRetirementInputs: RetirementInputs = {
     // recession year vs. a strong recovery year) so the crash/calm return model has room to draw genuine down years
     // instead of clamping almost everything toward one bound. See the Assumptions tab's return distribution preview.
     returnMean: 0.06,
-    returnStdDev: 0.11,
     returnFloor: -0.25,
     returnCeiling: 0.2,
     annualReturnOverrides: {},
@@ -60,7 +61,7 @@ export const defaultRetirementInputs: RetirementInputs = {
     oasStartAge: 65,
     aggressiveRrspMeltdown: false,
     withdrawalOrder: ["interestBearing", "nonRegistered", "tfsa", "rrsp"],
-    withdrawalFrequency: "annual",
+    withdrawalFrequency: "monthly",
   },
   simulation: {
     iterations: 1_000,

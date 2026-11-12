@@ -1,6 +1,6 @@
 "use client";
 
-import { BadgeDollarSign, BriefcaseBusiness, Check, ChevronDown, Landmark, Menu, Plus, SlidersHorizontal, Trash2, UsersRound, WalletCards } from "lucide-react";
+import { BadgeDollarSign, BriefcaseBusiness, Calculator, Check, ChevronDown, Landmark, Menu, Plus, SlidersHorizontal, Trash2, UsersRound, WalletCards, X } from "lucide-react";
 import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -19,7 +19,7 @@ import {
 } from "react";
 import { defaultRetirementInputs } from "@/lib/default-inputs";
 import packageJson from "../../package.json";
-import type { MonteCarloWorkerMessage } from "@/lib/monteCarlo.worker";
+import type { MonteCarloWorkerMessage, WithdrawalOrderWorkerMessage } from "@/lib/monteCarlo.worker";
 import { forecastInputsForYear, sampleAnnualReturn } from "@/lib/simulationEngine";
 import { hasCompleteFundingSummary, isReturnOverrideUpdate, projectWithVariableReturns } from "@/lib/projectionPath";
 import { accountEntriesFor, accountTotal, assetsWithAccounts } from "@/lib/accounts";
@@ -30,10 +30,10 @@ import {
   provinceNames,
 } from "@/lib/taxRules";
 import { ageYearLabel, maxHouseholdAge, monthYearLabel, parsePlanDate, planDateFor, withPlanDate } from "@/lib/planDates";
-import { calculateCppAnnualBenefit, cppAnnualMaximum } from "@/lib/governmentBenefits";
+import { calculateCppAnnualBenefit, calculateOasAnnualBenefit, cppAnnualMaximum, oasAnnualMaximum } from "@/lib/governmentBenefits";
 import { SimulationCharts } from "@/components/SimulationCharts";
 import { ActualsView } from "@/components/ActualsView";
-import { projectWorkingForecast, workingForecastContext, workingForecastRebaseMarkers } from "@/lib/workingForecast";
+import { projectWorkingForecast, workingForecastContext, workingForecastRebaseMarkers, type WithdrawalObjective, type WithdrawalOrderSuggestion } from "@/lib/workingForecast";
 import { ScenarioFileDialog, ScenarioImportConflictDialog } from "@/components/ScenarioFileDialog";
 import { decryptScenario, encryptScenario, isEncryptedScenario } from "@/lib/scenarioEncryption";
 import type {
@@ -262,15 +262,18 @@ export default function Home() {
   // Changing the underlying random-generation parameters invalidates any previously locked-in path (bulk-generated or
   // hand-edited), so the Ledger/Dashboard immediately reflect the new assumptions instead of staying frozen at old values.
   function setReturnAssumption(patch: Partial<RetirementInputs["assumptions"]>) {
-    setInputs((current) => ({
-      ...current,
-      assumptions: { ...current.assumptions, ...patch, annualReturnOverrides: {} },
-    }));
+    setInputs((current) => {
+      const assumptions = { ...current.assumptions, ...patch, annualReturnOverrides: {} };
+      assumptions.returnFloor = Math.max(-0.999, assumptions.returnFloor);
+      assumptions.returnCeiling = Math.max(assumptions.returnFloor, assumptions.returnCeiling);
+      assumptions.returnMean = Math.min(assumptions.returnCeiling, Math.max(assumptions.returnFloor, assumptions.returnMean));
+      return { ...current, assumptions };
+    });
   }
 
   function applyReturnSeed(seed: number) {
     // Clearing overrides (rather than freezing every year's value) lets the Ledger keep regenerating live from the
-    // seed whenever mean/std-dev/floor/ceiling change, instead of the whole path getting stuck at whatever it was
+    // seed whenever average/minimum/maximum change, instead of the whole path getting stuck at whatever it was
     // when this seed was picked. Any individual years you've hand-edited via the Ledger's Return cells still stick.
     setInputs((current) => ({
       ...current,
@@ -711,6 +714,7 @@ export default function Home() {
                           receivesCpp: true,
                           cppPayoutRate: 0.6,
                           receivesOas: true,
+                          oasPayoutRate: 1,
                         },
                       ],
                     },
@@ -750,7 +754,11 @@ export default function Home() {
                             currentAge: nextPrimary.currentAge,
                             targetDeathAge: nextPrimary.targetDeathAge,
                             receivesCpp: nextPrimary.receivesCpp,
+                            cppPayoutRate: nextPrimary.cppPayoutRate,
+                            cppAnnualEstimates: nextPrimary.cppAnnualEstimates,
                             receivesOas: nextPrimary.receivesOas,
+                            oasPayoutRate: nextPrimary.oasPayoutRate,
+                            oasResidency: nextPrimary.oasResidency,
                             additionalPeople: remainingPeople,
                           },
                         };
@@ -839,11 +847,11 @@ export default function Home() {
                   CPP
                 </label>
                 <NumberField
-                  label="CPP payout"
+                  label="CPP at 65 (% of maximum)"
                   min={0}
                   step={1}
                   suffix="%"
-                  tooltip={`At ${inputs.strategy.cppStartAge}, ${formatCurrency(calculateCppAnnualBenefit(cppAnnualMaximum * (inputs.personalInfo.cppPayoutRate ?? 0.6), inputs.strategy.cppStartAge))} per year before tax, based on the current maximum CPP and this payout percentage.`}
+                  tooltip={`At ${inputs.strategy.cppStartAge}, ${formatCurrency(calculateCppAnnualBenefit(cppAnnualMaximum * (inputs.personalInfo.cppPayoutRate ?? 0.6), inputs.strategy.cppStartAge, inputs.personalInfo.cppAnnualEstimates))} per year before tax. This percentage is the age-65 baseline, not the age-60 reduction. A custom start-age estimate in Strategy Lab overrides the percentage for that age.`}
                   value={oneDecimalPercent(inputs.personalInfo.cppPayoutRate ?? 0.6)}
                   onChange={(value) =>
                     setInputs((current) => ({
@@ -995,11 +1003,11 @@ export default function Home() {
                     CPP
                   </label>
                   <NumberField
-                    label="CPP payout"
+                    label="CPP at 65 (% of maximum)"
                     min={0}
                     step={1}
                     suffix="%"
-                      tooltip={`At ${inputs.strategy.cppStartAge}, ${formatCurrency(calculateCppAnnualBenefit(cppAnnualMaximum * (person.cppPayoutRate ?? 0.6), inputs.strategy.cppStartAge))} per year before tax, based on the current maximum CPP and this payout percentage.`}
+                      tooltip={`At ${inputs.strategy.cppStartAge}, ${formatCurrency(calculateCppAnnualBenefit(cppAnnualMaximum * (person.cppPayoutRate ?? 0.6), inputs.strategy.cppStartAge, person.cppAnnualEstimates))} per year before tax. A custom start-age estimate in Strategy Lab overrides this age-65 baseline percentage for that age.`}
                     value={oneDecimalPercent(person.cppPayoutRate ?? 0.6)}
                     onChange={(value) =>
                       setInputs((current) => ({
@@ -1100,34 +1108,26 @@ export default function Home() {
             <h2>Assumptions</h2>
             <div className="field-grid two-up">
               <NumberField
-                label="Return mean"
+                label="Average annual return"
+                min={Number(oneDecimalPercent(inputs.assumptions.returnFloor))}
+                max={Number(oneDecimalPercent(inputs.assumptions.returnCeiling))}
                 step={0.1}
                 suffix="%"
                 value={oneDecimalPercent(inputs.assumptions.returnMean)}
-                tooltip="Average annual investment return. It sets the single randomized path used on the Dashboard/Ledger, and is the value Monte Carlo centers every run's randomized returns on — raising it improves most outcomes and the success rate."
+                tooltip="Expected arithmetic average of annual investment returns, before inflation. The distribution is weighted across the minimum and maximum to target this average. Individual retirement paths can average more or less; this is not a guaranteed compounded growth rate."
                 onChange={(value) =>
                   setReturnAssumption({ returnMean: Number(value) / 100 })
                 }
               />
               <NumberField
-                label="Return StdDev"
-                min={0}
-                step={0.1}
-                suffix="%"
-                value={oneDecimalPercent(inputs.assumptions.returnStdDev)}
-                tooltip="How much annual returns vary year to year, for both the Dashboard/Ledger's single path and every Monte Carlo run. Higher values widen the spread between Monte Carlo runs — more very good and very bad sequences of returns, which increases the chance of an early bad stretch depleting the portfolio."
-                onChange={(value) =>
-                  setReturnAssumption({ returnStdDev: Math.max(0, Number(value)) / 100 })
-                }
-              />
-              <NumberField
-                label="Return floor"
+                label="Minimum annual return"
+                min={-99.9}
                 step={0.1}
                 suffix="%"
                 value={oneDecimalPercent(
                   inputs.assumptions.returnFloor ?? -0.08,
                 )}
-                tooltip="The worst single-year return any randomized path can draw, on the Dashboard/Ledger and in Monte Carlo alike. Returns below this are resampled, so it caps how bad any one simulated year can be."
+                tooltip="Hard lower bound for generated annual returns. Values near this bound are possible, but exact endpoints are not forced. No simulated annual return will be worse; real markets can be. Widening the range changes the distribution and retirement risk."
                 onChange={(value) =>
                   setReturnAssumption({
                     returnFloor: Math.min(
@@ -1138,13 +1138,13 @@ export default function Home() {
                 }
               />
               <NumberField
-                label="Return cap"
+                label="Maximum annual return"
                 step={0.1}
                 suffix="%"
                 value={oneDecimalPercent(
                   inputs.assumptions.returnCeiling ?? 0.15,
                 )}
-                tooltip="The best single-year return any randomized path can draw, on the Dashboard/Ledger and in Monte Carlo alike. Returns above this are resampled, so it caps how good any one simulated year can be."
+                tooltip="Hard upper bound for generated annual returns. The full range is smoothly weighted to target the requested average, not concentrated around a bell curve. Exact endpoints are not forced. If the average equals a bound, all annual draws equal that bound."
                 onChange={(value) =>
                   setReturnAssumption({
                     returnCeiling: Math.max(
@@ -1196,49 +1196,16 @@ export default function Home() {
             {activeInputTab === "Assumptions" && (
               <ReturnDistributionPreview
                 mean={inputs.assumptions.returnMean}
-                stdDev={inputs.assumptions.returnStdDev}
                 floor={inputs.assumptions.returnFloor ?? -0.08}
                 ceiling={inputs.assumptions.returnCeiling ?? 0.15}
               />
             )}
             <p className="section-note">
-              These drive both the Dashboard&apos;s single projected path and
-              every run of the Monte Carlo simulation. Monte Carlo draws a
-              random annual return and inflation rate for each year of each
-              run from the mean/StdDev below, clamped to the floor/cap, then
-              reports how many of those randomized futures avoid running out
-              of money.
+              Annual return assumptions apply to both the Dashboard and Monte Carlo. The average is an arithmetic expectation, not guaranteed compounded growth; minimum and maximum are simulation limits, not market guarantees.
             </p>
           </section>
           </div>
           <div className="strategy-inputs" hidden={activeInputTab !== "Strategy"}>
-          <section className="input-section">
-            <h2>Government benefits</h2>
-            <div className="field-grid two-up benefit-start-ages">
-              <AgeSelect
-                label="CPP start age"
-                value={inputs.strategy.cppStartAge}
-                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.cppStartAge, planYear)} for the primary person.`}
-                onChange={(value) =>
-                  setInputs((current) => ({
-                    ...current,
-                    strategy: { ...current.strategy, cppStartAge: value },
-                  }))
-                }
-              />
-              <AgeSelect
-                label="OAS start age"
-                value={inputs.strategy.oasStartAge}
-                tooltip={`Starts ${monthYearLabel(inputs.personalInfo, inputs.strategy.oasStartAge, planYear)} for the primary person.`}
-                onChange={(value) =>
-                  setInputs((current) => ({
-                    ...current,
-                    strategy: { ...current.strategy, oasStartAge: value },
-                  }))
-                }
-              />
-            </div>
-          </section>
           <section className="input-section">
             <h2>Withdrawal strategy</h2>
             <div className="field-label-text strategy-field-label">
@@ -1288,7 +1255,7 @@ export default function Home() {
                 <FieldHint text="How often the withdrawal waterfall runs against realized returns, instead of one lump annual withdrawal. Monthly/quarterly/semi-annual also apply randomized within-year return variation on the Dashboard/Ledger and in Monte Carlo, so a down stretch isn't sold from as if the whole year were flat." />
               </span>
               <select
-                value={inputs.strategy.withdrawalFrequency ?? "annual"}
+                value={inputs.strategy.withdrawalFrequency ?? "monthly"}
                 onChange={(event) =>
                   setInputs((current) => ({
                     ...current,
@@ -1396,7 +1363,7 @@ export default function Home() {
         </aside>
         <section className="workspace">
           <nav className="view-tabs" aria-label="Workspace views">
-            {["Dashboard", "Accounts", "Ledger", "Actuals", "Monte Carlo", "Compare", "Tax Info", "Guide"].map(
+            {["Dashboard", "Accounts", "Ledger", "Actuals", "Monte Carlo", "Strategy Lab", "Compare", "Tax Info", "Guide"].map(
               (view) => (
                 <button
                   key={view}
@@ -1422,6 +1389,8 @@ export default function Home() {
                     ? "Year-by-year ledger"
                     : activeView === "Monte Carlo"
                       ? "Monte Carlo simulation"
+                      : activeView === "Strategy Lab"
+                        ? "Withdrawal strategy & spending"
                       : activeView === "Compare"
                         ? "Scenario comparison"
                         : activeView === "Guide"
@@ -1439,6 +1408,8 @@ export default function Home() {
                     ? "Plain-language notes on every input and assumption in the planner."
                     : activeView === "Monte Carlo"
                       ? "Randomized outcomes for risk testing."
+                      : activeView === "Strategy Lab"
+                        ? workingContext ? `Working forecast · ${workingContext.asOf}` : `Ledger path · seed ${inputs.simulation.randomSeed ?? 42}`
                       : isRunning
                         ? "Updating projection..."
                         : projection
@@ -1449,6 +1420,25 @@ export default function Home() {
           </div>
           {activeView === "Accounts" && <AccountsView inputs={inputs} onChange={setInputs} snapshot={selectedAccounts} balanceView={accountsBalanceView} onBalanceViewChange={setAccountsBalanceView} />}
           {activeView === "Actuals" && <ActualsView key={activeScenarioId} inputs={inputs} projection={projection} onChange={saveActuals} onOpenAccounts={() => setActiveView("Accounts")} />}
+          <div className="strategy-workspace" hidden={activeView !== "Strategy Lab"} key={`strategy-${activeScenarioId}`}>
+            <section className="strategy-comparison-section">
+              <h2>Compare withdrawal & spending strategies</h2>
+              <WithdrawalOrderAdvisor inputs={inputs} onApply={(result) => setInputs((current) => ({
+                ...current, strategy: { ...current.strategy, withdrawalOrder: [...result.suggested.order] },
+                simulation: { ...current.simulation, randomSeed: result.randomSeed },
+              }))} onApplySpending={(result, choice) => {
+                const candidate = result[choice];
+                const maximum = candidate.maximumSpending;
+                if (!maximum) return;
+                setInputs((current) => ({
+                  ...current, spendingPlan: maximum.spendingPlan,
+                  strategy: { ...current.strategy, withdrawalOrder: [...candidate.order] },
+                  simulation: { ...current.simulation, randomSeed: result.randomSeed },
+                }));
+              }} />
+            </section>
+            <GovernmentBenefitsStrategy inputs={inputs} onChange={setInputs} />
+          </div>
           {activeView === "Dashboard" && (
             <DashboardView
               kpis={kpis}
@@ -2245,6 +2235,9 @@ function SpendingPlanEditor({
               label="Annual spend"
               prefix="$"
               value={phase.annualSpending}
+              tooltip={!spendingPlan.indexedToInflation ? "Annual spending without inflation increases." : spendingPlan.indexFromFirstPhase
+                ? "Amount in the first phase's starting-year dollars. Inflation increases begin after that year and continue across later phases."
+                : "Amount in plan-start dollars. Inflation increases apply from the plan start, including years before the first phase."}
               onChange={(value) =>
                 updatePhase(phase.id, { annualSpending: Number(value) })
               }
@@ -2279,9 +2272,285 @@ function SpendingPlanEditor({
         />{" "}
         Indexed to inflation
       </label>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={spendingPlan.indexFromFirstPhase ?? false}
+          disabled={!spendingPlan.indexedToInflation}
+          onChange={(event) => onChange({ ...spendingPlan, indexFromFirstPhase: event.target.checked })}
+        />{" "}
+        <span className="field-label-text">
+          Start indexing at first phase
+          <FieldHint text="Use the earliest phase's start year instead of the plan start as the inflation anchor. That year's annual target equals the entered amount; inflation increases begin the following year. All phases use this same anchor, without restarting at each phase. Partial-year spending rules still apply. If the first phase predates the plan start, indexing starts at the plan start." />
+        </span>
+      </label>
     </section>
   );
 }
+function GovernmentBenefitsStrategy({ inputs, onChange }: { inputs: RetirementInputs; onChange: (inputs: RetirementInputs) => void }) {
+  const [selectedId, setSelectedId] = useState("primary");
+  const people = [{ ...inputs.personalInfo, id: "primary" }, ...(inputs.personalInfo.additionalPeople ?? [])];
+  const person = people.find((person) => person.id === selectedId) ?? people[0];
+  const planYear = planDateFor(inputs).getFullYear();
+  const startAges = [60, 65, 70] as const;
+  const usesLegacyOas = person.oasPayoutRate === undefined && Boolean(person.oasResidency);
+  const oasPayoutRate = person.oasPayoutRate ?? (person.oasResidency
+    ? Math.min(1, Math.max(0, calculateOasAnnualBenefit(oasAnnualMaximum, 65, person.oasResidency) / oasAnnualMaximum)) : 1);
+  function updatePerson(patch: Partial<Pick<RetirementInputs["personalInfo"], "cppAnnualEstimates" | "cppPayoutRate" | "receivesCpp" | "receivesOas" | "oasPayoutRate" | "oasResidency">>) {
+    onChange({ ...inputs, personalInfo: person.id === "primary" ? { ...inputs.personalInfo, ...patch }
+      : { ...inputs.personalInfo, additionalPeople: inputs.personalInfo.additionalPeople.map((entry) => entry.id === person.id ? { ...entry, ...patch } : entry) } });
+  }
+  function useOasPercentage(rate: number) {
+    updatePerson({ oasPayoutRate: Math.min(1, Math.max(0, rate)), oasResidency: undefined });
+  }
+  const cppChoices = startAges.map((age) => ({
+    age,
+    annualAmount: (person.receivesCpp ?? true) ? calculateCppAnnualBenefit(cppAnnualMaximum * (person.cppPayoutRate ?? 0.6), age, person.cppAnnualEstimates) : 0,
+    source: !(person.receivesCpp ?? true) ? "CPP disabled" : person.cppAnnualEstimates?.[age] !== undefined ? "Custom estimate" : "Percentage-based estimate",
+  }));
+  const oasChoices = ([65, 70] as const).map((age) => {
+    const annualAmount = (person.receivesOas ?? true) ? calculateOasAnnualBenefit(oasAnnualMaximum, age, person.oasResidency, person.oasPayoutRate) : 0;
+    return { age, annualAmount,
+      source: !(person.receivesOas ?? true) ? "OAS disabled" : usesLegacyOas ? "Saved detailed OAS settings"
+        : `${oneDecimalPercent(person.oasPayoutRate ?? 1)}% of full OAS`,
+    };
+  });
+  return (
+    <section className="government-benefits-strategy">
+      <h2>Government benefits</h2>
+      <div className="benefit-settings-grid benefit-primary-settings">
+        <AgeSelect label="CPP start age" value={inputs.strategy.cppStartAge}
+          tooltip={`Shared election, applied at each person's own age. For the primary person: ${monthYearLabel(inputs.personalInfo, inputs.strategy.cppStartAge, planYear)}.`}
+          onChange={(cppStartAge) => onChange({ ...inputs, strategy: { ...inputs.strategy, cppStartAge } })} />
+        <label className="field-label"><span className="field-label-text">OAS start age<FieldHint text="OAS cannot start before 65. The selected age applies to each person at their own age." /></span>
+          <select value={Math.max(65, inputs.strategy.oasStartAge)} onChange={(event) => onChange({ ...inputs, strategy: { ...inputs.strategy, oasStartAge: Number(event.target.value) as 65 | 70 } })}>
+            <option value={65}>65</option><option value={70}>70</option>
+          </select>
+        </label>
+        <label className="field-label">Person<select value={person.id} onChange={(event) => setSelectedId(event.target.value)}>
+          {people.map((entry) => <option key={entry.id} value={entry.id}>{entry.label || "Primary person"}</option>)}
+        </select></label>
+        <NumberField label="CPP at 65 (% maximum)" min={0} step={1} suffix="%" value={oneDecimalPercent(person.cppPayoutRate ?? 0.6)}
+          tooltip="Fallback age-65 entitlement. Before 65, CPP reduces it by 0.6% per month; after 65, it increases by 0.7% per month. This does not calculate contribution history, dropout provisions, or zero-earning years."
+          onChange={(value) => updatePerson({ cppPayoutRate: Math.max(0, Number(value) / 100) })} />
+        <NumberField label="OAS at 65 (% maximum)" min={0} max={100} step={0.1} suffix="%" value={oneDecimalPercent(oasPayoutRate)}
+          tooltip="Full OAS at 65 generally requires 40 years of Canadian residence after age 18. Use years / 40 × 100: 20 years = 50%, 30 years = 75%, 40 or more = 100%. The deferral increase is added separately. Verify eligibility and exceptions with Service Canada."
+          onChange={(value) => {
+            const rate = Math.min(1, Math.max(0, Number(value) / 100));
+            if (!usesLegacyOas || oneDecimalPercent(rate) !== oneDecimalPercent(oasPayoutRate)) useOasPercentage(rate);
+          }} />
+      </div>
+      <div className="benefit-person-settings">
+        <label className="check-row"><input type="checkbox" checked={person.receivesCpp ?? true} onChange={(event) => updatePerson({ receivesCpp: event.target.checked })} />CPP eligible</label>
+        <label className="check-row"><input type="checkbox" checked={person.receivesOas ?? true} onChange={(event) => updatePerson({ receivesOas: event.target.checked })} />OAS eligible</label>
+      </div>
+      {usesLegacyOas && <p className="benefit-model-note">Saved detailed OAS settings remain active. <button type="button" className="text-button" onClick={() => useOasPercentage(oasPayoutRate)}>Use displayed percentage instead</button></p>}
+      <details className="benefit-estimate-details">
+        <summary>CPP estimates by start age (optional)</summary>
+        <p>Annual amounts in plan-date dollars, already adjusted for the chosen start age and your expected contribution history. A custom estimate replaces the percentage-based calculation for that age; clear it to restore the fallback.</p>
+        <div className="benefit-settings-grid">
+          {startAges.map((age) => <label className="field-label" key={age}>Annual CPP at {age}
+            <span className="number-input"><span>$</span><input type="number" inputMode="decimal" min={0} step={1}
+              value={person.cppAnnualEstimates?.[age] ?? ""} placeholder="Use percentage estimate"
+              onChange={(event) => {
+                const estimates = { ...person.cppAnnualEstimates };
+                if (event.target.value === "") delete estimates[age];
+                else {
+                  const amount = Number(event.target.value);
+                  if (!Number.isFinite(amount) || amount < 0) return;
+                  estimates[age] = amount;
+                }
+                updatePerson({ cppAnnualEstimates: estimates });
+              }} /></span>
+          </label>)}
+        </div>
+      </details>
+      <p className="benefit-model-note">Gross benefits in plan-date dollars, before tax and OAS recovery.<FieldHint text="CPP does not automatically adjust for additional years without contributions. OAS uses your entered age-65 percentage, plus the separate deferral increase. Eligibility checkboxes remain manual: residence and legal-status requirements must be verified." /></p>
+      <div className="benefit-timing-grid">
+        <BenefitTimingChart label="CPP" choices={cppChoices} endAge={person.targetDeathAge} />
+        <BenefitTimingChart label="OAS" choices={oasChoices} endAge={person.targetDeathAge} />
+      </div>
+      <details className="benefit-model-details">
+        <summary>Assumptions & benefit rules</summary>
+        <p className="benefit-model-note">Without custom estimates, CPP uses a fixed entitlement plus the age adjustment; stopping work does not automatically reduce it. Low-earning dropouts and post-65 protections require contribution-history information. Check estimates against your planned work-stop date. <a href="https://www.canada.ca/en/services/benefits/publicpensions/cpp/amount.html" target="_blank" rel="noreferrer">CPP calculation rules</a> · <a href="https://www.canada.ca/en/services/benefits/publicpensions/cpp/when-start.html" target="_blank" rel="noreferrer">Start-age adjustments</a></p>
+        <p className="benefit-model-note">Hypothetical lifetime gross payments in plan-date dollars, not after-tax or investment returns. The charts assume full annual payments between birthdays; Ledger uses calendar-year proration and simulated inflation. OAS recovery can change the net crossover. The age-75 OAS increase is not modeled.</p>
+        <p className="benefit-model-note">OAS uses your entered percentage of the full age-65 pension, before inflation, tax, recovery, and the separate start-age deferral increase. The usual residence-based estimate is qualifying Canadian residence years after age 18 / 40 × 100, capped at 100%. The planner does not verify eligibility, add future residence years, or infer agreement-specific entitlements. Confirm the percentage for your circumstances. Previously saved detailed OAS settings are preserved until you change the percentage or explicitly switch. <a href="https://www.canada.ca/en/services/benefits/publicpensions/old-age-security/eligibility.html" target="_blank" rel="noreferrer">OAS eligibility</a></p>
+        {workingForecastContext(inputs) && <p className="benefit-model-note">The charts preview editable inputs, not frozen Actuals history. Start-age changes use Rebase from actuals for future settings. Per-person entitlement estimates and eligibility are structural inputs; use a new editable-plan baseline to change them without rewriting the existing baseline.</p>}
+      </details>
+      {workingForecastContext(inputs) && <p className="benefit-model-note">Editable benefit preview; saved Actuals assumptions stay unchanged until rebasing or creating a new baseline.</p>}
+    </section>
+  );
+}
+
+function BenefitTimingChart({ label, choices, endAge }: { label: string; choices: { age: number; annualAmount: number; source: string }[]; endAge: number }) {
+  const firstAge = choices[0].age;
+  const lastAge = Math.max(firstAge, Math.floor(endAge));
+  const ages = Array.from({ length: lastAge - firstAge + 1 }, (_, index) => firstAge + index);
+  const crossovers = choices.flatMap((earlier, index) => choices.slice(index + 1).map((later) => {
+    const crossover = later.annualAmount > earlier.annualAmount
+      ? later.age + earlier.annualAmount * (later.age - earlier.age) / (later.annualAmount - earlier.annualAmount) : null;
+    return { earlier: earlier.age, later: later.age, crossover };
+  }));
+  const option: EChartsOption = {
+    animationDuration: 200,
+    color: ["#2563eb", "#b45309", "#059669"],
+    grid: { top: 20, right: 20, bottom: 60, left: 80 },
+    legend: { bottom: 0, textStyle: { fontSize: 11 } },
+    tooltip: { trigger: "axis", confine: true, valueFormatter: (value) => formatCurrency(Number(value)) },
+    xAxis: { type: "value", min: firstAge, max: Math.max(firstAge + 1, lastAge), minInterval: 1, name: "Age", nameLocation: "middle", nameGap: 28 },
+    yAxis: { type: "value", axisLabel: { formatter: (value: number) => formatCurrency(value), fontSize: 10 } },
+    series: choices.map((choice) => ({ name: `Start at ${choice.age}`, type: "line", symbol: "none",
+      data: ages.map((age) => [age, Math.max(0, age - choice.age) * choice.annualAmount]),
+      lineStyle: { width: 2 },
+    })),
+  };
+  return (
+    <section className="benefit-timing-chart">
+      <h3>{label} cumulative benefits<FieldHint text="Total gross payments by birthday. Crossover ages show when the later start catches up with the earlier start; these are not after-tax or investment-return comparisons." /></h3>
+      <ReactECharts option={option} style={{ height: 220, width: "100%" }} notMerge lazyUpdate />
+      <ul className="benefit-crossovers" aria-label={`${label} crossover ages`}>{crossovers.map(({ earlier, later, crossover }) => <li key={`${earlier}-${later}`}>
+        {later} vs. {earlier}: <strong>{crossover !== null && crossover <= endAge ? `age ${crossover.toFixed(1)}` : `none by ${endAge}`}</strong>
+      </li>)}</ul>
+      <details className="benefit-payment-details">
+        <summary>Annual amounts & estimate basis</summary>
+      <div className="table-wrap"><table className="benefit-comparison-table">
+        <thead><tr><th scope="col">Start age</th><th scope="col">Annual benefit</th><th scope="col">Basis</th></tr></thead>
+        <tbody>{choices.map((choice) => <tr key={choice.age}><th scope="row">{choice.age}</th><td>{formatCurrency(choice.annualAmount, 2)}</td><td>{choice.source}</td></tr>)}</tbody>
+      </table></div>
+      </details>
+    </section>
+  );
+}
+
+function WithdrawalOrderAdvisor({ inputs, onApply, onApplySpending }: {
+  inputs: RetirementInputs;
+  onApply: (result: WithdrawalOrderSuggestion) => void;
+  onApplySpending: (result: WithdrawalOrderSuggestion, choice: "current" | "suggested") => void;
+}) {
+  const [objective, setObjective] = useState<WithdrawalObjective>("spending");
+  const [request, setRequest] = useState<{ inputs: RetirementInputs; objective: WithdrawalObjective } | null>(null);
+  const [snapshot, setSnapshot] = useState<{ inputs: RetirementInputs; objective: WithdrawalObjective; output: WithdrawalOrderSuggestion } | null>(null);
+  const [failure, setFailure] = useState<{ inputs: RetirementInputs; objective: WithdrawalObjective; message: string } | null>(null);
+  const [progress, setProgress] = useState({ completed: 0, total: 24, evaluations: 0 });
+  const running = request?.inputs === inputs && request.objective === objective;
+  const result = snapshot?.inputs === inputs && snapshot.objective === objective ? snapshot.output : null;
+  const error = failure?.inputs === inputs && failure.objective === objective ? failure.message : "";
+  const unchanged = result ? result.suggested.order.every((account, index) => account === result.current.order[index]) : false;
+  const currentMaximum = result?.current.maximumSpending;
+  const suggestedMaximum = result?.suggested.maximumSpending;
+  useEffect(() => {
+    if (!request || request.inputs !== inputs || request.objective !== objective) return;
+    let worker: Worker | null = null;
+    let cancelled = false;
+    const fail = (message: string) => {
+      if (cancelled) return;
+      setFailure({ ...request, message });
+      setRequest(null);
+      worker?.terminate();
+    };
+    try {
+      worker = new Worker(new URL("../lib/monteCarlo.worker.ts", import.meta.url), { type: "module" });
+      worker.onmessage = (event: MessageEvent<WithdrawalOrderWorkerMessage>) => {
+        if (cancelled) return;
+        const message = event.data;
+        if (message.type === "order-progress") setProgress({ completed: message.completed, total: message.total, evaluations: message.evaluations });
+        else if (message.type === "order-complete") {
+          setSnapshot({ ...request, output: message.output });
+          setRequest(null);
+          worker?.terminate();
+        } else fail(message.message);
+      };
+      worker.onerror = (event) => {
+        event.preventDefault();
+        fail("Unable to compare withdrawal orders. Please try again.");
+      };
+      worker.onmessageerror = () => fail("Unable to read the withdrawal-order comparison. Please try again.");
+      worker.postMessage({ type: "suggest-withdrawal-order", ...request });
+    } catch {
+      fail("Unable to start the withdrawal-order comparison. Please try again.");
+    }
+    return () => {
+      cancelled = true;
+      worker?.terminate();
+    };
+  }, [inputs, objective, request]);
+  return (
+    <div className="withdrawal-order-advisor">
+      <div className="strategy-comparison-toolbar">
+      <label className="field-label">
+        <span className="field-label-text">Objective<FieldHint text="Compare all 24 account orders on the same Ledger path. Spend more ranks estimated proportional spending capacity. Preserve estate and Reduce lifetime tax prioritize funding the requested spending; if none can, the smallest funding gap comes first. Other strategy settings stay fixed. Ties favor your current order. Mandatory RRIFs, tax-aware rules, and the GIC buffer can override the preferred order, so several orders may be equivalent." /></span>
+        <select value={objective} onChange={(event) => setObjective(event.target.value as WithdrawalObjective)}>
+          <option value="spending">Spend more / maximize spending</option>
+          <option value="estate">Preserve estate</option>
+          <option value="tax">Reduce lifetime tax</option>
+        </select>
+      </label>
+      <div className="maximum-spending-actions">
+        <button type="button" className="button button-quiet" disabled={running} onClick={() => {
+          setSnapshot(null);
+          setFailure(null);
+          setProgress({ completed: 0, total: 24, evaluations: 0 });
+          setRequest({ inputs, objective });
+        }}><Calculator size={14} aria-hidden="true" />{objective === "spending" ? "Find maximum spending" : "Compare orders"}</button>
+        {running && <button type="button" className="button button-quiet" onClick={() => setRequest(null)}><X size={14} aria-hidden="true" />Cancel</button>}
+      </div>
+      </div>
+      {running && <p role="status">{progress.completed} of {progress.total} orders compared; {progress.evaluations.toLocaleString("en-CA")} projections evaluated.</p>}
+      {error && <p role="alert">{error}</p>}
+      {result && <div className="withdrawal-order-result">
+        <h3>{unchanged ? "Your current order performs as well as the alternatives" : "A different order ranks higher for this objective"}</h3>
+        <div className="withdrawal-order-options">
+          <section><h4>Current order</h4><ol className="withdrawal-suggested-order">{result.current.order.map((account) => <li key={account}>{withdrawalAccountLabels[account]}</li>)}</ol></section>
+          <section><h4>Suggested order</h4><ol className="withdrawal-suggested-order">{result.suggested.order.map((account) => <li key={account}>{withdrawalAccountLabels[account]}</li>)}</ol></section>
+        </div>
+        {objective !== "spending" && <div className="table-wrap">
+          <table className="maximum-spending-table">
+            <thead><tr><th scope="col">Comparison</th><th scope="col">Current</th><th scope="col">Suggested</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Requested spending</th><td>{result.current.funded ? "Funded" : `${formatCurrency(result.current.fundingGap)} gap`}</td><td>{result.suggested.funded ? "Funded" : `${formatCurrency(result.suggested.fundingGap)} gap`}</td></tr>
+              <tr><th scope="row">After-tax estate</th><td>{formatCurrency(result.current.finalEstate)}</td><td>{formatCurrency(result.suggested.finalEstate)}</td></tr>
+              <tr><th scope="row">Income + estate tax</th><td>{formatCurrency(result.current.lifetimeTax)}</td><td>{formatCurrency(result.suggested.lifetimeTax)}</td></tr>
+              <tr><th scope="row">OAS recovery</th><td>{formatCurrency(result.current.oasRecovery)}</td><td>{formatCurrency(result.suggested.oasRecovery)}</td></tr>
+            </tbody>
+          </table>
+        </div>}
+        {objective === "spending" && suggestedMaximum && <section className="strategy-spending-preview">
+          <h3>Maximum phase spending</h3>
+          <div className="table-wrap">
+            <table className="maximum-spending-table">
+              <thead><tr><th scope="col">Phase</th><th scope="col">Entered</th><th scope="col">Max with current order</th><th scope="col">Max with suggested order</th></tr></thead>
+              <tbody>{inputs.spendingPlan.phases.map((phase, index) => <tr key={phase.id}>
+                <th scope="row">{phase.label}</th><td>{formatCurrency(phase.annualSpending)}</td>
+                <td>{currentMaximum ? formatCurrency(currentMaximum.spendingPlan.phases[index].annualSpending) : "Unavailable"}</td>
+                <td>{formatCurrency(suggestedMaximum.spendingPlan.phases[index].annualSpending)}</td>
+              </tr>)}</tbody>
+            </table>
+          </div>
+          <dl className="maximum-spending-totals">
+            <div><dt>Suggested spending level</dt><dd>{formatPercent(suggestedMaximum.multiplier)} of entered phases</dd></div>
+            <div><dt>Final portfolio at suggested maximum</dt><dd>{formatCurrency(suggestedMaximum.finalPortfolio, 2)}</dd></div>
+            <div><dt>After-tax estate at suggested maximum</dt><dd>{formatCurrency(suggestedMaximum.finalEstate, 2)}</dd></div>
+            <div><dt>Funding limit at age</dt><dd>{suggestedMaximum.limitingAge}</dd></div>
+          </dl>
+          {suggestedMaximum.finalPortfolio > 1 && <p className="maximum-spending-note">The fixed phase proportions reach a funding constraint or leave funds that cannot be spent under the selected rules, so a final balance remains.</p>}
+          <div className="maximum-spending-actions">
+            {currentMaximum && !unchanged && <button type="button" className="button button-quiet" onClick={() => onApplySpending(result, "current")}><Check size={14} aria-hidden="true" />Apply maximum with current order</button>}
+            <button type="button" className="button button-primary" onClick={() => onApplySpending(result, "suggested")}><Check size={14} aria-hidden="true" />{unchanged ? "Apply maximum spending" : "Apply suggested order & spending"}</button>
+          </div>
+          <p className="maximum-spending-note">Phase dates, proportions, and inflation settings are retained. The final balances above use the suggested maximum spending, not your entered spending. A near-zero balance leaves no reserve for worse markets or a longer life.</p>
+        </section>}
+        {result.equivalentOrders > 1 && <p className="maximum-spending-note">{result.equivalentOrders} orders tie within the comparison tolerance. Your current order is retained when it ties for best.</p>}
+        {!result.suggested.funded && <p className="maximum-spending-note">{objective === "spending"
+          ? "Your entered phase amounts are not fully funded under the suggested order; the maximum-spending preview shows the supported proportional level instead."
+          : "No compared order fully funds the requested spending; the smallest funding gap was prioritized."}</p>}
+        <button type="button" className={`button ${objective === "spending" ? "button-quiet" : "button-primary"}`} disabled={unchanged} onClick={() => onApply(result)}><Check size={14} aria-hidden="true" />{objective === "spending" ? "Apply suggested order only" : "Apply suggested order"}</button>
+        {result.workingForecast && <p className="maximum-spending-note">Uses saved forecast settings from the next full year, excludes fixed history and other pending edits, and preserves scheduled later revisions. Applied order and spending changes remain pending until Rebase from actuals.</p>}
+      </div>}
+      <p className="maximum-spending-note">A Ledger-path comparison, not a Monte Carlo safety guarantee. Manual order controls remain available.</p>
+    </div>
+  );
+}
+
 function DashboardView({
   kpis,
   inputs,
@@ -2601,17 +2870,17 @@ function LedgerView({
                       <div className="ledger-subperiod-sticky">
                         {hasTaxAllocation && <table className="ledger-subperiod-table ledger-funding-table">
                           <thead>
-                            <tr><th rowSpan={2}>Person</th><th colSpan={8}>Funding sources</th><th colSpan={3}>Cash flow</th><th>Tax calculation</th></tr>
-                            <tr><th>Employment / pension</th><th>RRSP/RRIF drawn</th><th>TFSA drawn</th><th>Non-registered</th><th title="Cash drawn from GICs and interest-bearing savings. Interest retained in the holding is not cash funding.">GIC / savings drawn</th><th title="OAS retained after modeled clawback.">OAS amount</th><th>CPP amount</th><th>Total funding</th><th>Less contributions</th><th>Less income tax</th><th>Net cash</th><th title="Income used to calculate tax, not a cash-flow total. Pension splitting, tax-free withdrawals, cost basis, and other modeled deductions can make this differ from funding received.">Taxable income</th></tr>
+                            <tr><th rowSpan={2}>Person</th><th colSpan={8}>Funding sources</th><th colSpan={4}>Cash flow</th></tr>
+                            <tr><th>Employment / pension</th><th>RRSP/RRIF drawn</th><th>TFSA drawn</th><th>Non-registered</th><th title="Cash drawn from GICs and interest-bearing savings. Interest retained in the holding is not cash funding.">GIC / savings drawn</th><th title="OAS retained after modeled clawback.">OAS amount</th><th>CPP amount</th><th>Total funding</th><th>Less contributions</th><th title="Reference only: income used to calculate tax, not cash received or another deduction from funding.">Taxable income</th><th>Less income tax</th><th title="After-tax cash available: total funding minus contributions and income tax.">Net cash</th></tr>
                           </thead>
                           <tbody>{year.taxesByPerson.map((person) => <tr key={person.id}>
                             <td>{person.label}</td><td>{formatCurrency(person.employmentIncome, 2)}</td><td>{formatCurrency(person.rrspWithdrawals ?? 0, 2)}</td>
                             <td>{formatCurrency(person.tfsaWithdrawals, 2)}</td><td>{formatCurrency(person.nonRegisteredWithdrawals, 2)}</td><td>{formatCurrency(person.interestBearingWithdrawals, 2)}</td>
                             <td>{formatCurrency(person.oasIncome, 2)}</td><td>{formatCurrency(person.cppIncome, 2)}</td><td><strong>{formatCurrency(person.totalFunding, 2)}</strong></td>
-                            <td>{formatCurrency(person.contributions, 2)}</td><td>{formatCurrency(person.totalTax, 2)}</td><td><strong>{formatCurrency(person.netCash, 2)}</strong></td><td>{formatCurrency(person.taxableIncome, 2)}</td>
+                            <td>{formatCurrency(person.contributions, 2)}</td><td>{formatCurrency(person.taxableIncome, 2)}</td><td>{formatCurrency(person.totalTax, 2)}</td><td><strong>{formatCurrency(person.netCash, 2)}</strong></td>
                           </tr>)}</tbody>
                           <tfoot><tr><th>Household total</th>{([
-                            "employmentIncome", "rrspWithdrawals", "tfsaWithdrawals", "nonRegisteredWithdrawals", "interestBearingWithdrawals", "oasIncome", "cppIncome", "totalFunding", "contributions", "totalTax", "netCash", "taxableIncome",
+                            "employmentIncome", "rrspWithdrawals", "tfsaWithdrawals", "nonRegisteredWithdrawals", "interestBearingWithdrawals", "oasIncome", "cppIncome", "totalFunding", "contributions", "taxableIncome", "totalTax", "netCash",
                           ] as const).map((field) => <td key={field}>{formatCurrency(year.taxesByPerson.reduce((total, person) => total + (person[field] ?? 0), 0), 2)}</td>)}</tr></tfoot>
                         </table>}
                         {hasSubPeriods && <SubPeriodTable subPeriods={year.subPeriods!} income={year.income} withdrawals={year.withdrawals} />}
@@ -2736,15 +3005,16 @@ function MonteCarloView({
         </strong>
       </div>
       <MonteCarloPercentileChart simulationOutput={simulationOutput} />
+      <MonteCarloReturnDiagnostics diagnostics={simulationOutput.returnDiagnostics} />
       <FailureAnalysisView failureAnalysis={simulationOutput.failureAnalysis} />
       <div className="table-wrap">
-        <table>
+        <table className="monte-carlo-results-table monte-carlo-portfolio-table">
           <thead>
             <tr>
-              <th>Age</th>
-              <th>{worstSurvivingLabel(simulationOutput)}</th>
-              <th>Median</th>
-              <th>90th percentile</th>
+              <th scope="col">Age</th>
+              <th scope="col">{worstSurvivingLabel(simulationOutput)}</th>
+              <th scope="col">Median</th>
+              <th scope="col">90th percentile</th>
             </tr>
           </thead>
           <tbody>
@@ -2763,6 +3033,71 @@ function MonteCarloView({
   );
 }
 
+function MonteCarloReturnDiagnostics({ diagnostics }: { diagnostics: SimulationOutput["returnDiagnostics"] }) {
+  if (!diagnostics.annualDrawCount) return null;
+  const { earlySequence } = diagnostics;
+  const formatSequenceReturn = (totalReturn: number) => <><strong>{formatPercent(totalReturn)} total</strong><span>{formatPercent((1 + totalReturn) ** (1 / earlySequence.years) - 1)} per year</span></>;
+  const option: EChartsOption = {
+    animationDuration: 200,
+    grid: { top: 16, right: 16, bottom: 80, left: 60 },
+    tooltip: { trigger: "axis", confine: true, valueFormatter: (value) => formatPercent(Number(value)) },
+    xAxis: {
+      type: "category",
+      data: diagnostics.histogram.map((bucket) => `${(bucket.minimum * 100).toFixed(1)}% to ${(bucket.maximum * 100).toFixed(1)}%`),
+      axisLabel: { fontSize: 10, rotate: 35, interval: "auto" },
+    },
+    yAxis: { type: "value", axisLabel: { formatter: (value: number) => formatPercent(value), fontSize: 10 } },
+    series: [{
+      name: "Share of annual draws",
+      type: "bar",
+      data: diagnostics.histogram.map((bucket) => ({
+        value: bucket.count / diagnostics.annualDrawCount,
+        itemStyle: { color: bucket.maximum <= 0 ? "#b45309" : "#2563eb" },
+      })),
+      barWidth: "85%",
+    }],
+  };
+  return (
+    <div className="monte-carlo-return-diagnostics">
+      <div className="panel-heading">
+        <h2>Simulated annual returns</h2>
+        <span>{diagnostics.annualDrawCount.toLocaleString("en-CA")} future annual draws</span>
+      </div>
+      <div className="table-wrap">
+        <table className="monte-carlo-summary-table">
+          <thead><tr><th scope="col">Annual return</th><th scope="col">Requested</th><th scope="col">Simulated</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Average</th><td>{formatPercent(diagnostics.requestedMean)}</td><td>{formatPercent(diagnostics.realizedMean)}</td></tr>
+            <tr><th scope="row">Minimum</th><td>{formatPercent(diagnostics.requestedMinimum)}</td><td>{formatPercent(diagnostics.minimum)}</td></tr>
+            <tr><th scope="row">Maximum</th><td>{formatPercent(diagnostics.requestedMaximum)}</td><td>{formatPercent(diagnostics.maximum)}</td></tr>
+          </tbody>
+          <tbody>
+            <tr><th className="loss-group-heading" colSpan={3} scope="rowgroup">How often did bad years occur?</th></tr>
+            <tr><th scope="row">Years with any loss</th><td aria-label="Not applicable">-</td><td>{formatPercent(diagnostics.negativeShare)} of years</td></tr>
+            <tr><th scope="row">Years losing more than 10%</th><td aria-label="Not applicable">-</td><td>{formatPercent(diagnostics.belowMinus10Share)} of years</td></tr>
+            <tr><th scope="row">Years losing more than 20%</th><td aria-label="Not applicable">-</td><td>{formatPercent(diagnostics.belowMinus20Share)} of years</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p className="monte-carlo-loss-note">Loss frequencies count simulated future years across all runs, not failed retirement plans. Categories overlap: a year losing more than 20% counts in all three loss rows.</p>
+      <ReactECharts option={option} style={{ height: 260, width: "100%" }} notMerge lazyUpdate />
+      <h3>
+        First {earlySequence.years} simulated {earlySequence.years === 1 ? "year" : "years"}: compounded return
+        <FieldHint text="Total is cumulative growth over these years; per year is the equivalent compounded annual rate, not each year's actual return. Before cash flows, inflation, tax, and partial-year adjustments; fixed Actuals history is excluded." />
+      </h3>
+      <div className="table-wrap">
+        <table className="monte-carlo-results-table monte-carlo-sequence-table">
+          <thead><tr><th scope="col">Worst</th><th scope="col">10th percentile</th><th scope="col">Median</th><th scope="col">90th percentile</th><th scope="col">Best</th></tr></thead>
+          <tbody><tr>
+            <td>{formatSequenceReturn(earlySequence.worst)}</td><td>{formatSequenceReturn(earlySequence.p10)}</td><td>{formatSequenceReturn(earlySequence.p50)}</td>
+            <td>{formatSequenceReturn(earlySequence.p90)}</td><td>{formatSequenceReturn(earlySequence.best)}</td>
+          </tr></tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function worstSurvivingLabel(simulationOutput: SimulationOutput) {
   const rank = Math.round(simulationOutput.kpis.worstSurvivingPercentileRank * 100);
   return `${rank}th percentile (worst surviving)`;
@@ -2770,12 +3105,10 @@ function worstSurvivingLabel(simulationOutput: SimulationOutput) {
 
 function ReturnDistributionPreview({
   mean,
-  stdDev,
   floor,
   ceiling,
 }: {
   mean: number;
-  stdDev: number;
   floor: number;
   ceiling: number;
 }) {
@@ -2783,32 +3116,31 @@ function ReturnDistributionPreview({
     // A fixed seed keeps the preview stable while you tweak other inputs, independent of the scenario's own random seed.
     const random = createPreviewRandom(20260907);
     const sampleCount = 4000;
-    const samples = Array.from({ length: sampleCount }, () => sampleAnnualReturn(random, mean, stdDev, floor, ceiling));
-    const bucketCount = 20;
+    const samples = Array.from({ length: sampleCount }, () => sampleAnnualReturn(random, mean, floor, ceiling));
+    const bucketCount = ceiling > floor ? 20 : 1;
     const bucketWidth = (ceiling - floor) / bucketCount || 1;
     const counts = new Array(bucketCount).fill(0);
     for (const sample of samples) {
       const bucketIndex = Math.min(bucketCount - 1, Math.max(0, Math.floor((sample - floor) / bucketWidth)));
       counts[bucketIndex] += 1;
     }
-    const labels = Array.from({ length: bucketCount }, (_, index) => `${((floor + index * bucketWidth) * 100).toFixed(0)}%`);
+    const labels = Array.from({ length: bucketCount }, (_, index) => ceiling <= floor ? `${(floor * 100).toFixed(1)}%`
+      : `${((floor + index * bucketWidth) * 100).toFixed(1)}% to ${((floor + (index + 1) * bucketWidth) * 100).toFixed(1)}%`);
     const realizedMean = samples.reduce((sum, value) => sum + value, 0) / samples.length;
-    const variance = samples.reduce((sum, value) => sum + (value - realizedMean) ** 2, 0) / samples.length;
     const negativeShare = samples.filter((value) => value < 0).length / samples.length;
     return {
       labels,
       frequencies: counts.map((count) => count / samples.length),
       realizedMean,
-      realizedStdDev: Math.sqrt(variance),
       negativeShare,
       worst: Math.min(...samples),
       best: Math.max(...samples),
     };
-  }, [mean, stdDev, floor, ceiling]);
+  }, [mean, floor, ceiling]);
 
   const option: EChartsOption = {
     animationDuration: 200,
-    grid: { top: 12, right: 12, bottom: 46, left: 46 },
+    grid: { top: 12, right: 12, bottom: 80, left: 46 },
     tooltip: {
       trigger: "axis",
       valueFormatter: (value) => formatPercent(Number(value)),
@@ -2833,11 +3165,11 @@ function ReturnDistributionPreview({
     <div className="return-distribution-preview">
       <div className="field-label-text">
         <span>Return distribution preview</span>
-        <FieldHint text="Shows the shape of annual returns these assumptions actually produce (a sample of 4,000 draws), not just the raw mean/std-dev numbers. Returns are drawn from a normal distribution truncated to the floor/cap, with the underlying curve shifted so the average of the truncated draws still lands on your mean. If your floor and cap aren't the same distance from your mean (realistic, since markets usually have more downside room than upside), the shape will skew toward whichever side has more room - that's expected, not an error." />
+        <FieldHint text="A fixed sample of 4,000 annual draws. A maximum-entropy bounded distribution spreads probability across the full range, weighting one side as needed to target the requested arithmetic average. At the midpoint it is uniform. Bounds remain possible limits, not guaranteed observations, and individual paths can average above or below the target. An average equal to either bound produces constant annual draws. This is an assumption-driven model, not a historically calibrated forecast." />
       </div>
-      <ReactECharts option={option} style={{ height: 160, width: "100%" }} notMerge lazyUpdate />
+      <ReactECharts option={option} style={{ height: 210, width: "100%" }} notMerge lazyUpdate />
       <p className="return-distribution-stats">
-        Realized: {formatPercent(stats.realizedMean)} mean, {formatPercent(stats.realizedStdDev)} std-dev, {formatPercent(stats.negativeShare)} of years negative, range {formatPercent(stats.worst)} to {formatPercent(stats.best)}.
+        Generated: {formatPercent(stats.realizedMean)} average, {formatPercent(stats.negativeShare)} negative years, minimum {formatPercent(stats.worst)}, maximum {formatPercent(stats.best)}.
       </p>
     </div>
   );
@@ -3120,7 +3452,8 @@ function ComparisonAssumptions({ left, right, leftName, rightName }: { left: Ret
     ["People", `${1 + (left.personalInfo.additionalPeople?.length ?? 0)}`, `${1 + (right.personalInfo.additionalPeople?.length ?? 0)}`],
     ["Spending phases", `${left.spendingPlan.phases.length}`, `${right.spendingPlan.phases.length}`],
     ["Return mean", formatPercent(left.assumptions.returnMean), formatPercent(right.assumptions.returnMean)],
-    ["Return StdDev", formatPercent(left.assumptions.returnStdDev), formatPercent(right.assumptions.returnStdDev)],
+    ["Minimum annual return", formatPercent(left.assumptions.returnFloor), formatPercent(right.assumptions.returnFloor)],
+    ["Maximum annual return", formatPercent(left.assumptions.returnCeiling), formatPercent(right.assumptions.returnCeiling)],
     ["Inflation mean", formatPercent(left.assumptions.inflationMean), formatPercent(right.assumptions.inflationMean)],
     ["CPP / OAS start", `${left.strategy.cppStartAge} / ${left.strategy.oasStartAge}`, `${right.strategy.cppStartAge} / ${right.strategy.oasStartAge}`],
   ];
@@ -3417,7 +3750,7 @@ function GuideView() {
         <>
           <p><strong>Plan date</strong> is the saved reference date for starting ages and account balances. Reopening a scenario does not advance this date or anyone's age. Change it explicitly when rebasing a plan, and update ages and balances to match. <strong>Death age</strong> is the person's birthday cutoff for age-based income and benefits; the estate is settled in the final simulated year. Birth month, when provided, controls within-year proration.</p>
           <p>Each additional person has their own age, birth month, benefits, accounts, and tax return. Household projections use the longest household lifespan; age-based income belongs to the person who owns that stream.</p>
-          <p><strong>Province</strong> selects the provincial tax rules. <strong>CPP/OAS payout %</strong> lets you model less than the maximum benefit.</p>
+          <p><strong>Province</strong> selects the provincial tax rules. <strong>CPP at 65 (% of maximum)</strong> sets a fallback entitlement before the start-age adjustment. Strategy Lab also supports per-person annual CPP estimates at 60, 65, and 70, already adjusted for age and your expected contribution history. The app does not infer extra zero-earning years or contribution-history dropouts from your retirement date. <strong>OAS at 65 (% maximum)</strong> is a user-entered share, normally estimated as qualifying Canadian residence years after 18 divided by 40, capped at 100%; the deferral increase is separate.</p>
         </>
       ),
     },
@@ -3503,7 +3836,7 @@ function GuideView() {
       title: "Assumptions: what's random and what isn't",
       body: (
         <>
-          <p><strong>Return mean/StdDev</strong> and <strong>Inflation mean/StdDev</strong> define the distributions used to generate paths. <strong>Return floor/ceiling</strong> limit extreme annual returns. The random seed makes the single path reproducible.</p>
+          <p><strong>Average annual return</strong>, <strong>Minimum annual return</strong>, and <strong>Maximum annual return</strong> define a broad, bounded distribution, smoothly weighted to target the arithmetic average. It is uniform when the average is halfway between the bounds. Individual paths are not forced to hit that average or either bound; compounded growth differs from the arithmetic average. These limits are assumptions, not market guarantees or historically calibrated estimates. Annual returns and inflation are sampled independently; prolonged economic regimes are not explicitly modeled. Inflation retains its own mean and variability. Within-year return variability is derived from the annual distribution, and the annual bounds do not constrain individual months. The random seed makes the single path reproducible. Older saved return standard deviations are ignored, so regenerated paths and success rates can change; saved Actuals history and frozen comparisons are retained.</p>
           <p>For a non-annual withdrawal frequency, each annual return is decomposed into sub-period returns that preserve the annual compounded result while allowing positive and negative months or quarters within the year.</p>
           <p>The Ledger can override individual annual returns for the single projection. Monte Carlo ignores those overrides and generates fresh paths.</p>
           <p>Tax brackets, basic personal amounts, TFSA room, and OAS thresholds are projected forward using simulated inflation, while tax rates and other rule parameters remain fixed. Future legislation is not modeled.</p>
@@ -3516,7 +3849,7 @@ function GuideView() {
         <>
           <p><strong>Withdrawal frequency</strong> controls when the waterfall runs: annual, semi-annual, quarterly, or monthly. More frequent schedules expose the portfolio to more realistic within-year timing and make the Ledger expandable by period.</p>
           <p>Employment income end ages and months define when each person stops working; household spending and withdrawals begin when the last employment income stream in the household ends. With monthly withdrawals, that first retirement year is prorated from the selected month through December. Income streams also support independent start and end months for partial first or final years.</p>
-          <p><strong>CPP/OAS start age</strong> changes the modeled benefit amount: starting early reduces it and delaying increases it. The strategy age determines when the benefit begins.</p>
+          <p><strong>Government benefits</strong> in Strategy Lab compares cumulative gross CPP at 60/65/70 and OAS at 65/70, with crossover ages for the selected person. Household start-age elections apply to each person at their own age. The charts use plan-date dollars and full years between birthdays, before income tax, OAS recovery, investment returns, and calendar-year proration; they are hypothetical timing comparisons, not guaranteed after-tax break-even ages. Optional CPP start-age estimates replace the fallback for that age. OAS uses a per-person age-65 percentage with the deferral increase added separately; no extra residence years or eligibility rules are calculated automatically. The age-75 OAS increase is not modeled. Older detailed OAS settings are retained until explicitly replaced with the percentage.</p>
           <p><strong>Tax-aware household withdrawals</strong> follows your account order and chooses the more efficient person within the first available account type. It can supplement RRSP withdrawals from the next non-registered account only when that reduces OAS recovery and improves after-tax cash. TFSA stays in its chosen position, without a separate preservation setting. Mandatory RRIF withdrawals and the GIC buffer rule still apply. This is a local current-cash-flow heuristic, not a guaranteed lifetime optimum. It can be combined with aggressive RRSP meltdown: spending is funded first, then extra registered withdrawals are made and the final pension allocation, income tax, and OAS recovery are recalculated. Meltdown can increase current tax or OAS recovery.</p>
           <p><strong>Eligible pension income splitting</strong> assumes the primary and first additional person are eligible spouses/common-law partners. The annual search compares both directions of one election, up to 50% of the donor's eligible income. Marked employer pensions can qualify before 65 without RRSP conversion; registered-account withdrawals generally require conversion to a RRIF and a donor aged at least 65. Ordinary RRSP withdrawals, CPP, and OAS are excluded. CPP pension sharing is separate and is not modeled. Splitting reallocates taxable income, not cash ownership or monthly withholding. OAS recovery uses individual net income for tax purposes, not half of household after-tax spending. CRA relationship and residency requirements are assumed; pension and age credits, GIS, provincial benefit differences, and special survivor rules are not modeled.</p>
           <p><strong>Aggressive RRSP meltdown</strong> withdraws additional RRSP/RRIF funds after retirement to fill the current federal bracket. It is a tax strategy approximation, and its annual decision is displayed in the sub-period table as smoothed period amounts when using a non-annual schedule.</p>
@@ -3572,6 +3905,7 @@ function GuideView() {
       body: (
         <>
           <p><strong>Dashboard</strong>: the main projection, KPIs, charts, and strategy comparison.</p>
+          <p><strong>Strategy Lab</strong>: compare withdrawal orders by spending capacity, final estate, or tax, with current and suggested orders side by side. Spend more / maximize spending previews maximum proportional phase amounts for both orders in the same calculation. Apply the order only, maximum spending with the current order, or the suggested order and its matching spending plan together. Manual withdrawal settings remain in the sidebar's Strategy inputs.</p>
           <p><strong>Ledger</strong>: the same projection in a year-by-year table. Edit annual returns and expand years to inspect monthly, quarterly, or semi-annual returns and withdrawals.</p>
           <p><strong>Monte Carlo</strong>: randomized runs summarized as percentile bands, success rate, and failure analysis. To reduce runtime, pension splitting compares no split, 50% of eligible income in either direction, and an eligible income-balancing split. Dashboard, Ledger, and Compare keep the detailed allocation search. Tax rules, OAS recovery, withdrawal preferences, and simulation counts are unchanged, but individual outcomes can differ slightly. Simulations run in the background with an animated progress indicator, percentage, and completed-run count, followed by a Preparing results stage. Changing inputs restarts the simulation; leaving the tab cancels it.</p>
           <p>Monte Carlo sizes withdrawals using bounded interpolation, with the existing bisection solver as a fallback if the faster method does not converge. This avoids repeated calculations without removing the selected withdrawal strategies. Dashboard, Ledger, and Compare retain the existing sizing solver.</p>

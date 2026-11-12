@@ -1,4 +1,5 @@
 import { CPP, OAS, TFSA, getMinimumWithdrawalPercentage } from "@equisoft/tax-ca";
+import type { OasResidencySettings } from "@/types/retirement";
 
 const BENEFIT_REFERENCE_AGE = 65;
 
@@ -8,7 +9,9 @@ export const oasClawbackThreshold = OAS.REPAYMENT.MIN;
 export const rrifMinimumWithdrawalAge = 72;
 export const tfsaAnnualContributionLimit = TFSA.MAX_CONTRIBUTION;
 
-export function calculateCppAnnualBenefit(annualAmountAt65: number, startAge: number) {
+export function calculateCppAnnualBenefit(annualAmountAt65: number, startAge: number, annualEstimates?: Partial<Record<60 | 65 | 70, number>>) {
+  const estimate = annualEstimates?.[startAge as 60 | 65 | 70];
+  if (typeof estimate === "number" && Number.isFinite(estimate) && estimate >= 0) return estimate;
   const monthsFromReference = (startAge - BENEFIT_REFERENCE_AGE) * 12;
   const adjustment = monthsFromReference < 0
     ? monthsFromReference * CPP.MONTHLY_DELAY.PENALTY
@@ -16,10 +19,27 @@ export function calculateCppAnnualBenefit(annualAmountAt65: number, startAge: nu
   return Math.max(0, annualAmountAt65 * (1 + adjustment));
 }
 
-export function calculateOasAnnualBenefit(annualAmountAt65: number, startAge: number) {
-  const eligibleStartAge = Math.max(OAS.MIN_AGE, startAge);
+export function calculateOasAnnualBenefit(annualAmountAt65: number, startAge: number, residency?: OasResidencySettings, payoutRate?: number) {
+  const eligibleStartAge = Math.min(70, Math.max(OAS.MIN_AGE, startAge));
   const deferredMonths = (eligibleStartAge - BENEFIT_REFERENCE_AGE) * 12;
-  return Math.max(0, annualAmountAt65 * (1 + deferredMonths * OAS.MONTHLY_DELAY_BONUS));
+  if (typeof payoutRate === "number" && Number.isFinite(payoutRate)) {
+    return Math.max(0, annualAmountAt65 * Math.min(1, Math.max(0, payoutRate)) * (1 + deferredMonths * OAS.MONTHLY_DELAY_BONUS));
+  }
+  const estimate = residency?.annualEstimates?.[eligibleStartAge as 65 | 70];
+  if (typeof estimate === "number" && Number.isFinite(estimate) && estimate >= 0) return estimate;
+  if (!residency) return Math.max(0, annualAmountAt65 * (1 + deferredMonths * OAS.MONTHLY_DELAY_BONUS));
+  const yearsAt65 = Math.min(40, Math.max(0, Math.floor(Number.isFinite(residency.yearsAt65) ? residency.yearsAt65 : 0)));
+  const additionalResidence = residency.livesInCanada && residency.continueResidence;
+  const yearsAtStart = Math.min(40, yearsAt65 + (additionalResidence ? Math.floor(eligibleStartAge - 65) : 0));
+  const minimumYears = residency.livesInCanada ? 10 : 20;
+  if (!residency.eligibilityOverride && yearsAtStart < minimumYears) return 0;
+  const firstEligibleAge = residency.eligibilityOverride ? 65 : 65 + Math.max(0, minimumYears - yearsAt65);
+  const initialYears = Math.min(40, yearsAt65 + (additionalResidence ? firstEligibleAge - 65 : 0));
+  const partialWithDeferral = initialYears / 40 * (1 + Math.max(0, eligibleStartAge - firstEligibleAge) * 12 * OAS.MONTHLY_DELAY_BONUS);
+  const partialAtStart = yearsAtStart / 40;
+  const fullEligibilityAge = yearsAt65 >= 40 ? 65 : additionalResidence ? 65 + 40 - yearsAt65 : Infinity;
+  const fullWithDeferral = eligibleStartAge >= fullEligibilityAge ? 1 + (eligibleStartAge - fullEligibilityAge) * 12 * OAS.MONTHLY_DELAY_BONUS : 0;
+  return Math.max(0, annualAmountAt65 * Math.max(partialWithDeferral, partialAtStart, fullWithDeferral));
 }
 
 // Annual recovery liability uses net income before the recovery deduction; prior-year-based monthly withholding is not modeled.

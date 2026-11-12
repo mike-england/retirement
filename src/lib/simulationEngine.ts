@@ -11,6 +11,7 @@ import type {
   GicPositionState,
   IncomeBySource,
   IncomeStream,
+  OasResidencySettings,
   ProvinceCode,
   ProjectionBalanceOverride,
   RetirementInputs,
@@ -63,7 +64,10 @@ type PersonRoster = {
   birthMonth?: number;
   receivesCpp: boolean;
   cppPayoutRate: number;
+  cppAnnualEstimates?: Partial<Record<60 | 65 | 70, number>>;
   receivesOas: boolean;
+  oasPayoutRate?: number;
+  oasResidency?: OasResidencySettings;
   gicConfigs: ResolvedGicConfig[];
 };
 
@@ -308,6 +312,7 @@ function growWithBalanceOverrides(balances: Record<string, AccountBalances>, por
 
 export function subPeriodsPerYear(frequency: WithdrawalFrequency | undefined): number {
   switch (frequency) {
+    case undefined:
     case "monthly": return 12;
     case "quarterly": return 4;
     case "semiAnnual": return 2;
@@ -366,95 +371,47 @@ function standardNormal(random: () => number) {
   return Math.sqrt(-2 * Math.log(first)) * Math.cos(2 * Math.PI * second);
 }
 
-// Abramowitz & Stegun 7.1.26 error-function approximation (max error ~1.5e-7).
-function erf(x: number): number {
-  const sign = x < 0 ? -1 : 1;
-  const absX = Math.abs(x);
-  const t = 1 / (1 + 0.3275911 * absX);
-  const poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
-  return sign * (1 - poly * Math.exp(-absX * absX));
-}
+const returnTiltCache = new Map<number, number>();
 
-function standardNormalCdf(z: number): number {
-  return 0.5 * (1 + erf(z / Math.SQRT2));
-}
-
-// Peter Acklam's rational approximation of the inverse standard normal CDF (relative error < 1.15e-9).
-function inverseStandardNormalCdf(p: number): number {
-  const a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00];
-  const b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01];
-  const c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00];
-  const d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00];
-  const pLow = 0.02425;
-  const pHigh = 1 - pLow;
-  if (p < pLow) {
-    const q = Math.sqrt(-2 * Math.log(p));
-    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
-      / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
-  }
-  if (p <= pHigh) {
-    const q = p - 0.5;
-    const r = q * q;
-    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
-      / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
-  }
-  const q = Math.sqrt(-2 * Math.log(1 - p));
-  return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
-    / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
-}
-
-// A proper truncated normal, sampled via inverse-CDF (not rejection sampling or a clip-and-shift transform): pick a
-// uniform value between how much probability mass sits below the floor and below the ceiling, then invert it back to
-// a return. This always succeeds in one step and never artificially piles years up exactly at a bound (unlike hard
-// clamping) - density naturally tapers off approaching floor/ceiling instead. The underlying (pre-truncation) mean is
-// solved for (not just set to targetMean) so the truncated distribution's actual average still lands on target -
-// this is what naturally "prefers one side": if floor/ceiling sit off-center from targetMean, the solved mean skews
-// the shape toward whichever side has more room, rather than forcing symmetric floor/ceiling to get an accurate
-// average. Shared by the deterministic Ledger path and Monte Carlo.
-export function sampleAnnualReturn(random: () => number, targetMean: number, standardDeviation: number, floor: number, ceiling: number): number {
-  if (ceiling <= floor) return targetMean;
-  const stdDev = Math.max(0, standardDeviation);
-  if (stdDev === 0) return Math.min(ceiling, Math.max(floor, targetMean));
-  const untruncatedMean = solveUntruncatedMean(targetMean, stdDev, floor, ceiling);
-  const probabilityBelowFloor = standardNormalCdf((floor - untruncatedMean) / stdDev);
-  const probabilityBelowCeiling = standardNormalCdf((ceiling - untruncatedMean) / stdDev);
-  const uniformInRange = probabilityBelowFloor + random() * Math.max(0, probabilityBelowCeiling - probabilityBelowFloor);
-  const clampedUniform = Math.min(1 - 1e-12, Math.max(1e-12, uniformInRange));
-  const value = untruncatedMean + inverseStandardNormalCdf(clampedUniform) * stdDev;
-  return Math.min(ceiling, Math.max(floor, value));
-}
-
-function standardNormalPdf(z: number): number {
-  return Math.exp(-0.5 * z * z) / Math.sqrt(2 * Math.PI);
-}
-
-// Mean of a normal(mu, stdDev) truncated to [floor, ceiling].
-function truncatedNormalMean(mu: number, stdDev: number, floor: number, ceiling: number): number {
-  const alpha = (floor - mu) / stdDev;
-  const beta = (ceiling - mu) / stdDev;
-  const mass = standardNormalCdf(beta) - standardNormalCdf(alpha);
-  if (mass <= 1e-12) return Math.min(ceiling, Math.max(floor, mu));
-  return mu + stdDev * (standardNormalPdf(alpha) - standardNormalPdf(beta)) / mass;
-}
-
-// Same (targetMean, stdDev, floor, ceiling) tuple is reused across every year and every Monte Carlo run, so caching the
-// bisection result avoids re-solving it on every single sample.
-const untruncatedMeanCache = new Map<string, number>();
-function solveUntruncatedMean(targetMean: number, stdDev: number, floor: number, ceiling: number): number {
-  const cacheKey = `${targetMean}|${stdDev}|${floor}|${ceiling}`;
-  const cached = untruncatedMeanCache.get(cacheKey);
+function returnTilt(targetPosition: number): number {
+  const cached = returnTiltCache.get(targetPosition);
   if (cached !== undefined) return cached;
-  let low = floor - 6 * stdDev;
-  let high = ceiling + 6 * stdDev;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const mid = (low + high) / 2;
-    if (truncatedNormalMean(mid, stdDev, floor, ceiling) < targetMean) low = mid;
-    else high = mid;
+  const reflectedMean = Math.min(targetPosition, 1 - targetPosition);
+  let low = 0;
+  let high = 1 / reflectedMean;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const magnitude = (low + high) / 2;
+    const mean = magnitude < 0.001 ? 0.5 - magnitude / 12 + magnitude ** 3 / 720 : 1 / magnitude - 1 / Math.expm1(magnitude);
+    if (mean > reflectedMean) low = magnitude;
+    else high = magnitude;
   }
-  const solved = (low + high) / 2;
-  if (untruncatedMeanCache.size > 500) untruncatedMeanCache.clear();
-  untruncatedMeanCache.set(cacheKey, solved);
-  return solved;
+  const tilt = (targetPosition < 0.5 ? -1 : 1) * (low + high) / 2;
+  if (returnTiltCache.size > 500) returnTiltCache.clear();
+  returnTiltCache.set(targetPosition, tilt);
+  return tilt;
+}
+
+export function sampleAnnualReturn(random: () => number, targetMean: number, floor: number, ceiling: number): number {
+  if (ceiling <= floor) return floor;
+  const mean = Math.min(ceiling, Math.max(floor, targetMean));
+  if (mean === floor || mean === ceiling) return mean;
+  const tilt = returnTilt((mean - floor) / (ceiling - floor));
+  const uniform = Math.min(1 - Number.EPSILON, Math.max(Number.EPSILON, random()));
+  const position = Math.abs(tilt) < 1e-7 ? uniform : tilt > 0
+    ? 1 + Math.log(uniform + (1 - uniform) * Math.exp(-tilt)) / tilt
+    : Math.log1p(uniform * Math.expm1(tilt)) / tilt;
+  return Math.min(ceiling, Math.max(floor, floor + position * (ceiling - floor)));
+}
+
+export function impliedReturnStdDev(assumptions: RetirementInputs["assumptions"]): number {
+  const { returnMean: targetMean } = assumptions;
+  const floor = assumptions.returnFloor ?? -0.08;
+  const ceiling = Math.max(floor, assumptions.returnCeiling ?? 0.15);
+  if (ceiling <= floor || targetMean <= floor || targetMean >= ceiling) return 0;
+  const magnitude = Math.abs(returnTilt((targetMean - floor) / (ceiling - floor)));
+  const variance = magnitude < 0.001 ? 1 / 12 - magnitude ** 2 / 240
+    : 1 / magnitude ** 2 - Math.exp(-magnitude) / (-Math.expm1(-magnitude)) ** 2;
+  return (ceiling - floor) * Math.sqrt(Math.max(0, variance));
 }
 
 
@@ -501,6 +458,7 @@ export function projectRetirementPlan(
   for (const checkpoint of checkpoints.filter((checkpoint) => checkpoint.date.getTime() === valuationDate.getTime())) checkpoint.capture(balancesByPerson);
   const startedGicIds = startedGicIdsSeed(roster);
   let cumulativeInflation = 1;
+  const inflationMultipliersByYear: number[] = [];
   // Streams with "partialInflation"/"fixedRate" indexing compound independently of the shared inflation multiplier.
   const streamIndexMultipliers: Record<string, number> = Object.fromEntries(
     inputs.incomeStreams.map((stream) => [stream.id, 1]),
@@ -543,7 +501,7 @@ export function projectRetirementPlan(
     const periodReturns = subPeriodCount <= 1
       ? [portfolioReturn]
       : options.subPeriodReturns?.[index]
-        ?? decomposeAnnualReturn(fallbackRandom, portfolioReturn, subPeriodCount, inputs.assumptions.returnStdDev);
+        ?? decomposeAnnualReturn(fallbackRandom, portfolioReturn, subPeriodCount, impliedReturnStdDev(inputs.assumptions));
     const periodGrowthFractions = periodReturns.map((_, period) => {
       if (index > 0) return 1 / periodReturns.length;
       const periodEnd = (period + 1) / periodReturns.length;
@@ -558,8 +516,13 @@ export function projectRetirementPlan(
     const activePhase = inputs.spendingPlan.phases.find(
       (phase) => age >= phase.startAge && age <= phase.endAge,
     );
+    inflationMultipliersByYear[index] = cumulativeInflation;
+    const firstPhaseIndex = Math.max(0, Math.min(...inputs.spendingPlan.phases.map((phase) => phase.startAge)) - baseInputs.personalInfo.currentAge);
+    const spendingInflation = inputs.spendingPlan.indexFromFirstPhase
+      ? cumulativeInflation / (inflationMultipliersByYear[firstPhaseIndex] ?? cumulativeInflation)
+      : cumulativeInflation;
     const annualSpendingTarget = activePhase
-      ? activePhase.annualSpending * (inputs.spendingPlan.indexedToInflation ? cumulativeInflation : 1)
+      ? activePhase.annualSpending * (inputs.spendingPlan.indexedToInflation ? spendingInflation : 1)
       : 0;
     const spendingTarget = age < retirementStartAge
       ? 0
@@ -754,7 +717,10 @@ function buildRoster(inputs: RetirementInputs): PersonRoster[] {
       birthMonth: inputs.personalInfo.birthMonth,
       receivesCpp: inputs.personalInfo.receivesCpp ?? true,
       cppPayoutRate: Math.max(0, finiteNumber(inputs.personalInfo.cppPayoutRate, 0.6)),
+      cppAnnualEstimates: inputs.personalInfo.cppAnnualEstimates,
       receivesOas: inputs.personalInfo.receivesOas ?? true,
+      oasPayoutRate: inputs.personalInfo.oasPayoutRate,
+      oasResidency: inputs.personalInfo.oasResidency,
       gicConfigs: resolveGicConfigs(inputs.existingAssets, inputs.personalInfo.currentAge, inputs.assumptions.returnMean),
     },
     ...(inputs.personalInfo.additionalPeople ?? []).map((person) => {
@@ -767,7 +733,10 @@ function buildRoster(inputs: RetirementInputs): PersonRoster[] {
         birthMonth: person.birthMonth,
         receivesCpp: person.receivesCpp ?? true,
         cppPayoutRate: Math.max(0, finiteNumber(person.cppPayoutRate, 0.6)),
+        cppAnnualEstimates: person.cppAnnualEstimates,
         receivesOas: person.receivesOas ?? true,
+        oasPayoutRate: person.oasPayoutRate,
+        oasResidency: person.oasResidency,
         gicConfigs: resolveGicConfigs(person.existingAssets, currentAge, inputs.assumptions.returnMean),
       };
     }),
@@ -1521,14 +1490,14 @@ function personFixedIncome(inputs: RetirementInputs, person: PersonRoster, yearI
     if (person.receivesCpp && age >= inputs.strategy.cppStartAge) {
       // Was targetDeathAge + 1, which the age <= targetDeathAge guard above made unreachable - the death year never actually prorated. Fixed to cut off on the death birthday itself.
       const proration = incomeProrationFraction(age, inputs.strategy.cppStartAge, person.targetDeathAge, person.birthMonth, person.birthMonth, yearIndex);
-      const cppAmount = calculateCppAnnualBenefit(cppAnnualMaximum * person.cppPayoutRate, inputs.strategy.cppStartAge) * inflationMultiplier * proration;
+      const cppAmount = calculateCppAnnualBenefit(cppAnnualMaximum * person.cppPayoutRate, inputs.strategy.cppStartAge, person.cppAnnualEstimates) * inflationMultiplier * proration;
       income.cpp += cppAmount;
       taxableIncome.ordinaryIncome += cppAmount;
     }
     if (person.receivesOas && age >= Math.max(65, inputs.strategy.oasStartAge)) {
       const oasStartAge = Math.max(65, inputs.strategy.oasStartAge);
       const proration = incomeProrationFraction(age, oasStartAge, person.targetDeathAge, person.birthMonth, person.birthMonth, yearIndex);
-      const oasAmount = calculateOasAnnualBenefit(oasAnnualMaximum, inputs.strategy.oasStartAge) * inflationMultiplier * proration;
+      const oasAmount = calculateOasAnnualBenefit(oasAnnualMaximum, inputs.strategy.oasStartAge, person.oasResidency, person.oasPayoutRate) * inflationMultiplier * proration;
       income.oas += oasAmount;
       taxableIncome.ordinaryIncome += oasAmount;
     }

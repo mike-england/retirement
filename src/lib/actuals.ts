@@ -87,7 +87,11 @@ export function createForecastRevision(baseline: ActualsBaseline, inputs: Retire
   if (!parsePlanDate(effectiveDate) || !effectiveDate.endsWith("-01-01") || effectiveDate <= lastActual || effectiveDate > baseline.points.at(-1)!.date) throw new Error("Choose a January 1 after the latest actuals date and within the frozen plan.");
   const anchors = (plan: RetirementInputs) => [{ ...plan.personalInfo, id: "primary" }, ...plan.personalInfo.additionalPeople].map((person) => ({
     id: person.id, currentAge: person.currentAge, targetDeathAge: person.targetDeathAge, birthMonth: person.birthMonth,
-    receivesCpp: person.receivesCpp, cppPayoutRate: person.cppPayoutRate, receivesOas: person.receivesOas,
+    receivesCpp: person.receivesCpp, cppPayoutRate: person.cppPayoutRate, cppAnnualEstimates: person.cppAnnualEstimates ?? {}, receivesOas: person.receivesOas,
+    oasPayoutRate: person.oasPayoutRate ?? (person.oasResidency ? null : 1),
+    oasResidency: { yearsAt65: person.oasResidency?.yearsAt65 ?? 40, livesInCanada: person.oasResidency?.livesInCanada ?? true,
+      continueResidence: person.oasResidency?.continueResidence ?? true, eligibilityOverride: person.oasResidency?.eligibilityOverride ?? false,
+      annualEstimates: person.oasResidency?.annualEstimates ?? {} },
     accounts: accountEntriesFor(person.id === "primary" ? plan.existingAssets : person.existingAssets, person.currentAge, plan.assumptions.returnMean)
       .map((account) => ({ id: account.id, type: account.type, returnType: account.returnType, balance: account.balance, bookValue: account.bookValue, annualRate: account.annualRate, termYears: account.termYears, startAge: account.startAge, maturityAction: account.maturityAction })),
   }));
