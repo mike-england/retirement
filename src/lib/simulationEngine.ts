@@ -80,6 +80,7 @@ type PersonYearState = {
   fixedTaxable: TaxableIncome;
   tax: TaxResult;
   cashContribution: number;
+  scheduledTfsaContribution: number;
   monthlyRrspContribution: number;
   monthlyTfsaContribution: number;
   monthlyNonRegisteredContribution: number;
@@ -237,6 +238,7 @@ export type ProjectionOptions = {
   balanceOverrides?: ProjectionBalanceOverride[];
   checkpointDates?: string[];
   forecastRevisions?: ForecastRevision[];
+  householdTfsaSurplusFromYear?: number;
   // Per year index, the realized return for each sub-period (month/quarter/half) when withdrawalFrequency isn't "annual". Falls back to an internally generated split if omitted.
   subPeriodReturns?: number[][];
 };
@@ -570,6 +572,7 @@ export function projectRetirementPlan(
       retirementStartMonth,
       options.pensionSplittingPolicy ?? "detailed",
       options.fastWithdrawalSizing ?? false,
+      baseYear + index >= (options.householdTfsaSurplusFromYear ?? -Infinity),
     );
 
 
@@ -642,6 +645,7 @@ export function projectRetirementPlan(
       netSpendableCash: result.netSpendableCash,
       spendingTarget,
       portfolioReturn,
+      appliedPortfolioReturn,
       inflationRate,
       estateValue,
       estateTax: yearEstateTax,
@@ -827,6 +831,7 @@ function fundHousehold(
   retirementStartMonth: number,
   pensionSplittingPolicy: PensionSplittingPolicy,
   fastWithdrawalSizing: boolean,
+  householdTfsaSurplus: boolean,
 ) {
   const useHouseholdTax = Boolean(inputs.strategy.taxAwareWithdrawals || inputs.strategy.pensionIncomeSplitting?.enabled
     || roster.some((person) => person.currentAge + yearIndex >= rrifConversionAgeFor(inputs, person.id)));
@@ -879,6 +884,7 @@ function fundHousehold(
       withdrawals: { rrsp: 0, tfsa: 0, nonRegistered: 0, interestBearing: 0 },
       fixedTaxable,
       cashContribution: fixed.cashContribution,
+      scheduledTfsaContribution: fixed.tfsaContribution + fixed.monthlyTfsaContribution * 12,
       monthlyRrspContribution: fixed.monthlyRrspContribution,
       monthlyTfsaContribution: fixed.monthlyTfsaContribution,
       monthlyNonRegisteredContribution: fixed.monthlyNonRegisteredContribution,
@@ -1251,18 +1257,31 @@ function fundHousehold(
   // silently invested. This matters when employment ends before the first retirement spending phase starts.
   const finalSurplus = spendingTarget > 0 ? Math.max(0, netCashTotal() - spendingTarget) : 0;
   if (finalSurplus > 0) {
-    const surplusState = states.find((state) => state.id === "primary") ?? states[0];
-    // When the GIC buffer strategy is reserving/refilling, leftover cash tops the GIC back up first, before TFSA/non-registered.
-    const gicContribution = Math.min(finalSurplus, Math.max(0, gicRefillCap));
-    const remainingSurplus = finalSurplus - gicContribution;
-    // TFSA is fully tax-free, so it's filled first (up to the annual room) before falling back to non-registered.
-    const tfsaRoom = Math.max(0, tfsaAnnualContributionLimit * inflationMultiplier);
-    const tfsaContribution = Math.min(remainingSurplus, tfsaRoom);
-    const nonRegisteredContribution = remainingSurplus - tfsaContribution;
-    surplusState.balances.interestBearing += gicContribution;
-    surplusState.balances.tfsa += tfsaContribution;
-    surplusState.balances.nonRegistered += nonRegisteredContribution;
-    surplusState.balances.nonRegisteredBookValue += nonRegisteredContribution;
+    if (!householdTfsaSurplus) {
+      const surplusState = states.find((state) => state.id === "primary") ?? states[0];
+      const gicContribution = Math.min(finalSurplus, Math.max(0, gicRefillCap));
+      const remainingSurplus = finalSurplus - gicContribution;
+      const tfsaContribution = Math.min(remainingSurplus, Math.max(0, tfsaAnnualContributionLimit * inflationMultiplier));
+      const nonRegisteredContribution = remainingSurplus - tfsaContribution;
+      surplusState.balances.interestBearing += gicContribution;
+      surplusState.balances.tfsa += tfsaContribution;
+      surplusState.balances.nonRegistered += nonRegisteredContribution;
+      surplusState.balances.nonRegisteredBookValue += nonRegisteredContribution;
+    } else {
+      const eligibleStates = states.filter((state, index) => state.age >= 18 && state.age <= roster[index].targetDeathAge);
+      const surplusState = eligibleStates[0] ?? states.find((state, index) => state.age <= roster[index].targetDeathAge) ?? states[0];
+      const gicContribution = Math.min(finalSurplus, Math.max(0, gicRefillCap));
+      let remainingSurplus = finalSurplus - gicContribution;
+      surplusState.balances.interestBearing += gicContribution;
+      for (const state of eligibleStates) {
+        const tfsaRoom = Math.max(0, tfsaAnnualContributionLimit * inflationMultiplier - state.scheduledTfsaContribution);
+        const tfsaContribution = Math.min(remainingSurplus, tfsaRoom);
+        state.balances.tfsa += tfsaContribution;
+        remainingSurplus -= tfsaContribution;
+      }
+      surplusState.balances.nonRegistered += remainingSurplus;
+      surplusState.balances.nonRegisteredBookValue += remainingSurplus;
+    }
   }
 
   const netSpendableCash = netCashTotal();

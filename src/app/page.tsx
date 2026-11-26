@@ -106,7 +106,7 @@ type MonteCarloProgress = { completed: number; total: number };
 
 type ProjectionSnapshot = {
   inputs: RetirementInputs;
-  calculator: typeof projectWithVariableReturns;
+  calculator: (inputs: RetirementInputs) => DeterministicProjection;
   result: DeterministicProjection | null;
   error?: string;
 };
@@ -1437,7 +1437,7 @@ export default function Home() {
                 }));
               }} />
             </section>
-            <GovernmentBenefitsStrategy inputs={inputs} onChange={setInputs} />
+            <GovernmentBenefitsStrategy inputs={inputs} onChange={setInputs} visible={activeView === "Strategy Lab"} />
           </div>
           {activeView === "Dashboard" && (
             <DashboardView
@@ -2287,7 +2287,7 @@ function SpendingPlanEditor({
     </section>
   );
 }
-function GovernmentBenefitsStrategy({ inputs, onChange }: { inputs: RetirementInputs; onChange: (inputs: RetirementInputs) => void }) {
+function GovernmentBenefitsStrategy({ inputs, onChange, visible }: { inputs: RetirementInputs; onChange: (inputs: RetirementInputs) => void; visible: boolean }) {
   const [selectedId, setSelectedId] = useState("primary");
   const people = [{ ...inputs.personalInfo, id: "primary" }, ...(inputs.personalInfo.additionalPeople ?? [])];
   const person = people.find((person) => person.id === selectedId) ?? people[0];
@@ -2367,8 +2367,8 @@ function GovernmentBenefitsStrategy({ inputs, onChange }: { inputs: RetirementIn
       </details>
       <p className="benefit-model-note">Gross benefits in plan-date dollars, before tax and OAS recovery.<FieldHint text="CPP does not automatically adjust for additional years without contributions. OAS uses your entered age-65 percentage, plus the separate deferral increase. Eligibility checkboxes remain manual: residence and legal-status requirements must be verified." /></p>
       <div className="benefit-timing-grid">
-        <BenefitTimingChart label="CPP" choices={cppChoices} endAge={person.targetDeathAge} />
-        <BenefitTimingChart label="OAS" choices={oasChoices} endAge={person.targetDeathAge} />
+        <BenefitTimingChart label="CPP" choices={cppChoices} endAge={person.targetDeathAge} visible={visible} />
+        <BenefitTimingChart label="OAS" choices={oasChoices} endAge={person.targetDeathAge} visible={visible} />
       </div>
       <details className="benefit-model-details">
         <summary>Assumptions & benefit rules</summary>
@@ -2382,7 +2382,7 @@ function GovernmentBenefitsStrategy({ inputs, onChange }: { inputs: RetirementIn
   );
 }
 
-function BenefitTimingChart({ label, choices, endAge }: { label: string; choices: { age: number; annualAmount: number; source: string }[]; endAge: number }) {
+function BenefitTimingChart({ label, choices, endAge, visible }: { label: string; choices: { age: number; annualAmount: number; source: string }[]; endAge: number; visible: boolean }) {
   const firstAge = choices[0].age;
   const lastAge = Math.max(firstAge, Math.floor(endAge));
   const ages = Array.from({ length: lastAge - firstAge + 1 }, (_, index) => firstAge + index);
@@ -2407,7 +2407,7 @@ function BenefitTimingChart({ label, choices, endAge }: { label: string; choices
   return (
     <section className="benefit-timing-chart">
       <h3>{label} cumulative benefits<FieldHint text="Total gross payments by birthday. Crossover ages show when the later start catches up with the earlier start; these are not after-tax or investment-return comparisons." /></h3>
-      <ReactECharts option={option} style={{ height: 220, width: "100%" }} notMerge lazyUpdate />
+      {visible && <ReactECharts option={option} style={{ height: 220, width: "100%" }} notMerge lazyUpdate />}
       <ul className="benefit-crossovers" aria-label={`${label} crossover ages`}>{crossovers.map(({ earlier, later, crossover }) => <li key={`${earlier}-${later}`}>
         {later} vs. {earlier}: <strong>{crossover !== null && crossover <= endAge ? `age ${crossover.toFixed(1)}` : `none by ${endAge}`}</strong>
       </li>)}</ul>
@@ -2701,6 +2701,8 @@ function LedgerView({
       </section>
     );
   const years = projection.years;
+  const projectionStartDate = planDateFor(working?.baseline.inputs ?? inputs);
+  const hasPartialFirstYear = projectionStartDate.getMonth() !== 0 || projectionStartDate.getDate() !== 1;
   const plannedSpend = years.reduce(
     (sum, year) => sum + year.spendingTarget,
     0,
@@ -2822,6 +2824,7 @@ function LedgerView({
                       <input
                         type="number"
                         step="0.1"
+                        aria-label={`Annual return for ${year.calendarYear}`}
                         disabled={year.calendarYear < firstEditableYear}
                         title={working ? year.calendarYear < firstEditableYear ? "Recorded/past return path is fixed in the working forecast." : `Future return edits are applied automatically when rebasing from Actuals. Currently modeled: ${oneDecimalPercent(year.portfolioReturn)}%.` : "Annualized return. First-year growth applies only from the saved plan date; earlier sub-periods have zero modeled growth."}
                         value={oneDecimalPercent(year.calendarYear < firstEditableYear ? year.portfolioReturn : inputs.assumptions.annualReturnOverrides[year.age] ?? year.portfolioReturn)}
@@ -2834,6 +2837,11 @@ function LedgerView({
                       />
                       %
                     </span>
+                    {hasPartialFirstYear && year.calendarYear === years[0].calendarYear && (
+                      <span className="ledger-applied-return" title="Compounded market return applied from the plan date through year-end, before cash flows. Fixed-rate holdings use their own rates.">
+                        Applied: {updating ? "updating" : formatPercent(year.appliedPortfolioReturn)}
+                      </span>
+                    )}
                   </td>
                   <td>{formatCurrency(year.income.employment)}</td>
                   <td>{formatCurrency(year.income.cpp)}</td>
@@ -3724,44 +3732,69 @@ function TaxBracketTable({
 function GuideView() {
   const sections: { title: string; body: ReactNode }[] = [
     {
-      title: "What this tool actually calculates",
+      title: "What the planner does",
       body: (
         <>
-          <p>This is a scenario-based planning model. It predicts possible household cash flow, taxes, account balances, and estate values from the assumptions you enter, but it cannot predict which future scenario will occur.</p>
-          <p>The Dashboard and Ledger show one seeded variable-return path. Monte Carlo runs the same plan many times with different return and inflation paths, then summarizes the range of outcomes. A high success rate means the modeled portfolio stayed funded; it does not guarantee that result in real life.</p>
-          <p>Each simulated year adds income, applies the selected withdrawal schedule, calculates annual tax and OAS recovery tax, reinvests eligible surplus cash, and updates the accounts. With monthly, quarterly, or semi-annual withdrawals, the annualized market return is split into matching sub-period returns. First-year growth applies only from the saved plan date; earlier sub-periods have zero modeled growth.</p>
+          <p>Retirement Planner helps you explore how your household's income, savings, spending, taxes, and withdrawal choices might work together over retirement. It models Canadian accounts and tax rules, CPP and OAS, and the estate remaining at the end of the plan.</p>
+          <p>The Dashboard and Ledger show one possible path based on your assumptions. Monte Carlo runs many different return and inflation paths to show a range of outcomes. You can save alternative scenarios and compare them, or record actual balances as your plan progresses.</p>
+          <p>Results are estimates, not predictions or financial advice. They depend on your inputs and simplify some tax and benefit rules. Review important decisions with a qualified professional.</p>
         </>
       ),
     },
     {
-      title: "Choosing a strategy",
+      title: "Your data and backups",
       body: (
         <>
-          <p>Keep spending, lifespan, market assumptions, and the random seed unchanged when comparing withdrawal strategies. First check that spending is fully funded, then compare Monte Carlo success rates and downside outcomes. Once you are comfortable with the plan's resilience, use final estate to compare wealth preserved. No strategy is best under every possible future.</p>
-          <p><strong>Spending funded first:</strong> check for funding gaps and when they begin. A large final estate in one favorable return path does not compensate for being unable to fund the intended lifestyle in less favorable paths.</p>
-          <p><strong>Reliability before estate:</strong> compare Monte Carlo success rates, when failed runs run out of money, and the range of outcomes in poor markets. These are estimates under the chosen assumptions, not guarantees. Among plans with acceptable resilience, final estate is a useful secondary measure, especially when leaving an inheritance is a goal.</p>
-          <p><strong>Taxes and OAS explain the differences:</strong> do not choose solely on the lowest tax bill or highest OAS payment. Accepting some OAS recovery or paying more tax now can sometimes reduce later RRIF or estate taxes. Review spending, reliability, and estate together rather than minimizing any single tax figure.</p>
+          <p>Your scenarios and calculations stay in your browser on this device. <strong>Save</strong> stores the current scenario in browser storage, not in an online account; it will not automatically appear on another device. Saved scenarios are not encrypted in browser storage. Clearing browser data, using private browsing, or losing the device can remove them.</p>
+          <p>Use <strong>New</strong> to start another scenario without deleting your saved ones. Select a saved scenario to reopen it, and use <strong>Delete</strong> to remove one you no longer need.</p>
+          <p>Use <strong>Export</strong> regularly to keep a separate backup. An ordinary JSON file is readable by anyone who opens it. For a protected backup, select <strong>Password protect file</strong> and choose a strong, unique password; at least 12 characters are recommended. The file is encrypted on your device with AES-256-GCM, a widely used encryption standard. Its filename still reveals the scenario name.</p>
+          <p>Keep the password somewhere safe: it is not saved by the app and cannot be recovered. Encryption protects the exported file, not the copy saved in your browser. <strong>Import</strong> restores either format and asks for the password when needed; the imported scenario is saved unencrypted in your browser.</p>
+          <p>Backups include saved baselines, actual balances, notes, and forecast revisions. Unsaved Actuals form entries are not included. If an imported scenario has the same name as a saved one, choose <strong>Keep both</strong> to retain both histories or <strong>Replace existing</strong> to replace the saved scenario and its history.</p>
+          <p>The site counts page visits without cookies or click tracking. Scenario names, financial information, passwords, and file contents are not included in those counts.</p>
         </>
       ),
     },
     {
-      title: "People and dates",
+      title: "Start a plan",
       body: (
         <>
-          <p><strong>Plan date</strong> is the saved reference date for starting ages and account balances. Reopening a scenario does not advance this date or anyone's age. Change it explicitly when rebasing a plan, and update ages and balances to match. <strong>Death age</strong> is the person's birthday cutoff for age-based income and benefits; the estate is settled in the final simulated year. Birth month, when provided, controls within-year proration.</p>
-          <p>Each additional person has their own age, birth month, benefits, accounts, and tax return. Household projections use the longest household lifespan; age-based income belongs to the person who owns that stream.</p>
-          <p><strong>Province</strong> selects the provincial tax rules. <strong>CPP at 65 (% of maximum)</strong> sets a fallback entitlement before the start-age adjustment. Strategy Lab also supports per-person annual CPP estimates at 60, 65, and 70, already adjusted for age and your expected contribution history. The app does not infer extra zero-earning years or contribution-history dropouts from your retirement date. <strong>OAS at 65 (% maximum)</strong> is a user-entered share, normally estimated as qualifying Canadian residence years after 18 divided by 40, capped at 100%; the deferral increase is separate.</p>
+          <p><strong>1. People:</strong> Set the Plan date, province, ages, birth months, and planned lifespans. Add the other people in your household and review each person's CPP and OAS eligibility and entitlements. Ages and starting account balances must describe the same Plan date.</p>
+          <p><strong>2. Income:</strong> Add employment, pensions, and other income for each person. Set the amounts, start and end ages or months, tax treatment, and any increases over time.</p>
+          <p><strong>3. Contributions:</strong> Add any planned RRSP, TFSA, and non-registered contributions, including who makes them and when. Contributions reduce available cash; RRSP contributions also reduce modeled taxable income.</p>
+          <p><strong>4. Spending:</strong> Enter the annual spending you want in each phase of retirement and choose whether it increases with inflation. Spending and withdrawals begin when the household's last employment income stream ends.</p>
+          <p><strong>5. Accounts:</strong> Open the main Accounts tab and enter each person's balances as of the Plan date. Include every account once, including GICs held inside registered accounts.</p>
+          <p><strong>6. Assumptions and Strategy:</strong> Review the return, inflation, tax, and withdrawal settings in the sidebar. Then check the Dashboard and Ledger, run Monte Carlo, and save and export your scenario. Adjust the inputs as you learn more; projections update automatically.</p>
         </>
       ),
     },
     {
-      title: "Income streams",
+      title: "Sidebar: people, income, and contributions",
       body: (
         <>
-          <p>Each stream has an owner, amount, age range, tax treatment, and indexation rule. The age controls determine when the stream starts and stops.</p>
-          <p>Tax treatment controls how the amount is classified: employment and pension are ordinary income, registered withdrawals are taxable or tax-free as appropriate, dividends receive their modeled treatment, and capital gains use the configured inclusion rate.</p>
-          <p>Contribution schedules deposit the configured annual amounts directly into RRSP, TFSA, or non-registered accounts during their active age range. RRSP contributions reduce taxable income; TFSA and non-registered contributions use after-tax cash. All contributions reduce available cash regardless of where the money came from. For a partial or unusual year, create a separate schedule active for that one year with the desired annual amounts.</p>
-          <p>Indexation can follow inflation, a portion of inflation, a fixed annual rate, or no increase. The model uses annual income totals; the withdrawal schedule controls how spending draws are distributed within the year.</p>
+          <p><strong>People</strong> defines the household, the Plan date, and individual benefit eligibility. The Plan date anchors starting ages and balances and does not advance when you reopen the app. The projection continues through the longest household lifespan, with income and benefits assigned to their owners. Birth months help determine partial-year amounts.</p>
+          <p>CPP at 65 is a fallback percentage of the maximum benefit; the app applies the start-age adjustment but does not calculate your contribution history. OAS at 65 is a percentage you provide, commonly estimated from qualifying Canadian residence years after age 18 divided by 40, up to 100%. This is not an eligibility determination. Strategy Lab offers more benefit settings and comparisons.</p>
+          <p><strong>Income</strong> holds streams such as employment and pensions. Set an owner, amount, timing, tax treatment, and indexation for each stream. Employment end dates determine when household retirement spending begins. Use separate streams for amounts or schedules that change.</p>
+          <p><strong>Contributions</strong> sets deposits by person, account type, and age range. Schedules can be annual or monthly. For an unusual or partial year, use a separate one-year schedule with the intended amount.</p>
+        </>
+      ),
+    },
+    {
+      title: "Sidebar: spending, assumptions, and strategy",
+      body: (
+        <>
+          <p><strong>Spending</strong> uses annual targets for one or more age-based phases. With inflation indexing enabled, amounts normally use Plan date dollars. <strong>Start indexing at first phase</strong> instead uses the first phase's starting year as the common anchor for all phases. Without indexing, amounts stay fixed in nominal dollars.</p>
+          <p><strong>Assumptions</strong> includes inflation and the average, minimum, and maximum annual market returns. These are inputs to the model, not guarantees about markets. Returns vary within the selected bounds; individual paths need not achieve the requested average. Inflation is sampled separately, and prolonged market regimes are not explicitly modeled. First-year investment growth is prorated from the Plan date; spending, income, contributions, and taxes retain their calendar-year rules.</p>
+          <p><strong>Strategy</strong> controls withdrawal frequency and account order, along with optional tax-aware withdrawals, eligible pension splitting, RRSP meltdown, and a GIC / HISA buffer. Mandatory RRIF withdrawals still apply. Tax-aware withdrawals seek more efficient current household cash flow within the chosen order; they do not guarantee the best lifetime outcome. RRSP meltdown deliberately adds withdrawals and can increase current tax or OAS recovery.</p>
+          <p>Pension splitting assumes the primary person and first additional person are eligible spouses or common-law partners. The GIC / HISA buffer can reserve fixed-rate holdings until the modeled market falls from its peak, then reserve them again after recovery. Review these settings against your own circumstances rather than optimizing for a single return path.</p>
+        </>
+      ),
+    },
+    {
+      title: "Dashboard",
+      body: (
+        <>
+          <p>The Dashboard summarizes one projected path with funding, balances, taxes, benefits, estate results, and charts. Start by checking whether the intended spending is funded and when any gap appears. Then use the Ledger to understand the yearly details and Monte Carlo to see how the plan behaves under different conditions.</p>
+          <p><strong>OAS recovered</strong> is the amount of OAS the government takes back because income exceeds the recovery threshold. <strong>Lifetime OAS</strong> is the total benefit kept after that recovery. End-of-life tax is the modeled tax on the final estate and is also included in lifetime tax. Estate results are estimates after modeled tax and probate fees.</p>
         </>
       ),
     },
@@ -3769,148 +3802,101 @@ function GuideView() {
       title: "Accounts",
       body: (
         <>
-          <p><strong>RRSP / RRIF</strong>: withdrawals are fully taxed as ordinary income. The RRIF conversion age applies to the whole registered holding; minimum withdrawals begin the following year and eligible RRIF income can be pension-split from age 65. Plans without a saved conversion age use 71, with minimums starting at 72. Choose Already converted for an existing RRIF. Conversion timing, partial conversions, and the spouse-age election for minimums are not optimized.</p>
-          <p>Accounts are entered separately by owner in the main Accounts view, with a subtotal for each person and a household total. Each row has its own tax type and return treatment; include each balance only once, including GICs held inside an RRSP or TFSA. The simulation pools market-linked balances by owner and tax type when funding withdrawals.</p>
-          <p>With saved Actuals baselines, Accounts defaults to <strong>Selected baseline</strong>: read-only holdings and totals from the baseline selected in Actuals, with its latest complete balance date. Incomplete entries do not replace the totals; a baseline without complete actuals shows its starting balances instead. Inactive future holdings are excluded from this dated view. Switching baselines changes the displayed snapshot, not the editable plan or working-forecast source. Choose <strong>Plan starting balances</strong> to add, edit, or reorder accounts and holding details. Without a baseline, this editor opens directly.</p>
-          <p><strong>TFSA</strong>: withdrawals are always tax-free and never counted as income anywhere.</p>
-          <p><strong>Non-registered</strong> + <strong>Adjusted cost base (ACB)</strong>: only the gain above your ACB is taxable, and only that portion is a capital gain (taxed at the capital gains inclusion rate on the Assumptions tab, currently 50% or 66.67% included). If ACB equals the account balance there's no gain and changing it further won't do anything; the same applies at death, where any remaining unrealized gain is deemed realized.</p>
-          <p><strong>Fixed-rate GIC / PPN</strong>: earns its own annual rate rather than the simulated market return. For example, 5% annually over two years compounds to 10.25%. A non-registered holding realizes deferred growth at maturity or proportionally on early withdrawal; RRSP/RRIF growth remains sheltered until withdrawn and TFSA growth is tax-free. At maturity, proceeds can renew or move to the market-linked balance within the same tax wrapper. Existing saved total-term rates are converted to equivalent annual rates.</p>
-          <p><strong>Interest-bearing savings</strong>: enter an assumed annual rate without a GIC term. Non-registered interest is modeled as taxable annually; registered and TFSA holdings retain their tax treatment. These balances participate in the GIC / HISA buffer strategy. The assumed rate stays constant in projections even though actual savings rates can change.</p>
+          <p>Enter accounts separately under their owners, with a name, starting balance, account type, and return treatment. Person subtotals and the household total help you check that everything is included once. Expand a row for details such as adjusted cost base or a fixed rate; use the handle to reorder accounts. Reordering does not change the withdrawal strategy.</p>
+          <p><strong>RRSP / RRIF</strong> withdrawals are taxable; set each person's RRIF conversion age here, or choose Already converted. Minimum withdrawals begin the year after conversion. <strong>TFSA</strong> withdrawals are tax-free. For <strong>non-registered</strong> accounts, the adjusted cost base helps determine the taxable gain when investments are sold or deemed disposed at death.</p>
+          <p>Choose <strong>Market-linked</strong> for investments following simulated market returns, <strong>Fixed-rate GIC / PPN</strong> for a holding with a rate and term, or <strong>Interest-bearing savings</strong> for an assumed savings rate without a term. Fixed rates are not randomized; actual savings rates can change. A GIC can renew or move to market-linked investments in the same tax wrapper at maturity. Do not include the same GIC balance in another account row.</p>
+          <p>Named accounts help organize balances, but the model pools market-linked investments by person and tax type when calculating withdrawals. It does not choose which named account to sell.</p>
         </>
       ),
     },
     {
-      title: "Actuals: getting started",
+      title: "Ledger",
       body: (
         <>
-          <p>Actuals compares recorded account balances with your plan and projects forward from those balances. Before starting, check <strong>People: Plan date</strong>, ages, <strong>Accounts</strong> balances, and assumptions. Starting ages and balances must describe that same date. If you have no reliable older plan, start with today's date and current values; the app cannot reconstruct a missing historical forecast.</p>
-          <p>No initial freeze is required. With at least one account and a completed projection, Actuals shows the live <strong>Editable plan</strong>. Enter a balance date and recorded balances. Opening the view or typing in the form does not save anything.</p>
-          <p>Your first <strong>Apply actuals</strong> or <strong>Save incomplete entry</strong> automatically preserves the reference as <strong>Original plan</strong> and saves the scenario and entry together. The reference keeps the plan's starting balances, not the new actual balances. It stays fixed after saving; existing or imported baselines are not replaced automatically. Only complete applied entries activate the working forecast.</p>
+          <p>The Ledger shows the Dashboard projection year by year. Expand a year to inspect returns, balances, funding, taxes, and withdrawals by person and account type. With more frequent withdrawals, the expanded view also shows the modeled periods within the year.</p>
+          <p>The Return input is a full-year market assumption. If the Plan date is after January 1, the first year also shows <strong>Applied</strong>: the compounded market return modeled from the Plan date to year-end. Fixed-rate holdings use their own rates, and account balances also reflect cash flows.</p>
+          <p>You can edit annual returns for this path or use <strong>Generate returns</strong> to produce a new path. Monte Carlo generates its own paths and does not use these yearly overrides. When a working forecast is active, past and current-year returns stay fixed; future edits are applied through a rebase.</p>
+          <p>Current-year amounts are full-year estimates, not a list of what remains to withdraw. Recorded balances do not tell the model what income, withdrawals, taxes, or contributions have already occurred.</p>
         </>
       ),
     },
     {
-      title: "Actuals: recording balances",
+      title: "Using your results in retirement",
       body: (
         <>
-          <p>At each review, choose one balance date and enter every tracked household account for that date. Enter <strong>0</strong> for an empty account; leave unknown balances blank. <strong>Copy last actuals</strong> copies the latest saved entry before that date. If there is no earlier entry, <strong>Use starting balances</strong> copies the baseline's starting balances. Review copied values against your statements. Selecting an existing date loads its entry for editing.</p>
-          <p><strong>Apply actuals</strong> saves a complete household entry and automatically recalculates future balances, withdrawals, taxes, and funding in Dashboard, Ledger, scenario comparisons, and Monte Carlo. Routine balance updates do not need a rebase or another save step. <strong>Save incomplete entry</strong> keeps partial work but does not apply it to the household forecast. Complete unsaved entries are previews only.</p>
-          <p>The chart always displays the full history and forecast, without zoom or pan. <strong>Compare</strong> selects the household or an individual person. The dashed blue reference is the editable plan until the first save, then the selected frozen baseline. The green <strong>Rolling reforecast</strong> includes applied balances and saved assumptions. Dots are recorded balances; future lines are estimates. A difference from plan includes deposits, withdrawals, and spending changes, not just investment returns.</p>
-          <p>Keep the Plan date, ages, and starting Accounts balances unchanged during routine entry. Review funding on Dashboard and expand Ledger years for withdrawals by person and account type. Market-linked accounts are pooled by person and tax type, not chosen individually by name. Current-year amounts are full-year estimates, not amounts still to withdraw: balance entries do not record actual year-to-date income, withdrawals, taxes, contributions, or cost bases.</p>
+          <p>Start on the <strong>Dashboard</strong> by checking whether your planned spending is funded and whether any funding gap appears. Then open the <strong>Ledger</strong>, find the year you want to review, and select the <strong>+</strong> beside it to see the details.</p>
+          <p>The expanded funding table shows each person's modeled annual withdrawals under <strong>RRSP/RRIF drawn</strong>, <strong>TFSA drawn</strong>, <strong>Non-registered</strong>, and <strong>GIC / savings drawn</strong>. It also shows employment or pension income, CPP, and OAS. These amounts reflect your chosen strategy, scheduled withdrawals, and any required RRIF minimums. The model groups market-linked accounts by person and tax type; it does not select a particular named account to withdraw from.</p>
+          <p><strong>Less income tax</strong> shows the estimated annual income tax for each person. <strong>Net cash</strong> is funding after modeled contributions and income tax; the household total can be compared with the year's spending target. OAS is shown after modeled recovery. These are annual estimates, not a withholding schedule or a tax bill.</p>
+          <p>For monthly, quarterly, or semi-annual withdrawals, the expanded period table shows modeled withdrawals by account type for each period. Use it to understand the planned timing, but check your actual transactions and tax obligations before deciding what to withdraw. In particular, a current-year estimate covers the whole year, not just what remains after withdrawals or taxes already paid.</p>
+          <p>If retirement income and withdrawals leave more after-tax cash than the spending target, the projection assumes the surplus is reinvested. When the GIC / HISA buffer is set to refill and is eligible for a top-up, the model fills that first. It then uses each living adult's TFSA in the order listed under People, up to a modeled annual limit after scheduled TFSA contributions. Any money left over goes into non-registered investments belonging to the first living adult listed under People, or the first living person if there are no adults. These are assumptions in the forecast, not actual deposits or a personalized recommendation, and the Ledger does not separately list those surplus deposits.</p>
+          <p>The annual TFSA limit comes from the planner's bundled tax data and future limits are estimated using modeled inflation. It is not a live CRA lookup and does not determine residency eligibility or track unused room or withdrawals. Before contributing, verify each account holder's eligibility and actual available room, including previous contributions and withdrawals. Review investment choices, withholding, and taxes with a qualified professional as needed. Update balances through Actuals and revisit the plan as circumstances change.</p>
+          <p>Older frozen Actuals baselines retain their original surplus calculation to preserve historical comparisons. Rebase an older baseline to use the household TFSA rule from the following January 1; the earlier history stays unchanged.</p>
         </>
       ),
     },
     {
-      title: "Actuals: rebasing",
+      title: "Actuals: compare your plan with real balances",
       body: (
         <>
-          <p>Rebase when you want a new dated reference from recorded balances, or want to apply edited future assumptions. Select the source baseline, then <strong>Rebase from actuals</strong>. In <strong>Review new baseline</strong>, name the new baseline and choose a complete saved household entry; the latest is selected initially. Check the date, before/after ages, account balances, and total, then <strong>Confirm rebase</strong>. Cancel makes no changes.</p>
-          <p>Confirmation updates the editable Plan date, Accounts balances, and calendar-year ages, saves the scenario, and makes the new baseline drive future projections automatically. Balances apply on the recorded date. The working calculation retains modeled tax-year history and holding state rather than starting another year's income or withdrawals. Earlier history and the separate blue/green lines are preserved; the new reference begins at the rebase date. New entries belong on or after that date.</p>
-          <p>Edited income, spending, contribution, return, tax, withdrawal, and RRIF-conversion assumptions are saved automatically and take effect the following <strong>January 1</strong>, shown in the review. No separate forecast-revision save is needed. Earlier calculations stay unchanged, later scheduled revisions keep their dates, and unchanged settings do not create extra revisions. If no full future year remains, rebasing cannot apply edited assumptions. Ordinary scenario Save retains edits but does not apply them to an active working forecast.</p>
-          <p>You can browse earlier baselines without changing the working source; applying a complete entry or confirming a rebase changes that source. Ledger labels every rebase date, and Plan overview charts show green dashed rebase lines, grouping dates in the same year. Under <strong>More baseline options</strong>, <strong>Freeze editable plan</strong> creates a separate reference for changed people or account structure; those structural edits are not included in a rebase. <strong>Use editable plan</strong> stops using actuals for the main projection without deleting history.</p>
+          <p>Over time, your real account balances will differ from the amounts your plan projected. Actuals lets you enter those balances during regular reviews, so your future forecast reflects where you are now instead of continuing from an increasingly outdated estimate. You can also see how your progress compares with the plan you started with.</p>
+          <p>The preserved plan used for comparison is called a <strong>baseline</strong>. Before starting, check that the Plan date, ages, starting accounts, and assumptions describe the same starting point. If you have no reliable older plan, use today's date and current values; the app cannot reconstruct a lost historical forecast.</p>
+          <p>Initially, Actuals shows the live editable plan. Enter a balance date and the household's account balances. Your first <strong>Apply actuals</strong> or <strong>Save incomplete entry</strong> automatically saves the scenario and freezes its starting plan as <strong>Original plan</strong>. You do not need to freeze it first. Opening the view or typing without saving does not create a baseline.</p>
+          <p>For each review, use one date for all tracked accounts. Enter <strong>0</strong> for a real zero and leave an unknown amount blank. <strong>Copy last actuals</strong> fills from the latest earlier entry; when none exists, <strong>Use starting balances</strong> fills from the baseline. Check copied amounts against your statements. Selecting an existing date loads it for editing.</p>
+          <p><strong>Apply actuals</strong> saves a complete entry and makes it drive the working forecast in Dashboard, Ledger, Compare, and Monte Carlo. Routine entries do not require a rebase. <strong>Save incomplete entry</strong> preserves partial work without applying it to the forecast. A complete unsaved entry previews the result but is not recorded.</p>
+          <p>Once you have a baseline, the Accounts tab opens with a read-only view of its latest complete saved balances. If there are no complete entries, it shows the baseline's starting balances instead. Incomplete entries do not change these totals. To edit your accounts, select <strong>Plan starting balances</strong> in Accounts. Choosing a different baseline in Actuals changes the snapshot shown there, but does not change your editable plan or working forecast.</p>
+          <p>The dashed blue line is the selected baseline; the green rolling reforecast incorporates applied balances and saved assumptions. Dots mark recorded balances, while future lines are estimates. Compare the household or an individual person. A difference from the baseline reflects all changes, including deposits, withdrawals, and spending, not just investment performance.</p>
+          <p>Do not advance the Plan date, ages, or starting balances for routine reviews. Actuals records balances, not transactions: income, tax paid, withdrawals, contributions, cost bases, and fixed-holding details remain modeled assumptions. Review your actual transactions before acting on the forecast.</p>
         </>
       ),
     },
     {
-      title: "Actuals: history and backups",
+      title: "Actuals: rebase and history",
       body: (
         <>
-          <p><strong>History</strong> shows saved balance dates, amounts, differences, entry completeness, and notes, with forecast revisions and their effective dates below. Entries recorded directly against the selected baseline can be edited. Earlier entries carried through a rebase are marked <strong>Archived</strong>; edit their originals under the source baseline. Successive rebases retain earlier history without duplicating transition dates.</p>
-          <p>Every saved entry, including an archived row, has a trash button. Deleting a middle entry keeps later recorded balances and saved assumptions, removes the deleted record from snapshots, and rebuilds affected forecasts. If it anchors a rebase, only that rebase is removed; its other records and settings move to the preceding valid baseline, and later rebases are reconnected and rebuilt. Their actual balances stay unchanged, though calculated amounts between entries may change. Confirmation names removed and rebuilt baselines. Conflicting same-date records stop deletion without changing anything. Current Accounts balances, Plan date, edited assumptions, and other scenarios are unchanged. Cancel makes no changes; confirmation saves immediately and cannot be undone. Export a backup first.</p>
-          <p>To remove a mistaken baseline, select it and click the trash button beside the baseline selector. Confirmation lists the entries and revisions being removed and any working-source change. Other baselines remain saved. A source baseline cannot be deleted while newer rebases depend on it; delete those first. Deleting the final baseline returns to the editable-plan preview. Deletion cannot be undone and does not reset editable Accounts balances or the Plan date.</p>
-          <p>Saving or applying actuals and confirming a rebase automatically save the scenario in this browser. Ordinary and password-protected exports include baselines, recorded entries and notes, archived history, forecast revisions, and the working-source choice; Import restores them. Unsaved form edits and preview markers are not included. Export after important reviews and before deleting history. Browser storage is not a separate backup.</p>
+          <p>Regularly applying actual balances updates your forecast without changing the original comparison. Use <strong>Rebase from actuals</strong> when you want a new dated reference point or need to apply edited future assumptions to an active working forecast. Choose a complete saved entry, review the new name, date, ages, and balances, then confirm. The app updates the editable Plan date, ages, and account balances, saves the new baseline, and keeps earlier history. Cancel makes no changes.</p>
+          <p>Balance updates take effect on their recorded date. Changed future income, spending, contributions, returns, taxes, withdrawal settings, and RRIF conversion settings take effect on January 1 after the selected balance date. Saving the scenario alone does not apply those edits to an active working forecast. If no full future year remains, a rebase cannot apply changed future assumptions.</p>
+          <p>Changes to people or account structure require a separate baseline: use <strong>Freeze editable plan</strong> under More baseline options, then apply a complete entry against it to make it the working source. <strong>Use editable plan</strong> returns the main views to the editable projection without deleting history. Browsing a different baseline does not switch the working source.</p>
+          <p><strong>History</strong> contains entries, notes, and saved forecast revisions. Earlier entries carried through a rebase are marked Archived; edit them under their source baseline. Deleting an entry or baseline saves immediately and cannot be undone. The confirmation explains affected history; dependent baselines can restrict deletion. Export a backup before removing records.</p>
         </>
       ),
     },
     {
-      title: "Spending",
+      title: "Monte Carlo",
       body: (
         <>
-          <p>Spending is defined in phases, each with an annual target and age range. The information icons show the primary person's corresponding dates. Start age cannot be after end age, and the editor caps end ages at the household's modeled lifespan.</p>
-          <p>When spending is indexed, each phase grows with cumulative simulated inflation. Otherwise its target stays fixed in nominal dollars.</p>
-          <p>The withdrawal order is configurable. The model uses it to cover after-tax spending shortfalls, with RRIF minimums and any configured income streams included in the annual cash-flow calculation. If the accounts cannot fund the target, the projection is marked depleted instead of borrowing an invented balance.</p>
+          <p>Monte Carlo runs your plan many times using different market returns and inflation. It keeps your household and strategy settings fixed, so the results show how this plan responds to different modeled futures, not which strategy is best.</p>
+          <p>The <strong>success rate</strong> is the share of runs in which the modeled portfolio did not run out over the evaluated horizon. Percentile bands show the range of balances at each age, and failure analysis shows when failed runs first depleted their portfolios. A percentile line is not necessarily one complete simulated path. Review poor outcomes as well as the median and success rate.</p>
+          <p>Simulated annual returns summarize the generated returns and losses, including compounded returns over the first five future simulated years when available. They describe market assumptions before cash flows and taxes, not your actual account performance. With applied actuals, history through the latest actuals year remains fixed and future full years are randomized.</p>
+          <p>Results depend on your assumptions and are not guarantees. More runs reduce sampling noise, not the uncertainty in those assumptions. For speed, Monte Carlo uses simplified pension-splitting and withdrawal calculations, so individual results can differ slightly from the detailed Ledger.</p>
         </>
       ),
     },
     {
-      title: "Assumptions: what's random and what isn't",
+      title: "Strategy Lab",
       body: (
         <>
-          <p><strong>Average annual return</strong>, <strong>Minimum annual return</strong>, and <strong>Maximum annual return</strong> define a broad, bounded distribution, smoothly weighted to target the arithmetic average. It is uniform when the average is halfway between the bounds. Individual paths are not forced to hit that average or either bound; compounded growth differs from the arithmetic average. These limits are assumptions, not market guarantees or historically calibrated estimates. Annual returns and inflation are sampled independently; prolonged economic regimes are not explicitly modeled. Inflation retains its own mean and variability. Within-year return variability is derived from the annual distribution, and the annual bounds do not constrain individual months. The random seed makes the single path reproducible. Older saved return standard deviations are ignored, so regenerated paths and success rates can change; saved Actuals history and frozen comparisons are retained.</p>
-          <p>For a non-annual withdrawal frequency, each annual return is decomposed into sub-period returns that preserve the annual compounded result while allowing positive and negative months or quarters within the year.</p>
-          <p>The Ledger can override individual annual returns for the single projection. Monte Carlo ignores those overrides and generates fresh paths.</p>
-          <p>Tax brackets, basic personal amounts, TFSA room, and OAS thresholds are projected forward using simulated inflation, while tax rates and other rule parameters remain fixed. Future legislation is not modeled.</p>
+          <p>Choose an objective to compare withdrawal orders for spending capacity, final estate, or lifetime tax. The comparison evaluates all 24 account-type orders on the same Ledger path and shows the current and suggested results. You remain in control of whether to apply the suggested order.</p>
+          <p><strong>Spend more / maximize spending</strong> estimates a common adjustment to all spending phases while preserving their relative amounts. You can apply the current order's maximum, the suggested order alone, or the suggested order and its matching spending amounts. This is an estimate on one path, not a Monte Carlo safety target; review the Ledger and Monte Carlo before relying on it.</p>
+          <p><strong>Government benefits</strong> lets you choose household CPP and OAS start ages and compare cumulative gross payments for a selected person. The charts use full years in Plan date dollars and exclude tax, OAS recovery, and investment returns, so crossover ages are not after-tax break-even predictions. Optional per-person CPP estimates at 60, 65, and 70 replace the fallback for the ages entered; use annual, already age-adjusted estimates.</p>
+          <p>OAS eligibility and residence must be assessed separately; the planner does not automatically add residence years or model the age-75 OAS increase. Benefit entitlements are structural Actuals settings; create a new editable-plan baseline to change them. With an active working forecast, future strategy and spending changes remain pending until rebase.</p>
         </>
       ),
     },
     {
-      title: "Strategy",
+      title: "Compare",
       body: (
         <>
-          <p><strong>Withdrawal frequency</strong> controls when the waterfall runs: annual, semi-annual, quarterly, or monthly. More frequent schedules expose the portfolio to more realistic within-year timing and make the Ledger expandable by period.</p>
-          <p>Employment income end ages and months define when each person stops working; household spending and withdrawals begin when the last employment income stream in the household ends. With monthly withdrawals, that first retirement year is prorated from the selected month through December. Income streams also support independent start and end months for partial first or final years.</p>
-          <p><strong>Government benefits</strong> in Strategy Lab compares cumulative gross CPP at 60/65/70 and OAS at 65/70, with crossover ages for the selected person. Household start-age elections apply to each person at their own age. The charts use plan-date dollars and full years between birthdays, before income tax, OAS recovery, investment returns, and calendar-year proration; they are hypothetical timing comparisons, not guaranteed after-tax break-even ages. Optional CPP start-age estimates replace the fallback for that age. OAS uses a per-person age-65 percentage with the deferral increase added separately; no extra residence years or eligibility rules are calculated automatically. The age-75 OAS increase is not modeled. Older detailed OAS settings are retained until explicitly replaced with the percentage.</p>
-          <p><strong>Tax-aware household withdrawals</strong> follows your account order and chooses the more efficient person within the first available account type. It can supplement RRSP withdrawals from the next non-registered account only when that reduces OAS recovery and improves after-tax cash. TFSA stays in its chosen position, without a separate preservation setting. Mandatory RRIF withdrawals and the GIC buffer rule still apply. This is a local current-cash-flow heuristic, not a guaranteed lifetime optimum. It can be combined with aggressive RRSP meltdown: spending is funded first, then extra registered withdrawals are made and the final pension allocation, income tax, and OAS recovery are recalculated. Meltdown can increase current tax or OAS recovery.</p>
-          <p><strong>Eligible pension income splitting</strong> assumes the primary and first additional person are eligible spouses/common-law partners. The annual search compares both directions of one election, up to 50% of the donor's eligible income. Marked employer pensions can qualify before 65 without RRSP conversion; registered-account withdrawals generally require conversion to a RRIF and a donor aged at least 65. Ordinary RRSP withdrawals, CPP, and OAS are excluded. CPP pension sharing is separate and is not modeled. Splitting reallocates taxable income, not cash ownership or monthly withholding. OAS recovery uses individual net income for tax purposes, not half of household after-tax spending. CRA relationship and residency requirements are assumed; pension and age credits, GIS, provincial benefit differences, and special survivor rules are not modeled.</p>
-          <p><strong>Aggressive RRSP meltdown</strong> withdraws additional RRSP/RRIF funds after retirement to fill the current federal bracket. It is a tax strategy approximation, and its annual decision is displayed in the sub-period table as smoothed period amounts when using a non-annual schedule.</p>
-          <p><strong>GIC buffer strategy</strong>: a GIC only earns its keep as a sequence-of-returns buffer if it's still there when a real downturn hits - drawing it down on a fixed schedule regardless of market conditions defeats the purpose. Enabling this reserves the GIC while the market portfolio's own return (isolated from your contributions/withdrawals, since decumulation itself shouldn't look like a crash) is near its all-time high, then draws the GIC first once that return index is down more than the "draw trigger" from its peak - so a downturn is funded from the guaranteed GIC instead of selling depressed investments. Once the market recovers back within the "recovery threshold" of its old peak, the GIC reverts to being reserved (and refilled from leftover cash, e.g. RRIF minimums exceeding spending need, if enabled). A single down year is usually noise; 10-15% off the peak is a more meaningful signal that it's worth protecting the rest of the portfolio from selling low. There's deliberately no auto-optimizer here: fitting a trigger/recovery threshold to one guessed-at future return sequence is fitting noise, not a real edge - pick a threshold based on how much of a real correction you want to ride out, not by curve-fitting a simulation.</p>
+          <p>Compare saved scenarios or the current draft side by side to see how different assumptions or strategies affect funding, taxes, benefits, and estate results. Save alternatives as separate scenarios to keep them for later. To make a comparison meaningful, keep unrelated inputs and the random seed the same.</p>
+          <p>Look at funding gaps first, then assess resilience in Monte Carlo and compare estate and tax outcomes. A favorable estate on one path does not guarantee that spending will be funded under other conditions.</p>
         </>
       ),
     },
     {
-      title: "Death, estate, and probate",
+      title: "Tax Info",
       body: (
         <>
-          <p>When someone reaches their target death age, their accounts either roll over tax-free to a surviving person in the household, or - if no one survives them - are deemed disposed: RRSP/RRIF balances and deferred GIC growth become ordinary income, while non-registered growth above the ACB becomes a capital gain.</p>
-          <p>What's left after that final tax bill is reduced further by the probate fee rate (Assumptions) to produce the final estate value shown on the Dashboard.</p>
-          <p>This one-time deemed-disposition bill is shown as its own <strong>End-of-life tax</strong> KPI card on the Dashboard, separate from <strong>Lifetime tax</strong> - it's paid out of the estate itself, not funded from spending cash flow, so it doesn't indicate a funding shortfall in the Ledger's regular "Taxes paid" column. It's still included in the Lifetime tax total.</p>
-        </>
-      ),
-    },
-    {
-      title: "OAS clawback (recovery tax)",
-      body: (
-        <>
-          <p>OAS recovery uses modeled net income before the recovery deduction, including OAS, CPP, taxable capital gains, dividend gross-ups, and any pension-splitting allocation. Above the inflation-adjusted threshold, 15 cents per excess dollar is recovered, capped at the OAS paid. The projection reconciles the current year's liability; prior-year-based monthly withholding and later tax refunds are not modeled. OAS recovery is reported separately from income tax.</p>
-          <p><strong>OAS recovered</strong> on the Dashboard is the total OAS clawed back by the government across all people and projected years, not money received by the household. A value of $0 means no modeled clawback. <strong>Lifetime OAS</strong> is the benefit retained after that recovery. The recovery has already reduced the plan's OAS income and spendable cash; do not subtract it a second time.</p>
-        </>
-      ),
-    },
-    {
-      title: "Your data stays on this device",
-      body: (
-        <>
-          <p>All calculations run locally in your browser. We count page visits only, without cookies or click tracking. Scenario names, financial inputs, passwords, and file contents are not included in these counts. Scenarios stay in this browser unless you export or share them.</p>
-          <p><strong>Save</strong> keeps a scenario in this browser on this device so you can return to it later. It is not an online account, and it will not automatically appear on another computer or phone.</p>
-          <p><strong>Export</strong> downloads ordinary JSON or an optional password-protected file. Lost passwords cannot be recovered. <strong>Import</strong> accepts either format and asks for the password when needed. Password protection applies only to the exported file; scenarios saved in this browser remain unencrypted.</p>
-          <p>Clearing browser data or using private browsing can remove locally saved scenarios. Export important scenarios before doing that.</p>
-        </>
-      ),
-    },
-    {
-      title: "Saving, loading, import & export",
-      body: (
-        <>
-          <p><strong>Save</strong> stores the current scenario in this browser. Saving again updates the selected scenario. <strong>New</strong> starts a fresh scenario without deleting saved ones, and <strong>Delete</strong> removes the selected saved scenario.</p>
-          <p>When another saved scenario is available, <strong>Delete</strong> can also discard the unsaved <strong>New Scenario</strong> draft and switch to a saved scenario. The draft is removed from the dropdown until you click <strong>New</strong> or reload the page.</p>
-          <p><strong>Export</strong> makes a backup, optionally protected by a password. At least 12 characters are recommended, but no minimum length is enforced. <strong>Import</strong> opens JSON or encrypted backups and creates an unencrypted browser-saved scenario. Keep your password safe: there is no password recovery.</p>
-          <p>Save and both export formats include every frozen baseline and return path, dated balance entries and notes (including incomplete entries), the selected comparison baseline, working-forecast source or editable-plan choice, and saved forecast revisions with their archived settings and balance snapshots. Import restores that tracking state. Files without actuals still load as editable plans without a baseline.</p>
-          <p>If an imported name matches a saved scenario, <strong>Keep both</strong> adds a uniquely named copy, <strong>Replace existing</strong> updates the saved scenario, and <strong>Cancel</strong> leaves everything unchanged. Names are compared without capitalization or surrounding whitespace. Encrypted files are checked after decryption.</p>
-          <p><strong>Replace existing</strong> replaces that scenario's actuals history too; it does not merge entries or baselines. Choose <strong>Keep both</strong> when retaining both histories matters.</p>
-        </>
-      ),
-    },
-    {
-      title: "The other tabs",
-      body: (
-        <>
-          <p><strong>Dashboard</strong>: the main projection, KPIs, charts, and strategy comparison.</p>
-          <p><strong>Strategy Lab</strong>: compare withdrawal orders by spending capacity, final estate, or tax, with current and suggested orders side by side. Spend more / maximize spending previews maximum proportional phase amounts for both orders in the same calculation. Apply the order only, maximum spending with the current order, or the suggested order and its matching spending plan together. Manual withdrawal settings remain in the sidebar's Strategy inputs.</p>
-          <p><strong>Ledger</strong>: the same projection in a year-by-year table. Edit annual returns and expand years to inspect monthly, quarterly, or semi-annual returns and withdrawals.</p>
-          <p><strong>Monte Carlo</strong>: randomized runs summarized as percentile bands, success rate, and failure analysis. To reduce runtime, pension splitting compares no split, 50% of eligible income in either direction, and an eligible income-balancing split. Dashboard, Ledger, and Compare keep the detailed allocation search. Tax rules, OAS recovery, withdrawal preferences, and simulation counts are unchanged, but individual outcomes can differ slightly. Simulations run in the background with an animated progress indicator, percentage, and completed-run count, followed by a Preparing results stage. Changing inputs restarts the simulation; leaving the tab cancels it.</p>
-          <p>Monte Carlo sizes withdrawals using bounded interpolation, with the existing bisection solver as a fallback if the faster method does not converge. This avoids repeated calculations without removing the selected withdrawal strategies. Dashboard, Ledger, and Compare retain the existing sizing solver.</p>
-          <p><strong>Compare</strong>: run two saved scenarios side by side to see how changing inputs affects the result.</p>
-          <p><strong>Tax Info</strong>: the editable tax brackets, credits, and rates used by the model.</p>
+          <p>Tax Info shows the federal and provincial rules used by the projection, including editable brackets and rates. The province comes from People. Review changes carefully: the model projects certain thresholds with inflation but does not predict future legislation.</p>
+          <p>The planner simplifies tax and benefit rules. For example, it does not model every credit or eligibility exception, GIS, CPP pension sharing, or the age-75 OAS increase. Pension splitting assumes an eligible relationship. Verify the rules and amounts that matter to your household.</p>
         </>
       ),
     },

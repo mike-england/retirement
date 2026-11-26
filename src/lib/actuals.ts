@@ -29,7 +29,7 @@ export function resolveActualsReturnPath(baseline: ActualsBaseline): NonNullable
   let path = baseline.returnPath;
   if (!path) {
     if (baseline.inputs.simulation.randomSeed === undefined) throw new Error("This older baseline did not store its random return path. Freeze a new baseline to enable a matching reforecast.");
-    const regenerated = projectWithVariableReturns(baseline.inputs);
+    const regenerated = projectWithVariableReturns(baseline.inputs, baseline.householdTfsaSurplusFromYear ?? Infinity);
     const matches = baseline.points.filter((point) => point.date !== baseline.planDate).every((point) => {
       const year = regenerated.years.find((year) => `${year.calendarYear}-12-31` === point.date);
       return year && baseline.people.every((person) => Math.abs(year.portfolioByPerson[person.id] - point.portfolioByPerson[person.id]) < 0.02);
@@ -69,7 +69,7 @@ export function actualsProjectionOptions(baseline: ActualsBaseline, observations
       }
       return { date: entry.date, people };
     });
-  return { ...path, balanceOverrides, forecastRevisions: activeRevisions };
+  return { ...path, balanceOverrides, forecastRevisions: activeRevisions, householdTfsaSurplusFromYear: baseline.householdTfsaSurplusFromYear ?? Infinity };
 }
 
 export function hasForecastAssumptionChanges(inputs: RetirementInputs, reference: RetirementInputs): boolean {
@@ -129,7 +129,8 @@ export function createActualsBaseline(inputs: RetirementInputs, projection: Dete
     return { date: `${year.calendarYear}-12-31`, portfolioByPerson: { ...year.portfolioByPerson } };
   }).filter((point) => point.date > planDate)];
   return structuredClone({ id, name: name.trim() || "Original plan", createdAt: new Date().toISOString(), planDate,
-    inputs: frozenInputs, people: people.map((person) => ({ id: person.id, label: person.label || "Person" })), accounts, points, returnPath: freezeReturnPath(projection) });
+    inputs: frozenInputs, people: people.map((person) => ({ id: person.id, label: person.label || "Person" })), accounts, points,
+    householdTfsaSurplusFromYear: Number(planDate.slice(0, 4)), returnPath: freezeReturnPath(projection) });
 }
 
 export function saveInitialBalanceObservation(inputs: RetirementInputs, projection: DeterministicProjection, observation: Omit<BalanceObservation, "baselineId">): ActualsTracking {
@@ -329,6 +330,7 @@ export function rebaseFromActuals(inputs: RetirementInputs, source: ActualsBasel
     existingAssets: updateAccounts(person.id, person.existingAssets, person.currentAge) }));
   const baseline: ActualsBaseline = { ...structuredClone(source), id, name: name.trim() || `Rebased ${date}`, createdAt: new Date().toISOString(),
     accounts: source.accounts.map((account) => ({ ...account, startingBalance: entry.balances[account.key] ?? account.startingBalance })),
+    householdTfsaSurplusFromYear: source.householdTfsaSurplusFromYear ?? Number(date.slice(0, 4)) + 1,
     rebase: { date, sourceBaselineId: source.id, editableInputs: editable, observations, revisions } };
   const savedEntry = { ...structuredClone(entry), id: crypto.randomUUID(), baselineId: id };
   const nextInputs: RetirementInputs = { ...structuredClone(inputs), planDate: editable.planDate, existingAssets: editable.existingAssets,
@@ -430,6 +432,7 @@ export function isActualsTracking(value: unknown): value is ActualsTracking {
   if (tracking.cadence !== undefined && !["monthly", "quarterly", "annually"].includes(tracking.cadence)) return false;
   const baselinesValid = tracking.baselines.every((baseline) => baseline && typeof baseline.id === "string" && typeof baseline.name === "string"
     && Boolean(parsePlanDate(baseline.planDate)) && Number.isFinite(new Date(baseline.createdAt).getTime()) && baseline.inputs && typeof baseline.inputs === "object"
+    && (baseline.householdTfsaSurplusFromYear === undefined || Number.isInteger(baseline.householdTfsaSurplusFromYear))
     && Array.isArray(baseline.people) && baseline.people.length > 0 && baseline.people.every((person) => person && typeof person.id === "string" && typeof person.label === "string")
     && Array.isArray(baseline.accounts) && baseline.accounts.length > 0 && baseline.accounts.every((account) => account && typeof account.key === "string" && typeof account.ownerId === "string"
       && typeof account.name === "string" && Number.isFinite(account.startingBalance) && account.startingBalance >= 0 && Boolean(parsePlanDate(account.activeDate)))

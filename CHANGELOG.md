@@ -1,3 +1,8 @@
+# 1.5.1 (November 25, 2026)
+- Reorganized the Guide around getting started, protecting scenario data, understanding each view, and using retirement projections.
+- Updated retirement surplus reinvestment to use each eligible household member's modeled annual TFSA allowance before non-registered investments. Older Actuals baselines adopt the new rule from the year after rebasing.
+- Added the applied partial-year market return to the Ledger alongside the full-year return input when the plan starts after January 1.
+
 # 1.5.0 (November 12, 2026)
 - Added Strategy Lab to compare withdrawal orders and estimate maximum proportional spending, while retaining manual control.
 - Added CPP/OAS payment and crossover charts, optional per-age CPP estimates, and per-person OAS percentages.
