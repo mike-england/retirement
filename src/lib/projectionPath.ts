@@ -22,7 +22,7 @@ export function hasCompleteFundingSummary(projection: DeterministicProjection | 
     }));
 }
 
-export function projectWithVariableReturns(inputs: RetirementInputs): DeterministicProjection {
+export function projectWithVariableReturns(inputs: RetirementInputs, householdTfsaSurplusFromYear?: number): DeterministicProjection {
   const annualReturns = generateAnnualReturns(inputs).map((generatedReturn, index) =>
     inputs.assumptions.annualReturnOverrides[inputs.personalInfo.currentAge + index] ?? generatedReturn,
   );
@@ -34,7 +34,7 @@ export function projectWithVariableReturns(inputs: RetirementInputs): Determinis
       const random = createRandom((inputs.simulation.randomSeed ?? 0) + 1);
       return annualReturns.map((annualReturn) => decomposeAnnualReturn(random, annualReturn, subPeriodCount, impliedReturnStdDev(inputs.assumptions)));
     })();
-  return projectRetirementPlan(inputs, { annualReturns, subPeriodReturns });
+  return projectRetirementPlan(inputs, { annualReturns, subPeriodReturns, householdTfsaSurplusFromYear });
 }
 
 export function generateAnnualReturns(inputs: RetirementInputs, seed = inputs.simulation.randomSeed) {

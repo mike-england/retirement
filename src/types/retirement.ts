@@ -261,6 +261,7 @@ export interface ActualsBaseline {
   people: { id: string; label: string }[];
   accounts: TrackedAccount[];
   points: { date: string; portfolioByPerson: Record<string, number> }[];
+  householdTfsaSurplusFromYear?: number;
   returnPath?: { annualReturns: number[]; annualInflation: number[]; subPeriodReturns: number[][] };
   rebase?: {
     date: string;
@@ -400,6 +401,7 @@ export interface YearProjection {
   netSpendableCash: number;
   spendingTarget: number;
   portfolioReturn: number;
+  appliedPortfolioReturn: number;
   inflationRate: number;
   estateValue: number;
   // One-time deemed-disposition tax on death (RRSP/RRIF, deferred GIC growth, and non-registered gains), only nonzero the
