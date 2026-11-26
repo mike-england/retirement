@@ -1,3 +1,6 @@
+# 1.5.2 (November 25, 2026)
+- Automate version information on the released page
+
 # 1.5.1 (November 25, 2026)
 - Reorganized the Guide around getting started, protecting scenario data, understanding each view, and using retirement projections.
 - Updated retirement surplus reinvestment to use each eligible household member's modeled annual TFSA allowance before non-registered investments. Older Actuals baselines adopt the new rule from the year after rebasing.

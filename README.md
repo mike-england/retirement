@@ -235,13 +235,14 @@ e.g. `python3 -m http.server 8000 --directory out`.
 
 ## Releasing
 
-GitHub Pages deploys run automatically when a tag is pushed (from any branch), and can also be started manually from the Actions tab. To cut a release:
+GitHub Pages deploys run automatically when a tag is pushed (from any branch), and can also be started manually from the Actions tab. A tagged build displays the tag as its version; tags with or without a `v` prefix are supported. Local builds and manual branch deployments display the version in [package.json](package.json), which may differ from the latest tag.
 
-1. Bump the `version` in [package.json](package.json).
-2. Add a new section at the top of [CHANGELOG.md](CHANGELOG.md): `# X.Y.Z (Month D, Year)` with bullet points.
-3. Commit those changes.
-4. `git tag vX.Y.Z`
-5. `git push origin <branch> && git push origin vX.Y.Z`
+To cut a release:
 
-To run any past release locally: `git checkout vX.Y.Z && npm ci && npm run dev` (or `npm run build`).
+1. Add a new section at the top of [CHANGELOG.md](CHANGELOG.md): `# X.Y.Z (Month D, Year)` with bullet points.
+2. Commit those changes.
+3. `git tag X.Y.Z`
+4. `git push origin <branch> && git push origin X.Y.Z`
+
+To run a past release locally: `git checkout <tag> && npm ci && npm run dev` (or `npm run build`).
 

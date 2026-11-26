@@ -606,7 +606,7 @@ export default function Home() {
         <div className="brand-mark" aria-hidden="true">
           RP
         </div>
-        <strong>Retirement Planner <span className="app-version">v{packageJson.version}</span></strong>
+        <strong>Retirement Planner <span className="app-version">v{(process.env.NEXT_PUBLIC_APP_VERSION || packageJson.version).replace(/^v/, "")}</span></strong>
         <div className="scenario-actions">
           <select
             aria-label="Scenario"

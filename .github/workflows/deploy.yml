@@ -27,6 +27,7 @@ jobs:
       - run: npm run build
         env:
           GITHUB_PAGES_BUILD: "true"
+          NEXT_PUBLIC_APP_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       - uses: actions/upload-pages-artifact@v5
         with:
           path: out
